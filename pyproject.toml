@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nl2sql-analyst"
+version = "0.1.0"
+description = "A natural-language-to-SQL analytics assistant with an evaluation harness."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+llm = ["openai>=1.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+nl2sql = "nl2sql.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
