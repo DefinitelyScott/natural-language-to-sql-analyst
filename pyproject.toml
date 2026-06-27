@@ -21,3 +21,4 @@ nl2sql = "nl2sql.cli:main"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+pythonpath = ["."]
