@@ -8,3 +8,6 @@
 {"question": "Show revenue by region", "sql": "SELECT c.region, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue FROM customers c JOIN orders o ON o.customer_id = c.id JOIN order_items oi ON oi.order_id = o.id GROUP BY c.region ORDER BY revenue DESC"}
 {"question": "How many orders were placed in the last 30 days?", "sql": "SELECT COUNT(*) AS recent_orders FROM orders WHERE order_date >= date((SELECT MAX(order_date) FROM orders), '-30 day')"}
 {"question": "How many new customers signed up by month in 2024?", "sql": "SELECT strftime('%Y-%m', signup_date) AS month, COUNT(*) AS new_customers FROM customers WHERE signup_date >= '2024-01-01' AND signup_date < '2025-01-01' GROUP BY month ORDER BY month"}
+{"question": "What is the total revenue?", "sql": "SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_revenue FROM order_items oi"}
+{"question": "How many orders do we have?", "sql": "SELECT COUNT(*) AS order_count FROM orders"}
+{"question": "How many products are in the catalog?", "sql": "SELECT COUNT(*) AS product_count FROM products"}

@@ -104,7 +104,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 10 questions  |  execution accuracy: 10/10 (100%)  [offline backend]
+Evaluated 13 questions  |  execution accuracy: 13/13 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.

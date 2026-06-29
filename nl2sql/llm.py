@@ -142,6 +142,29 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
+            # The rules below are intentionally placed last. Matching is
+            # first-rule-wins, so these broad aggregate phrasings ("how many
+            # orders") do not shadow the more specific rules above (e.g. orders
+            # in the last 30 days), which should take precedence.
+            (
+                re.compile(r"total revenue|overall revenue|how much revenue", re.I),
+                """
+                SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_revenue
+                FROM order_items oi
+                """,
+            ),
+            (
+                re.compile(r"how many orders|number of orders|total orders|order count", re.I),
+                "SELECT COUNT(*) AS order_count FROM orders",
+            ),
+            (
+                re.compile(
+                    r"how many products|number of products|product count|"
+                    r"products in (the )?catalog",
+                    re.I,
+                ),
+                "SELECT COUNT(*) AS product_count FROM products",
+            ),
         ]
 
     def to_sql(self, question: str, schema: str) -> str:  # noqa: ARG002
