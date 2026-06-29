@@ -26,6 +26,7 @@ nl2sql-analyst/
 │   ├── llm.py           # LLM client (OpenAI-compatible) + offline rule-based fallback
 │   ├── generator.py     # orchestrates NL question -> SQL
 │   ├── runner.py        # read-only, guarded SQL execution
+│   ├── output.py        # table / CSV / JSON result formatters
 │   └── cli.py           # `nl2sql ask "..."`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
@@ -85,6 +86,18 @@ Results (12 rows):
 ```bash
 export OPENAI_API_KEY=sk-...
 python -m nl2sql.cli ask "Which 5 customers spent the most last year?" --llm
+```
+
+## Exporting results
+
+By default `ask` prints a human-readable table (truncated to 20 rows for
+readability). Pass `--format csv` or `--format json` to get the full result set
+in a machine-readable form. In these modes only the data is written to stdout —
+the generated SQL goes to stderr — so you can redirect straight to a file:
+
+```bash
+python -m nl2sql.cli ask "Show revenue by category" --format csv > revenue.csv
+python -m nl2sql.cli ask "Show revenue by region" --format json > revenue.json
 ```
 
 ## Safety guardrails
