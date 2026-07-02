@@ -77,8 +77,10 @@ Results (12 rows):
 `nl2sql` resolves a question to SQL in two ways:
 
 1. **Offline (default).** A small rule-based matcher handles a fixed catalog of
-   analytical question patterns. Deterministic, free, and used by the test suite
-   and CI. This keeps the repo runnable and verifiable by anyone who clones it.
+   analytical question patterns — from simple counts and group-by aggregations
+   to a window-function query for month-over-month revenue growth. Deterministic,
+   free, and used by the test suite and CI. This keeps the repo runnable and
+   verifiable by anyone who clones it.
 2. **LLM.** If `OPENAI_API_KEY` is set and you pass `--llm`, the question and the
    rendered schema are sent to an OpenAI-compatible chat model, which returns
    SQL. The generated SQL still passes through the same read-only guardrails.
@@ -117,7 +119,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 13 questions  |  execution accuracy: 13/13 (100%)  [offline backend]
+Evaluated 15 questions  |  execution accuracy: 15/15 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.

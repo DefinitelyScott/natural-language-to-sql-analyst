@@ -47,6 +47,35 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
+            # Month-over-month revenue growth. A ``LAG`` window function over a
+            # monthly-revenue CTE yields each month's change from the previous
+            # month; the first month's change is NULL because there is no prior
+            # month to compare against. This is the only rule that uses a window
+            # function, and it is placed ahead of the broad "total revenue" rule
+            # so "revenue growth" phrasings are not shadowed by it.
+            (
+                re.compile(
+                    r"month[- ]over[- ]month|(revenue|sales)\s+growth|"
+                    r"growth.*(revenue|sales)",
+                    re.I,
+                ),
+                """
+                WITH monthly AS (
+                    SELECT strftime('%Y-%m', o.order_date) AS month,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                    GROUP BY month
+                )
+                SELECT month,
+                       revenue,
+                       ROUND(revenue - LAG(revenue) OVER (ORDER BY month), 2)
+                           AS revenue_change
+                FROM monthly
+                ORDER BY month
+                """,
+            ),
             (
                 re.compile(r"customers?\b.*\bspent|top\s*(5|five)\s*customers", re.I),
                 """
@@ -97,6 +126,27 @@ class OfflineBackend:
                 GROUP BY p.id
                 ORDER BY units_sold DESC
                 LIMIT 1
+                """,
+            ),
+            # "Top products by revenue" ranks products by sales value
+            # (quantity * unit_price), which is distinct from the units-sold
+            # ranking above: a cheap high-volume item can top units-sold while a
+            # pricier item tops revenue. Requiring the word "revenue" keeps this
+            # rule from shadowing the best-selling (units) rule.
+            (
+                re.compile(
+                    r"top.*products?.*revenue|products?.*by revenue|"
+                    r"highest[- ]revenue products?",
+                    re.I,
+                ),
+                """
+                SELECT p.name,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM products p
+                JOIN order_items oi ON oi.product_id = p.id
+                GROUP BY p.id
+                ORDER BY revenue DESC
+                LIMIT 5
                 """,
             ),
             (
