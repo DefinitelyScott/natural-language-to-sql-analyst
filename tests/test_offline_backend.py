@@ -97,6 +97,38 @@ def test_offline_matches_revenue_growth_phrasings(question):
     assert sql.lower().startswith("with")
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by quarter in 2024.",
+        "What was revenue per quarter?",
+        "Break down quarterly sales.",
+    ],
+)
+def test_offline_matches_revenue_by_quarter_phrasings(question):
+    # Several quarterly phrasings should resolve to the quarter-bucketing rule,
+    # which derives the quarter from the month rather than a (nonexistent)
+    # SQLite quarter function.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY quarter" in sql
+    assert "/ 3" in sql  # month -> quarter integer arithmetic
+    assert sql.lower().startswith("select")
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_revenue_by_quarter():
+    # All sample orders fall in 2024, so every quarter is represented exactly
+    # once, ordered Q1..Q4, and the quarter totals must sum to total revenue.
+    ans = generator.answer_question(DB, "Show revenue by quarter in 2024.")
+    assert ans.result.columns == ["quarter", "revenue"]
+    quarters = [row[0] for row in ans.result.rows]
+    assert quarters == ["2024-Q1", "2024-Q2", "2024-Q3", "2024-Q4"]
+
+    quarter_total = round(sum(row[1] for row in ans.result.rows), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert quarter_total == total.result.rows[0][0]
+
+
 @pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
 def test_end_to_end_revenue_growth():
     # The first month has no prior month, so its revenue_change is NULL; every

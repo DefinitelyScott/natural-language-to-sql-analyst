@@ -192,6 +192,29 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
+            # Revenue bucketed by calendar quarter for 2024. SQLite has no
+            # quarter function, so the quarter number is derived from the month
+            # with integer arithmetic: (month + 2) / 3 maps months 1-3 -> 1,
+            # 4-6 -> 2, 7-9 -> 3, 10-12 -> 4. Kept with the other time-series
+            # rules and ahead of the broad "total revenue" rule below so that
+            # quarterly phrasings are not shadowed by it.
+            (
+                re.compile(
+                    r"(revenue|sales).*(by|per).*quarter|quarterly (revenue|sales)",
+                    re.I,
+                ),
+                """
+                SELECT '2024-Q' || (
+                           (CAST(strftime('%m', o.order_date) AS INTEGER) + 2) / 3
+                       ) AS quarter,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                GROUP BY quarter
+                ORDER BY quarter
+                """,
+            ),
             # The rules below are intentionally placed last. Matching is
             # first-rule-wins, so these broad aggregate phrasings ("how many
             # orders") do not shadow the more specific rules above (e.g. orders
