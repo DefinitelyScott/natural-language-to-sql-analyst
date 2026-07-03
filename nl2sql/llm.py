@@ -215,6 +215,36 @@ class OfflineBackend:
                 ORDER BY quarter
                 """,
             ),
+            # Revenue split by day of the week (Sunday..Saturday). SQLite's
+            # strftime('%w', ...) returns the weekday as a digit 0-6 with
+            # Sunday == 0; a CASE expression turns that digit into a readable
+            # name. Grouping and ordering use the numeric weekday (not the name)
+            # so the rows come back in calendar order rather than alphabetically.
+            # Kept with the other time-series rules and ahead of the broad
+            # "total revenue" rule so day-of-week phrasings are not shadowed.
+            (
+                re.compile(
+                    r"(revenue|sales).*(day of (the )?week|day[- ]of[- ]week|"
+                    r"weekday|days? of the week)|by weekday",
+                    re.I,
+                ),
+                """
+                SELECT CASE CAST(strftime('%w', o.order_date) AS INTEGER)
+                           WHEN 0 THEN 'Sunday'
+                           WHEN 1 THEN 'Monday'
+                           WHEN 2 THEN 'Tuesday'
+                           WHEN 3 THEN 'Wednesday'
+                           WHEN 4 THEN 'Thursday'
+                           WHEN 5 THEN 'Friday'
+                           WHEN 6 THEN 'Saturday'
+                       END AS weekday,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY CAST(strftime('%w', o.order_date) AS INTEGER)
+                ORDER BY CAST(strftime('%w', o.order_date) AS INTEGER)
+                """,
+            ),
             # The rules below are intentionally placed last. Matching is
             # first-rule-wins, so these broad aggregate phrasings ("how many
             # orders") do not shadow the more specific rules above (e.g. orders

@@ -78,8 +78,8 @@ Results (12 rows):
 
 1. **Offline (default).** A small rule-based matcher handles a fixed catalog of
    analytical question patterns — from simple counts and group-by aggregations
-   to time-series buckets (by month and by quarter) and a window-function query
-   for month-over-month revenue growth. Deterministic,
+   to time-series buckets (by month, by quarter, and by day of week) and a
+   window-function query for month-over-month revenue growth. Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.
 2. **LLM.** If `OPENAI_API_KEY` is set and you pass `--llm`, the question and the

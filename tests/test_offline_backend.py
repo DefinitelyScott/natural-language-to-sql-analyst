@@ -129,6 +129,46 @@ def test_end_to_end_revenue_by_quarter():
     assert quarter_total == total.result.rows[0][0]
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by day of week.",
+        "What are sales by weekday?",
+        "Break down revenue by day of the week.",
+    ],
+)
+def test_offline_matches_revenue_by_weekday_phrasings(question):
+    # Several day-of-week phrasings should resolve to the weekday-bucketing rule,
+    # which maps SQLite's numeric strftime('%w') weekday to a readable name via a
+    # CASE expression and orders by the numeric weekday (calendar order).
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "strftime('%w'" in sql
+    assert "WHEN 1 THEN 'Monday'" in sql
+    assert sql.lower().startswith("select")
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_revenue_by_weekday():
+    # Orders span a full year, so all seven weekdays are present, returned in
+    # Sunday..Saturday order, and the weekday totals must sum to total revenue.
+    ans = generator.answer_question(DB, "Show revenue by day of week.")
+    assert ans.result.columns == ["weekday", "revenue"]
+    weekdays = [row[0] for row in ans.result.rows]
+    assert weekdays == [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+    ]
+
+    weekday_total = round(sum(row[1] for row in ans.result.rows), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert weekday_total == total.result.rows[0][0]
+
+
 @pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
 def test_end_to_end_revenue_growth():
     # The first month has no prior month, so its revenue_change is NULL; every
