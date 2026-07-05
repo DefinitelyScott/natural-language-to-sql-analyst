@@ -182,3 +182,51 @@ def test_end_to_end_revenue_growth():
         ans.result.rows[1:], ans.result.rows[:-1]
     ):
         assert change == round(revenue - prev_revenue, 2)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What percentage of revenue comes from each category?",
+        "Show revenue share by category.",
+        "What share of total sales does each category represent?",
+        "Break down revenue by category as a percentage.",
+    ],
+)
+def test_offline_matches_revenue_share_by_category_phrasings(question):
+    # Several share/percentage phrasings resolve to the share-of-total rule,
+    # which uses SUM(revenue) OVER () as the grand-total denominator.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "SUM(revenue) OVER ()" in sql
+    assert "pct_of_total" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_revenue_share_does_not_shadow_plain_revenue_by_category():
+    # A bare "revenue by category" question (no share/percentage word) must
+    # still route to the simpler non-window rule, not the share rule.
+    plain = OfflineBackend().to_sql("Show revenue by category", schema="")
+    assert "OVER ()" not in plain
+    assert "pct_of_total" not in plain
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_revenue_share_by_category():
+    # Every category is present exactly once; the percentages are computed from
+    # the rounded per-category revenue over the grand total, so they sum to
+    # ~100 (within rounding), rows are revenue-descending, and the category
+    # revenues sum to total revenue.
+    ans = generator.answer_question(
+        DB, "What percentage of revenue comes from each category?"
+    )
+    assert ans.result.columns == ["category", "revenue", "pct_of_total"]
+
+    revenues = [row[1] for row in ans.result.rows]
+    assert revenues == sorted(revenues, reverse=True)
+
+    pct_total = sum(row[2] for row in ans.result.rows)
+    assert abs(pct_total - 100.0) < 0.5
+
+    category_total = round(sum(revenues), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert category_total == total.result.rows[0][0]

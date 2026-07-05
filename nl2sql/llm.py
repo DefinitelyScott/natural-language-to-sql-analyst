@@ -89,6 +89,37 @@ class OfflineBackend:
                 LIMIT 5
                 """,
             ),
+            # Each category's revenue as a share (percentage) of total revenue.
+            # A CTE first computes per-category revenue; the outer query divides
+            # each category by the grand total obtained with SUM(revenue) OVER ()
+            # -- a window function with an empty OVER () that sums across every
+            # row, i.e. the whole result. The 100.0 literal forces float division
+            # so the percentages are not integer-truncated. Requiring a
+            # share/percentage word in the matcher, and registering this rule
+            # ahead of the plain "revenue by category" rule below, keeps a bare
+            # "revenue by category" question routed to that simpler rule.
+            (
+                re.compile(
+                    r"(percent(age)?|share|proportion).*categor|"
+                    r"categor.*(percent(age)?|share|proportion)",
+                    re.I,
+                ),
+                """
+                WITH category_revenue AS (
+                    SELECT p.category AS category,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM products p
+                    JOIN order_items oi ON oi.product_id = p.id
+                    GROUP BY p.category
+                )
+                SELECT category,
+                       revenue,
+                       ROUND(100.0 * revenue / SUM(revenue) OVER (), 2)
+                           AS pct_of_total
+                FROM category_revenue
+                ORDER BY revenue DESC
+                """,
+            ),
             (
                 re.compile(r"(revenue|sales).*(by|per).*(category)", re.I),
                 """
