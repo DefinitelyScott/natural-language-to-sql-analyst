@@ -210,6 +210,64 @@ def test_revenue_share_does_not_shadow_plain_revenue_by_category():
     assert "pct_of_total" not in plain
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average order value by region?",
+        "Show average order value per region.",
+        "Break down avg order value by region.",
+    ],
+)
+def test_offline_matches_avg_order_value_by_region_phrasings(question):
+    # Several phrasings should resolve to the region-scoped AOV rule, which
+    # averages per-order totals (computed in a subquery) grouped by region.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY c.region" in sql
+    assert "AVG(order_total)" in sql
+    assert sql.lower().startswith("select")
+
+
+def test_avg_order_value_by_region_does_not_shadow_plain_aov():
+    # A bare "average order value" question (no region word) must still route to
+    # the simpler overall rule that returns a single average_order_value figure.
+    plain = OfflineBackend().to_sql("What is the average order value?", schema="")
+    assert "average_order_value" in plain
+    assert "region" not in plain.lower()
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_avg_order_value_by_region():
+    # Every seeded customer has one of four regions and all regions receive
+    # orders, so the result has exactly four rows, ordered by descending AOV.
+    # Each region's AOV must equal its own revenue divided by its order count,
+    # confirming the average is taken over orders (not order-item rows).
+    import sqlite3
+
+    ans = generator.answer_question(DB, "What is the average order value by region?")
+    assert ans.result.columns == ["region", "avg_order_value"]
+    assert len(ans.result.rows) == 4
+
+    values = [row[1] for row in ans.result.rows]
+    assert values == sorted(values, reverse=True)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        for region, avg_order_value in ans.result.rows:
+            revenue, order_count = conn.execute(
+                """
+                SELECT SUM(oi.quantity * oi.unit_price), COUNT(DISTINCT o.id)
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                JOIN customers c ON c.id = o.customer_id
+                WHERE c.region = ?
+                """,
+                (region,),
+            ).fetchone()
+            assert avg_order_value == round(revenue / order_count, 2)
+    finally:
+        conn.close()
+
+
 @pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
 def test_end_to_end_revenue_share_by_category():
     # Every category is present exactly once; the percentages are computed from
@@ -230,3 +288,58 @@ def test_end_to_end_revenue_share_by_category():
     category_total = round(sum(revenues), 2)
     total = generator.answer_question(DB, "What is the total revenue?")
     assert category_total == total.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by region and category.",
+        "Break down sales by category and region.",
+        "What is revenue per region and category?",
+    ],
+)
+def test_offline_matches_revenue_by_region_and_category_phrasings(question):
+    # Questions naming BOTH region and category resolve to the two-dimensional
+    # rule, which groups by region and category and joins all four tables so the
+    # products (category) join is present alongside the customers (region) join.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY c.region, p.category" in sql
+    assert "JOIN products p ON p.id = oi.product_id" in sql
+    assert sql.lower().startswith("select")
+
+
+def test_region_and_category_does_not_shadow_single_dimension_rules():
+    # A bare "revenue by region" (no category word) must still route to the
+    # one-dimension region rule, and a bare "revenue by category" (no region
+    # word) to the one-dimension category rule -- neither should hit the
+    # two-dimensional region+category rule.
+    by_region = OfflineBackend().to_sql("Show revenue by region", schema="")
+    assert "GROUP BY c.region" in by_region
+    assert "p.category" not in by_region
+
+    by_category = OfflineBackend().to_sql("Show revenue by category", schema="")
+    assert "GROUP BY p.category" in by_category
+    assert "c.region" not in by_category
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_revenue_by_region_and_category():
+    # Every (region, category) pair that has sales appears once; rows are grouped
+    # by region then revenue-descending within each region, and the full grid of
+    # region+category revenues must sum to total revenue (every order item is
+    # counted exactly once).
+    ans = generator.answer_question(DB, "Show revenue by region and category.")
+    assert ans.result.columns == ["region", "category", "revenue"]
+
+    # Rows are ordered by region ascending, then revenue descending within it.
+    from itertools import groupby
+
+    regions_in_order = [region for region, _ in groupby(r[0] for r in ans.result.rows)]
+    assert regions_in_order == sorted(regions_in_order)
+    for _, group in groupby(ans.result.rows, key=lambda r: r[0]):
+        revenues = [row[2] for row in group]
+        assert revenues == sorted(revenues, reverse=True)
+
+    grid_total = round(sum(row[2] for row in ans.result.rows), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert grid_total == total.result.rows[0][0]

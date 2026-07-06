@@ -89,6 +89,33 @@ class OfflineBackend:
                 LIMIT 5
                 """,
             ),
+            # Revenue broken out by two dimensions at once: customer region and
+            # product category. This is the only rule that groups by two columns,
+            # and it needs all four tables -- customers (region) -> orders ->
+            # order_items (the money) -> products (category) -- so the region and
+            # category labels meet on the same order-item rows. The matcher
+            # requires BOTH "region" and "category" words and is registered ahead
+            # of the single-dimension "revenue by region" and "revenue by
+            # category" rules so a combined question is not shadowed by whichever
+            # one-dimension rule would otherwise match first.
+            (
+                re.compile(
+                    r"(revenue|sales).*(region.*categor|categor.*region)|"
+                    r"(region.*categor|categor.*region).*(revenue|sales)",
+                    re.I,
+                ),
+                """
+                SELECT c.region,
+                       p.category,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM customers c
+                JOIN orders o ON o.customer_id = c.id
+                JOIN order_items oi ON oi.order_id = o.id
+                JOIN products p ON p.id = oi.product_id
+                GROUP BY c.region, p.category
+                ORDER BY c.region, revenue DESC
+                """,
+            ),
             # Each category's revenue as a share (percentage) of total revenue.
             # A CTE first computes per-category revenue; the outer query divides
             # each category by the grand total obtained with SUM(revenue) OVER ()
@@ -129,6 +156,33 @@ class OfflineBackend:
                 JOIN order_items oi ON oi.product_id = p.id
                 GROUP BY p.category
                 ORDER BY revenue DESC
+                """,
+            ),
+            # Average order value broken out by customer region. Order value is a
+            # per-order quantity, so it must be computed one level down (each
+            # order's total in the subquery) before averaging -- averaging the
+            # raw order_items rows would weight the mean by line-item count, not
+            # by order. The subquery carries customer_id up so the outer query can
+            # join to customers for the region label and then AVG per region.
+            # Requiring the word "region" and registering this rule ahead of the
+            # plain "average order value" rule below keeps a bare "average order
+            # value" question routed to that simpler overall rule.
+            (
+                re.compile(r"(average|avg).*order value.*region", re.I),
+                """
+                SELECT c.region,
+                       ROUND(AVG(order_total), 2) AS avg_order_value
+                FROM (
+                    SELECT o.id AS order_id,
+                           o.customer_id AS customer_id,
+                           SUM(oi.quantity * oi.unit_price) AS order_total
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.id
+                ) t
+                JOIN customers c ON c.id = t.customer_id
+                GROUP BY c.region
+                ORDER BY avg_order_value DESC
                 """,
             ),
             (
