@@ -227,6 +227,76 @@ def test_offline_matches_avg_order_value_by_region_phrasings(question):
     assert sql.lower().startswith("select")
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Who is the top-spending customer in each region?",
+        "Show the highest spending customer per region.",
+        "For each region, who is the top customer?",
+        "Best customer in each region.",
+    ],
+)
+def test_offline_matches_top_customer_per_region_phrasings(question):
+    # Per-region top-spender phrasings resolve to the greatest-N-per-group rule,
+    # which ranks customers inside each region with a PARTITION BY window and
+    # keeps only the top rank per region.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "PARTITION BY region" in sql
+    assert "ROW_NUMBER()" in sql
+    assert "WHERE rn = 1" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_top_customer_per_region_does_not_shadow_global_top_spenders():
+    # A per-region question hits the partitioned rule; the global "top 5
+    # customers by spend" question (no region word) must still route to the
+    # simpler LIMIT-5 rule, which does not partition or filter by rank.
+    per_region = OfflineBackend().to_sql(
+        "Who is the top-spending customer in each region?", schema=""
+    )
+    global_top = OfflineBackend().to_sql("Which 5 customers spent the most?", schema="")
+    assert "PARTITION BY region" in per_region
+    assert "PARTITION BY" not in global_top
+    assert "LIMIT 5" in global_top
+    assert per_region != global_top
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_top_customer_per_region():
+    # Exactly one winner per region (the sample data has four regions), and each
+    # winner must genuinely be the maximum spender within their own region.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "Who is the top-spending customer in each region?"
+    )
+    assert ans.result.columns == ["region", "name", "total_spent"]
+
+    regions = [row[0] for row in ans.result.rows]
+    assert regions == sorted(regions)
+    assert len(regions) == len(set(regions))  # one row per region
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        for region, _name, total_spent in ans.result.rows:
+            region_max = conn.execute(
+                """
+                SELECT MAX(spend) FROM (
+                    SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS spend
+                    FROM customers c
+                    JOIN orders o ON o.customer_id = c.id
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE c.region = ?
+                    GROUP BY c.id
+                )
+                """,
+                (region,),
+            ).fetchone()[0]
+            assert total_spent == region_max
+    finally:
+        conn.close()
+
+
 def test_avg_order_value_by_region_does_not_shadow_plain_aov():
     # A bare "average order value" question (no region word) must still route to
     # the simpler overall rule that returns a single average_order_value figure.
@@ -293,6 +363,68 @@ def test_end_to_end_revenue_share_by_category():
 @pytest.mark.parametrize(
     "question",
     [
+        "How many unique customers placed an order each month in 2024?",
+        "Show distinct customers per month in 2024.",
+        "How many active buyers did we have each month in 2024?",
+    ],
+)
+def test_offline_matches_unique_customers_per_month_phrasings(question):
+    # Several "monthly active buyers" phrasings resolve to the distinct-customer
+    # rule, which counts each customer once per month via COUNT(DISTINCT ...).
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "COUNT(DISTINCT o.customer_id)" in sql
+    assert "GROUP BY month" in sql
+    assert sql.lower().startswith("select")
+
+
+def test_unique_customers_does_not_shadow_customer_count_or_signups():
+    # A bare "how many customers" must still hit the simple total-count rule, and
+    # "new customers by month" must still hit the signup rule -- neither should be
+    # swallowed by the distinct-buyers-per-month rule (which needs a distinctness
+    # word plus a customer/buyer word).
+    count_sql = OfflineBackend().to_sql("How many customers do we have?", schema="")
+    assert count_sql == "SELECT COUNT(*) AS customer_count FROM customers"
+
+    signup_sql = OfflineBackend().to_sql(
+        "How many new customers signed up by month in 2024?", schema=""
+    )
+    assert "FROM customers" in signup_sql
+    assert "signup_date" in signup_sql
+    assert "COUNT(DISTINCT" not in signup_sql
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_unique_customers_per_month():
+    # All sample orders fall in 2024, so every month is present exactly once in
+    # calendar order. Each month's distinct-buyer count must never exceed the raw
+    # order count for that month (a customer can place several orders in a month
+    # but is counted once), and it is bounded by the 120-customer base.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "How many unique customers placed an order each month in 2024?"
+    )
+    assert ans.result.columns == ["month", "unique_customers"]
+    months = [row[0] for row in ans.result.rows]
+    assert months == sorted(months)
+    assert len(months) == 12
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        for month, unique_customers in ans.result.rows:
+            orders_that_month = conn.execute(
+                "SELECT COUNT(*) FROM orders WHERE strftime('%Y-%m', order_date) = ?",
+                (month,),
+            ).fetchone()[0]
+            assert 0 < unique_customers <= orders_that_month
+            assert unique_customers <= 120
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "Show revenue by region and category.",
         "Break down sales by category and region.",
         "What is revenue per region and category?",
@@ -343,3 +475,57 @@ def test_end_to_end_revenue_by_region_and_category():
     grid_total = round(sum(row[2] for row in ans.result.rows), 2)
     total = generator.answer_question(DB, "What is the total revenue?")
     assert grid_total == total.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average number of items per order?",
+        "average items per order",
+        "avg units per order",
+        "What is the mean number of units per order?",
+        "What is the average basket size?",
+    ],
+)
+def test_offline_matches_avg_units_per_order_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "avg_units_per_order" in sql
+    # Basket size sums quantity (units), not quantity * unit_price (money).
+    assert "SUM(oi.quantity)" in sql
+    assert "unit_price" not in sql
+
+
+def test_avg_units_per_order_distinct_from_order_value():
+    # "items per order" (basket size, units) and "order value" (money) must route
+    # to different rules: the units question must not be caught by the order-value
+    # rule, and vice versa.
+    units = OfflineBackend().to_sql("average items per order", schema="")
+    value = OfflineBackend().to_sql("What is the average order value?", schema="")
+    assert "avg_units_per_order" in units
+    assert "average_order_value" in value
+    assert units != value
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_avg_units_per_order():
+    # A single figure: the mean over each order's total unit count. Verify it
+    # equals total units sold divided by the number of orders, which confirms the
+    # average is taken per order (after the subquery rollup) rather than over the
+    # raw order-item rows.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "What is the average number of items per order?")
+    assert ans.result.columns == ["avg_units_per_order"]
+    assert len(ans.result.rows) == 1
+    avg_units = ans.result.rows[0][0]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        total_units, order_count = conn.execute(
+            "SELECT SUM(quantity), COUNT(DISTINCT order_id) FROM order_items"
+        ).fetchone()
+    finally:
+        conn.close()
+
+    assert avg_units == round(total_units / order_count, 2)
+    assert avg_units > 0

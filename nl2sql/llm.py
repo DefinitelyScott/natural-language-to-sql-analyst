@@ -76,6 +76,96 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
+            # Cumulative (running-total) revenue by month for 2024. A first CTE
+            # totals each month's revenue; the outer query then carries a running
+            # sum with SUM(revenue) OVER (ORDER BY month ROWS BETWEEN UNBOUNDED
+            # PRECEDING AND CURRENT ROW) -- an *explicit window frame* that sums
+            # every month up to and including the current one. This differs from
+            # the other window rules here: LAG (month-over-month) looks one row
+            # back, and the category-share rule's SUM(...) OVER () has an empty,
+            # unordered frame that spans the whole result; an ordered ROWS frame
+            # is what turns a plain total into a progressive running total. The
+            # final row's cumulative value therefore equals total 2024 revenue.
+            # It requires a cumulative/running-total phrasing and is registered
+            # ahead of the broad "total revenue" rule so it is not shadowed.
+            (
+                re.compile(
+                    r"cumulative\s+(revenue|sales)|"
+                    r"running\s+(total|sum)\s+(of\s+)?(revenue|sales)|"
+                    r"(revenue|sales)\s+running\s+total|"
+                    r"(revenue|sales)\s+to\s+date",
+                    re.I,
+                ),
+                """
+                WITH monthly AS (
+                    SELECT strftime('%Y-%m', o.order_date) AS month,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                    GROUP BY month
+                )
+                SELECT month,
+                       revenue,
+                       ROUND(
+                           SUM(revenue) OVER (
+                               ORDER BY month
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ), 2
+                       ) AS cumulative_revenue
+                FROM monthly
+                ORDER BY month
+                """,
+            ),
+            # The single highest-spending customer within each region: the classic
+            # "greatest-N-per-group" (top-1-per-partition) problem. A first CTE
+            # totals each customer's spend and carries their region; the second
+            # ranks customers *inside* each region with
+            # ROW_NUMBER() OVER (PARTITION BY region ORDER BY total_spent DESC);
+            # the outer query then keeps only rank 1 per region. PARTITION BY
+            # restarts the numbering for every region, which is what makes this a
+            # per-group ranking rather than one global ranking -- distinct from
+            # the other window rules here (LAG for month-over-month, SUM() OVER ()
+            # for category share), neither of which partitions. customer_id is a
+            # deterministic tiebreaker in the ORDER BY so ties resolve the same
+            # way on every run. This rule requires BOTH a top/best/highest word
+            # and "region", and is registered ahead of the plain "top 5 customers
+            # by spend" rule below so a per-region question is not shadowed by the
+            # global top-spenders rule.
+            (
+                re.compile(
+                    r"(top|best|highest)[-\s]*(spending|spender)?\s*customers?.*"
+                    r"(in|per|by|within|for)\s+(each\s+)?region|"
+                    r"region.*(top|best|highest)[-\s]*(spending|spender)?\s*customers?",
+                    re.I,
+                ),
+                """
+                WITH customer_spend AS (
+                    SELECT c.id AS customer_id,
+                           c.name AS name,
+                           c.region AS region,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_spent
+                    FROM customers c
+                    JOIN orders o ON o.customer_id = c.id
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY c.id
+                ),
+                ranked AS (
+                    SELECT region,
+                           name,
+                           total_spent,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY region
+                               ORDER BY total_spent DESC, customer_id
+                           ) AS rn
+                    FROM customer_spend
+                )
+                SELECT region, name, total_spent
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY region
+                """,
+            ),
             (
                 re.compile(r"customers?\b.*\bspent|top\s*(5|five)\s*customers", re.I),
                 """
@@ -197,6 +287,35 @@ class OfflineBackend:
                 )
                 """,
             ),
+            # Average basket size: the mean number of *units* per order, where an
+            # order's unit count is SUM(quantity) across its line items. Like the
+            # average-order-value rule above, the per-order rollup happens in the
+            # subquery and the AVG is taken over those order totals -- averaging
+            # the raw order_items rows instead would weight the mean by how many
+            # line items an order has, not by order. This differs from average
+            # order value only in the numerator: value sums quantity * unit_price
+            # (money), basket size sums quantity (units). The matcher requires an
+            # items/units-per-order or basket-size phrase, so it does not shadow
+            # the "order value" rule (which owns the "order value" wording) or the
+            # broad order/product count rules.
+            (
+                re.compile(
+                    r"(average|avg|mean)\s+(number\s+of\s+)?(items?|units?)\s+per\s+order|"
+                    r"(items?|units?)\s+per\s+order|"
+                    r"average\s+basket\s+size|basket\s+size",
+                    re.I,
+                ),
+                """
+                SELECT ROUND(AVG(order_units), 2) AS avg_units_per_order
+                FROM (
+                    SELECT o.id AS order_id,
+                           SUM(oi.quantity) AS order_units
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.id
+                )
+                """,
+            ),
             (
                 re.compile(r"how many (customers|users)", re.I),
                 "SELECT COUNT(*) AS customer_count FROM customers",
@@ -273,6 +392,32 @@ class OfflineBackend:
                        COUNT(*) AS new_customers
                 FROM customers
                 WHERE signup_date >= '2024-01-01' AND signup_date < '2025-01-01'
+                GROUP BY month
+                ORDER BY month
+                """,
+            ),
+            # Unique (active) customers per month -- the "monthly active buyers"
+            # metric: how many *distinct* customers placed at least one order in
+            # each month, as opposed to the raw order count. COUNT(DISTINCT
+            # customer_id) collapses a customer's multiple orders in a month down
+            # to one, so a repeat buyer is counted once per month. This is the
+            # only rule that uses COUNT(DISTINCT ...). It requires a distinctness
+            # word (unique/distinct/active) plus a customer/buyer word, so it does
+            # not shadow the plain "how many customers" count or the "new
+            # customers by month" signup rule above it (which counts signups, not
+            # buyers).
+            (
+                re.compile(
+                    r"(unique|distinct|active)\s+(customers?|buyers?|shoppers?)"
+                    r".*(month|2024)|"
+                    r"monthly.*(unique|distinct|active)\s+(customers?|buyers?)",
+                    re.I,
+                ),
+                """
+                SELECT strftime('%Y-%m', o.order_date) AS month,
+                       COUNT(DISTINCT o.customer_id) AS unique_customers
+                FROM orders o
+                WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
                 GROUP BY month
                 ORDER BY month
                 """,
