@@ -166,6 +166,54 @@ class OfflineBackend:
                 ORDER BY region
                 """,
             ),
+            # Segment customers into spend quartiles (four equal-sized tiers by
+            # lifetime spend). A first CTE totals each customer's spend; the
+            # second assigns a quartile with NTILE(4) OVER (ORDER BY total_spent
+            # DESC, customer_id) -- NTILE splits the ordered rows into four
+            # groups as equal in size as possible, so quartile 1 is the
+            # top-spending 25% of customers and quartile 4 the bottom 25%. The
+            # outer query then rolls each quartile up into a one-row summary
+            # (customer count, total and average spend). This is the only rule
+            # that uses NTILE; it differs from the ROW_NUMBER top-per-region rule
+            # (which ranks every row to pick a single winner) in that NTILE only
+            # needs the bucket number, not a full ranking. customer_id is a
+            # deterministic tiebreaker so tied spends fall on the same side of a
+            # bucket boundary on every run. The matcher requires a quartile/tier
+            # or "segment customers by spend" phrasing, so it does not shadow the
+            # plain top-spenders rule below it, and its "quartile" wording will
+            # not collide with the "revenue by quarter" rule.
+            (
+                re.compile(
+                    r"\bquartiles?\b|"
+                    r"(spend|spending)\s+tiers?|"
+                    r"segment\s+customers?\b.*\b(spend|spending|value|revenue)",
+                    re.I,
+                ),
+                """
+                WITH customer_spend AS (
+                    SELECT c.id AS customer_id,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_spent
+                    FROM customers c
+                    JOIN orders o ON o.customer_id = c.id
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY c.id
+                ),
+                bucketed AS (
+                    SELECT customer_id,
+                           total_spent,
+                           NTILE(4) OVER (ORDER BY total_spent DESC, customer_id)
+                               AS quartile
+                    FROM customer_spend
+                )
+                SELECT quartile,
+                       COUNT(*) AS customers,
+                       ROUND(SUM(total_spent), 2) AS total_spent,
+                       ROUND(AVG(total_spent), 2) AS avg_spent
+                FROM bucketed
+                GROUP BY quartile
+                ORDER BY quartile
+                """,
+            ),
             (
                 re.compile(r"customers?\b.*\bspent|top\s*(5|five)\s*customers", re.I),
                 """

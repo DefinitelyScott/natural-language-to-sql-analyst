@@ -82,8 +82,10 @@ Results (12 rows):
    (by month, by quarter, and by day of week) and
    window-function queries for month-over-month revenue growth, cumulative
    (running-total) revenue by month, each category's share of total revenue,
-   and the top-spending customer within
-   each region (a partitioned greatest-N-per-group ranking). Deterministic,
+   the top-spending customer within
+   each region (a partitioned greatest-N-per-group ranking), and customer
+   spend quartiles (an `NTILE(4)` segmentation into four equal-sized tiers).
+   Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.
 2. **LLM.** If `OPENAI_API_KEY` is set and you pass `--llm`, the question and the
@@ -124,7 +126,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 16 questions  |  execution accuracy: 16/16 (100%)  [offline backend]
+Evaluated 25 questions  |  execution accuracy: 25/25 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.

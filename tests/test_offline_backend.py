@@ -591,3 +591,70 @@ def test_end_to_end_avg_units_per_order():
 
     assert avg_units == round(total_units / order_count, 2)
     assert avg_units > 0
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Segment customers into spend quartiles.",
+        "Show customer spending quartiles.",
+        "Break customers into spend tiers.",
+        "Which quartile does each customer fall into by spend?",
+    ],
+)
+def test_offline_matches_spend_quartile_phrasings(question):
+    # Several segmentation phrasings resolve to the quartile rule, which buckets
+    # customers into four tiers with NTILE(4) over their descending spend.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "NTILE(4) OVER (ORDER BY total_spent DESC, customer_id)" in sql
+    assert "GROUP BY quartile" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_spend_quartile_does_not_shadow_top_spenders_or_quarter():
+    # "quartile" must not be confused with "quarter": a bare "top customers by
+    # spend" (no quartile/tier word) must still hit the LIMIT-5 rule, and a
+    # "revenue by quarter" question must still hit the quarter-bucketing rule.
+    top_spenders = OfflineBackend().to_sql("Which 5 customers spent the most?", schema="")
+    assert "LIMIT 5" in top_spenders
+    assert "NTILE" not in top_spenders
+
+    by_quarter = OfflineBackend().to_sql("Show revenue by quarter in 2024.", schema="")
+    assert "GROUP BY quarter" in by_quarter
+    assert "NTILE" not in by_quarter
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_spend_quartiles():
+    # Exactly four quartiles in ascending order. NTILE makes the buckets as equal
+    # in size as possible (counts differ by at most one), their customer counts
+    # sum to the number of customers who have placed an order, average spend is
+    # non-increasing from quartile 1 (top spenders) to quartile 4, and the
+    # quartile spend totals sum to total revenue (every buying customer is
+    # counted exactly once).
+    import sqlite3
+
+    ans = generator.answer_question(DB, "Segment customers into spend quartiles.")
+    assert ans.result.columns == ["quartile", "customers", "total_spent", "avg_spent"]
+
+    quartiles = [row[0] for row in ans.result.rows]
+    assert quartiles == [1, 2, 3, 4]
+
+    counts = [row[1] for row in ans.result.rows]
+    assert max(counts) - min(counts) <= 1  # NTILE keeps buckets near-equal
+
+    avgs = [row[3] for row in ans.result.rows]
+    assert avgs == sorted(avgs, reverse=True)  # quartile 1 spends the most
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        buying_customers = conn.execute(
+            "SELECT COUNT(DISTINCT customer_id) FROM orders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert sum(counts) == buying_customers
+
+    quartile_total = round(sum(row[2] for row in ans.result.rows), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert quartile_total == total.result.rows[0][0]
