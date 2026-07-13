@@ -80,8 +80,9 @@ Results (12 rows):
    analytical question patterns — from simple counts and group-by aggregations
    to per-order averages (order value and basket size), time-series buckets
    (by month, by quarter, and by day of week) and
-   window-function queries for month-over-month revenue growth, each
-   category's share of total revenue, and the top-spending customer within
+   window-function queries for month-over-month revenue growth, cumulative
+   (running-total) revenue by month, each category's share of total revenue,
+   and the top-spending customer within
    each region (a partitioned greatest-N-per-group ranking). Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.

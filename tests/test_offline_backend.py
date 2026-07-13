@@ -480,6 +480,68 @@ def test_end_to_end_revenue_by_region_and_category():
 @pytest.mark.parametrize(
     "question",
     [
+        "Show cumulative revenue by month in 2024.",
+        "What is the running total of revenue by month?",
+        "Give me the running sum of sales per month.",
+        "Show revenue to date by month.",
+    ],
+)
+def test_offline_matches_cumulative_revenue_phrasings(question):
+    # Several cumulative/running-total phrasings resolve to the running-total
+    # rule, which carries a progressive sum with an *ordered* ROWS window frame
+    # (distinct from the empty OVER () frame used for category share).
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" in sql
+    assert "cumulative_revenue" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_cumulative_revenue_does_not_shadow_total_or_growth_rules():
+    # A bare "total revenue" question (no cumulative/running word) must still hit
+    # the single-figure total rule, and a "revenue growth" question must still
+    # hit the month-over-month LAG rule -- neither should be swallowed by the
+    # running-total rule.
+    total_sql = OfflineBackend().to_sql("What is the total revenue?", schema="")
+    assert total_sql == (
+        "SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_revenue "
+        "FROM order_items oi"
+    )
+
+    growth_sql = OfflineBackend().to_sql(
+        "Show month-over-month revenue growth in 2024.", schema=""
+    )
+    assert "LAG(revenue) OVER (ORDER BY month)" in growth_sql
+    assert "cumulative_revenue" not in growth_sql
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_cumulative_revenue():
+    # All sample orders fall in 2024, so every month appears once in calendar
+    # order. The running total must be monotonically non-decreasing (all monthly
+    # revenues are positive), each row must equal the prior cumulative plus the
+    # current month's revenue, and the final row must equal total 2024 revenue.
+    ans = generator.answer_question(DB, "Show cumulative revenue by month in 2024.")
+    assert ans.result.columns == ["month", "revenue", "cumulative_revenue"]
+    assert len(ans.result.rows) == 12
+
+    months = [row[0] for row in ans.result.rows]
+    assert months == sorted(months)
+
+    cumulatives = [row[2] for row in ans.result.rows]
+    assert cumulatives == sorted(cumulatives)  # non-decreasing
+    assert cumulatives[0] == ans.result.rows[0][1]  # first month: no prior sum
+    for (_, revenue, cumulative), prev_cumulative in zip(
+        ans.result.rows[1:], cumulatives[:-1]
+    ):
+        assert cumulative == round(prev_cumulative + revenue, 2)
+
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert cumulatives[-1] == total.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "What is the average number of items per order?",
         "average items per order",
         "avg units per order",
