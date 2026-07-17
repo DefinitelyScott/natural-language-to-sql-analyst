@@ -658,3 +658,140 @@ def test_end_to_end_spend_quartiles():
     quartile_total = round(sum(row[2] for row in ans.result.rows), 2)
     total = generator.answer_question(DB, "What is the total revenue?")
     assert quartile_total == total.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which categories have above-average revenue?",
+        "Show categories with above the average revenue.",
+        "Which categories earn more than average?",
+        "List categories that beat the average revenue.",
+    ],
+)
+def test_offline_matches_above_average_category_phrasings(question):
+    # Several "above-average" phrasings resolve to the filter rule, which keeps
+    # only categories whose revenue exceeds the mean via a scalar subquery in the
+    # WHERE clause rather than a window function.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WHERE revenue > (SELECT AVG(revenue) FROM category_revenue)" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_above_average_category_does_not_shadow_plain_or_share_category():
+    # A bare "revenue by category" (no above-average word) must still route to the
+    # simple non-window rule, and a "share by category" question to the
+    # percentage rule -- neither should be swallowed by the above-average filter.
+    plain = OfflineBackend().to_sql("Show revenue by category", schema="")
+    assert "SELECT AVG(revenue)" not in plain
+
+    share = OfflineBackend().to_sql(
+        "What percentage of revenue comes from each category?", schema=""
+    )
+    assert "pct_of_total" in share
+    assert "SELECT AVG(revenue)" not in share
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_above_average_categories():
+    # The result must contain only categories whose revenue is strictly above the
+    # mean category revenue, returned revenue-descending. Cross-check against an
+    # independent recomputation of every category's revenue and their average, and
+    # confirm the filter is a proper non-empty subset of all categories (with four
+    # distinct category totals, at least one is above and at least one below the
+    # mean).
+    import sqlite3
+
+    ans = generator.answer_question(DB, "Which categories have above-average revenue?")
+    assert ans.result.columns == ["category", "revenue"]
+
+    revenues = [row[1] for row in ans.result.rows]
+    assert revenues == sorted(revenues, reverse=True)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        all_categories = conn.execute(
+            """
+            SELECT p.category, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+            FROM products p
+            JOIN order_items oi ON oi.product_id = p.id
+            GROUP BY p.category
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    mean_revenue = sum(rev for _, rev in all_categories) / len(all_categories)
+    expected = {cat for cat, rev in all_categories if rev > mean_revenue}
+    returned = {row[0] for row in ans.result.rows}
+
+    assert returned == expected
+    assert 0 < len(returned) < len(all_categories)  # a proper, non-empty subset
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the median order value?",
+        "Show me the median order total.",
+        "What's the median basket?",
+        "For order value, what is the median?",
+    ],
+)
+def test_offline_matches_median_order_value_phrasings(question):
+    # Several "median" phrasings resolve to the LIMIT/OFFSET middle-row rule,
+    # which is how a median is computed in SQLite (there is no MEDIAN function).
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "median_order_value" in sql
+    assert "LIMIT 2 - (SELECT COUNT(*) FROM order_totals) % 2" in sql
+
+
+def test_median_and_average_order_value_do_not_shadow_each_other():
+    # The two rules answer different questions over the same per-order rollup and
+    # must stay distinct: "average" must not be routed to the median rule, and
+    # "median" must not fall through to the average rule.
+    average = OfflineBackend().to_sql("What is the average order value?", schema="")
+    assert "average_order_value" in average
+    assert "OFFSET" not in average
+
+    median = OfflineBackend().to_sql("What is the median order value?", schema="")
+    assert "median_order_value" in median
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_median_order_value():
+    # Cross-check the SQL median against an independent Python computation over
+    # every order total, and assert the defining property of a median: half the
+    # orders fall at or below it. The sample DB has an even number of orders, so
+    # this also exercises the two-middle-rows branch of the LIMIT expression.
+    import sqlite3
+    import statistics
+
+    ans = generator.answer_question(DB, "What is the median order value?")
+    assert ans.result.columns == ["median_order_value"]
+    median = ans.result.rows[0][0]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        totals = [
+            row[0]
+            for row in conn.execute(
+                """
+                SELECT SUM(oi.quantity * oi.unit_price)
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY o.id
+                """
+            )
+        ]
+    finally:
+        conn.close()
+
+    assert len(totals) % 2 == 0  # even count -> averages the two middle values
+    assert median == round(statistics.median(totals), 2)
+    assert sum(1 for t in totals if t <= median) >= len(totals) / 2
+
+    # The distribution is right-skewed, so the median should sit below the mean;
+    # this is the reason both rules exist rather than one replacing the other.
+    average = generator.answer_question(DB, "What is the average order value?")
+    assert median < average.result.rows[0][0]

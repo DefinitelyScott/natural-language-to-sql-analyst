@@ -254,6 +254,41 @@ class OfflineBackend:
                 ORDER BY c.region, revenue DESC
                 """,
             ),
+            # Categories whose revenue is above the average category revenue.
+            # A first CTE totals each category's revenue; the outer query then
+            # keeps only the categories whose revenue exceeds the mean, obtained
+            # with a scalar subquery SELECT AVG(revenue) FROM category_revenue
+            # that re-reads the same CTE. This "above-average" filter is a
+            # distinct idiom from the window rules here: SUM(revenue) OVER ()
+            # (category share) annotates every row with the grand total but keeps
+            # all rows, whereas this scalar subquery is used in the WHERE clause
+            # to *drop* rows below the mean. The comparison is against the rounded
+            # per-category revenue, so the threshold matches the revenue values
+            # shown. The matcher requires an above/over-average phrase next to a
+            # category word and is registered ahead of both the category-share
+            # and the plain "revenue by category" rules so those bare questions
+            # are not shadowed.
+            (
+                re.compile(
+                    r"categor(y|ies).*(above|over|greater than|more than|beat)"
+                    r"[-\s]*(the\s+)?average|"
+                    r"(above|over)[-\s]*average.*categor",
+                    re.I,
+                ),
+                """
+                WITH category_revenue AS (
+                    SELECT p.category AS category,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM products p
+                    JOIN order_items oi ON oi.product_id = p.id
+                    GROUP BY p.category
+                )
+                SELECT category, revenue
+                FROM category_revenue
+                WHERE revenue > (SELECT AVG(revenue) FROM category_revenue)
+                ORDER BY revenue DESC
+                """,
+            ),
             # Each category's revenue as a share (percentage) of total revenue.
             # A CTE first computes per-category revenue; the outer query divides
             # each category by the grand total obtained with SUM(revenue) OVER ()
@@ -332,6 +367,46 @@ class OfflineBackend:
                     FROM orders o
                     JOIN order_items oi ON oi.order_id = o.id
                     GROUP BY o.id
+                )
+                """,
+            ),
+            # Median order value: the *middle* order total, which SQLite has no
+            # built-in function for. A first CTE rolls each order up to its total
+            # (the same per-order rollup the average-order-value rules use); the
+            # subquery then walks the totals in ascending order and keeps only the
+            # middle row(s) with LIMIT/OFFSET:
+            #   OFFSET (COUNT(*) - 1) / 2  skips the bottom half, and
+            #   LIMIT  2 - COUNT(*) % 2    takes 1 row when the count is odd and
+            #                              2 rows when it is even.
+            # AVG over that 1-or-2-row window is the median by definition: the
+            # single middle value, or the mean of the two middle values. This is
+            # deliberately paired with the average rule rather than replacing it —
+            # order totals are right-skewed (a few large orders pull the mean up),
+            # so the median is the more representative "typical order" and the gap
+            # between the two is itself informative. The matcher requires the word
+            # "median", which no other rule uses, so it neither shadows nor is
+            # shadowed by the average-order-value rules.
+            (
+                re.compile(
+                    r"median\s+(order\s+(value|total)|basket)|"
+                    r"order\s+(value|total).*median",
+                    re.I,
+                ),
+                """
+                WITH order_totals AS (
+                    SELECT o.id AS order_id,
+                           SUM(oi.quantity * oi.unit_price) AS order_total
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.id
+                )
+                SELECT ROUND(AVG(order_total), 2) AS median_order_value
+                FROM (
+                    SELECT order_total
+                    FROM order_totals
+                    ORDER BY order_total
+                    LIMIT 2 - (SELECT COUNT(*) FROM order_totals) % 2
+                    OFFSET (SELECT (COUNT(*) - 1) / 2 FROM order_totals)
                 )
                 """,
             ),

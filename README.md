@@ -30,7 +30,7 @@ nl2sql-analyst/
 │   └── cli.py           # `nl2sql ask "..."`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
-│   ├── gold.jsonl       # question / gold-SQL pairs
+│   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
 │   └── evaluate.py      # result-set comparison harness
 └── tests/               # pytest suite
 ```
@@ -78,13 +78,17 @@ Results (12 rows):
 
 1. **Offline (default).** A small rule-based matcher handles a fixed catalog of
    analytical question patterns — from simple counts and group-by aggregations
-   to per-order averages (order value and basket size), time-series buckets
+   to per-order statistics (average order value, median order value — a
+   `LIMIT`/`OFFSET` middle-row query, since SQLite has no `MEDIAN` function —
+   and basket size), time-series buckets
    (by month, by quarter, and by day of week) and
    window-function queries for month-over-month revenue growth, cumulative
    (running-total) revenue by month, each category's share of total revenue,
    the top-spending customer within
-   each region (a partitioned greatest-N-per-group ranking), and customer
-   spend quartiles (an `NTILE(4)` segmentation into four equal-sized tiers).
+   each region (a partitioned greatest-N-per-group ranking), customer
+   spend quartiles (an `NTILE(4)` segmentation into four equal-sized tiers),
+   and above-average filtering (categories whose revenue beats the mean, via a
+   scalar subquery in the `WHERE` clause).
    Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.
@@ -126,10 +130,29 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 25 questions  |  execution accuracy: 25/25 (100%)  [offline backend]
+Evaluated 27 questions  |  execution accuracy: 27/27 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
+
+### What counts as a matching result
+
+Two details decide whether the reported accuracy is meaningful:
+
+- **Column names are ignored.** A correct query may alias `revenue` as
+  `total_revenue`; penalizing that would measure phrasing, not correctness.
+- **Row order is checked only where it is part of the answer.** Each gold row
+  carries an `ordered` flag. For a scalar aggregate ("how many customers do we
+  have?") order is meaningless and rows are compared as a set. For a *ranking*
+  ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
+  right rows in the wrong order are a wrong answer, so those rows set
+  `"ordered": true` and are compared as returned. 17 of the 27 gold questions
+  are order-sensitive.
+
+The flag is a judgment about the question, not a mechanical "does the gold SQL
+have an `ORDER BY`" check — a gold query may sort purely so its output reads
+nicely (one row per region, listed alphabetically) without the order carrying
+any meaning. Those rows are deliberately left unordered.
 
 ## Tests
 
