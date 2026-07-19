@@ -69,3 +69,21 @@ def schema_context(db_path: str) -> str:
         return render(introspect(conn))
     finally:
         conn.close()
+
+
+def table_row_counts(db_path: str) -> list[tuple[str, int]]:
+    """Return ``(table_name, row_count)`` for every user table.
+
+    Table names come from ``sqlite_master`` (via :func:`introspect`), not from
+    user input, so interpolating them into ``COUNT(*)`` queries is safe; they
+    are still double-quoted to handle any unusual-but-legal table names.
+    """
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        counts: list[tuple[str, int]] = []
+        for table in introspect(conn):
+            cur = conn.execute(f'SELECT COUNT(*) FROM "{table.name}"')
+            counts.append((table.name, cur.fetchone()[0]))
+        return counts
+    finally:
+        conn.close()

@@ -476,6 +476,45 @@ class OfflineBackend:
                 LIMIT 5
                 """,
             ),
+            # Products frequently bought together (market-basket / affinity
+            # analysis): the pairs of products that co-occur in the most orders.
+            # This is the only rule that *self-joins* a table -- order_items to
+            # itself on the same order_id -- so each matched row is two line
+            # items from one order. The join condition oi1.product_id <
+            # oi2.product_id does two jobs at once: it drops the trivial
+            # self-pairing of a line item with itself, and it emits each unordered
+            # pair {A, B} only once (as A,B, never also B,A), so pairs are not
+            # double-counted. COUNT(DISTINCT oi1.order_id) counts *orders*
+            # containing both products rather than raw joined rows, which keeps
+            # the tally correct even when an order lists the same product on more
+            # than one line item. product_a/product_b are added to the ORDER BY
+            # after the co-occurrence count so ties resolve the same way on every
+            # run. The matcher owns the "bought/purchased together", "market
+            # basket", and "product pairs/affinity" phrasings, none of which any
+            # other rule uses, so it neither shadows nor is shadowed by the
+            # product- or basket-size rules.
+            (
+                re.compile(
+                    r"bought\s+together|purchased\s+together|"
+                    r"market[-\s]basket|product\s+(pairs|affinity)|"
+                    r"frequently\s+bought",
+                    re.I,
+                ),
+                """
+                SELECT p1.name AS product_a,
+                       p2.name AS product_b,
+                       COUNT(DISTINCT oi1.order_id) AS orders_together
+                FROM order_items oi1
+                JOIN order_items oi2
+                     ON oi2.order_id = oi1.order_id
+                    AND oi1.product_id < oi2.product_id
+                JOIN products p1 ON p1.id = oi1.product_id
+                JOIN products p2 ON p2.id = oi2.product_id
+                GROUP BY p1.name, p2.name
+                ORDER BY orders_together DESC, product_a, product_b
+                LIMIT 5
+                """,
+            ),
             (
                 re.compile(r"(repeat|returning) customers", re.I),
                 """

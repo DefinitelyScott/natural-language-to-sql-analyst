@@ -27,7 +27,7 @@ nl2sql-analyst/
 │   ├── generator.py     # orchestrates NL question -> SQL
 │   ├── runner.py        # read-only, guarded SQL execution
 │   ├── output.py        # table / CSV / JSON result formatters
-│   └── cli.py           # `nl2sql ask "..."`
+│   └── cli.py           # `nl2sql ask "..."` / `nl2sql schema`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
 │   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
@@ -87,8 +87,10 @@ Results (12 rows):
    the top-spending customer within
    each region (a partitioned greatest-N-per-group ranking), customer
    spend quartiles (an `NTILE(4)` segmentation into four equal-sized tiers),
-   and above-average filtering (categories whose revenue beats the mean, via a
-   scalar subquery in the `WHERE` clause).
+   above-average filtering (categories whose revenue beats the mean, via a
+   scalar subquery in the `WHERE` clause), and market-basket affinity
+   (the product pairs most often bought together, via a self-join of
+   `order_items` to itself on the same order).
    Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.
@@ -111,6 +113,17 @@ the generated SQL goes to stderr — so you can redirect straight to a file:
 ```bash
 python -m nl2sql.cli ask "Show revenue by category" --format csv > revenue.csv
 python -m nl2sql.cli ask "Show revenue by region" --format json > revenue.json
+```
+
+## Inspecting the schema
+
+`schema` prints the introspected schema exactly as it is rendered into the LLM
+prompt — the same text the model sees. `--counts` adds per-table row counts,
+which is handy for sanity-checking the sample data build:
+
+```bash
+python -m nl2sql.cli schema
+python -m nl2sql.cli schema --counts
 ```
 
 ## Safety guardrails

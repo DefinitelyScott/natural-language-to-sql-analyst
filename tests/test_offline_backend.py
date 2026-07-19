@@ -795,3 +795,77 @@ def test_end_to_end_median_order_value():
     # this is the reason both rules exist rather than one replacing the other.
     average = generator.answer_question(DB, "What is the average order value?")
     assert median < average.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which products are most frequently bought together?",
+        "What products are often purchased together?",
+        "Show me the market basket pairs.",
+        "Which product pairs co-occur most?",
+    ],
+)
+def test_offline_matches_bought_together_phrasings(question):
+    # Every affinity/market-basket phrasing resolves to the self-join rule and
+    # not to a product-count or basket-size rule.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "FROM order_items oi1" in sql
+    assert "oi1.product_id < oi2.product_id" in sql
+    assert "COUNT(DISTINCT oi1.order_id)" in sql
+
+
+def test_bought_together_does_not_shadow_basket_size():
+    # "basket size" (units per order) and "market basket" (product affinity) are
+    # different questions; each must route to its own rule.
+    affinity = OfflineBackend().to_sql(
+        "Which products are frequently bought together?", schema=""
+    )
+    assert "orders_together" in affinity
+
+    basket = OfflineBackend().to_sql("What is the average basket size?", schema="")
+    assert "avg_units_per_order" in basket
+    assert affinity != basket
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_bought_together():
+    # Cross-check the self-join affinity query against an independent Python
+    # computation: for every order, count each unordered pair of distinct
+    # products once, then confirm the SQL returns the same top pairs by
+    # co-occurring order count (with the same deterministic tiebreak).
+    import sqlite3
+    from collections import Counter
+    from itertools import combinations
+
+    ans = generator.answer_question(
+        DB, "Which products are most frequently bought together?"
+    )
+    assert ans.result.columns == ["product_a", "product_b", "orders_together"]
+    assert len(ans.result.rows) == 5
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        names_by_id = dict(conn.execute("SELECT id, name FROM products"))
+        order_products: dict[int, set[int]] = {}
+        for order_id, product_id in conn.execute(
+            "SELECT order_id, product_id FROM order_items"
+        ):
+            order_products.setdefault(order_id, set()).add(product_id)
+    finally:
+        conn.close()
+
+    # Mirror the SQL exactly: each unordered pair is keyed by product *id* order
+    # (oi1.product_id < oi2.product_id), and the displayed a/b names follow that
+    # id order -- not alphabetical order.
+    pair_counts: Counter[tuple[str, str]] = Counter()
+    for product_ids in order_products.values():
+        for id_a, id_b in combinations(sorted(product_ids), 2):
+            pair_counts[(names_by_id[id_a], names_by_id[id_b])] += 1
+
+    expected = sorted(
+        pair_counts.items(), key=lambda kv: (-kv[1], kv[0][0], kv[0][1])
+    )[:5]
+    expected_rows = [(a, b, count) for (a, b), count in expected]
+    got_rows = [(row[0], row[1], row[2]) for row in ans.result.rows]
+    assert got_rows == expected_rows

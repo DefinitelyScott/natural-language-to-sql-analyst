@@ -1,4 +1,9 @@
-"""Command-line interface: `python -m nl2sql.cli ask "<question>"`."""
+"""Command-line interface.
+
+Commands:
+    ask "<question>"   answer a natural-language question with SQL + results
+    schema [--counts]  print the introspected database schema
+"""
 
 from __future__ import annotations
 
@@ -6,7 +11,7 @@ import argparse
 import os
 import sys
 
-from . import generator, output
+from . import generator, output, schema
 from .runner import UnsafeQueryError
 
 _DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db")
@@ -36,6 +41,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
 
+    show = sub.add_parser(
+        "schema",
+        help="print the database schema (tables, columns, keys)",
+        description=(
+            "Print the introspected schema exactly as it is rendered for the "
+            "LLM prompt — useful for seeing what context the model works from, "
+            "and for orienting yourself in an unfamiliar database."
+        ),
+    )
+    show.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
+    show.add_argument(
+        "--counts",
+        action="store_true",
+        help="also show the number of rows in each table",
+    )
+
     args = parser.parse_args(argv)
 
     if not os.path.exists(args.db):
@@ -45,6 +66,16 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if args.command == "schema":
+        print(schema.schema_context(args.db))
+        if args.counts:
+            counts = schema.table_row_counts(args.db)
+            width = max((len(name) for name, _ in counts), default=0)
+            print("\nRow counts:")
+            for name, count in counts:
+                print(f"  {name:<{width}}  {count:,}")
+        return 0
 
     try:
         ans = generator.answer_question(
