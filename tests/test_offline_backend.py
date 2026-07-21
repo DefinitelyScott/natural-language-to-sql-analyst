@@ -869,3 +869,137 @@ def test_end_to_end_bought_together():
     expected_rows = [(a, b, count) for (a, b), count in expected]
     got_rows = [(row[0], row[1], row[2]) for row in ans.result.rows]
     assert got_rows == expected_rows
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average customer lifespan?",
+        "Show average customer tenure in days.",
+        "How long do customers stay active on average?",
+        "What is the typical customer lifespan?",
+    ],
+)
+def test_offline_matches_customer_lifespan_phrasings(question):
+    # Several lifespan/tenure phrasings resolve to the date-arithmetic rule, which
+    # measures each customer's first-to-last-order span with julianday() date
+    # differences (SQLite has no DATEDIFF) and averages those spans.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "julianday(MAX(order_date))" in sql
+    assert "avg_customer_lifespan_days" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_customer_lifespan_does_not_shadow_customer_count():
+    # "customer lifespan" (a date-span metric) must not collide with the plain
+    # "how many customers" count rule; each routes to its own rule.
+    lifespan = OfflineBackend().to_sql("What is the average customer lifespan?", schema="")
+    count = OfflineBackend().to_sql("How many customers do we have?", schema="")
+    assert "avg_customer_lifespan_days" in lifespan
+    assert count == "SELECT COUNT(*) AS customer_count FROM customers"
+    assert lifespan != count
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_customer_lifespan():
+    # A single figure: the mean per-customer first-to-last-order span in days.
+    # Cross-check against an independent Python recomputation over each buyer's
+    # order dates, and confirm the span is bounded by the one-year data window
+    # (all orders fall in calendar 2024, so no customer's span can reach 366 days)
+    # and is strictly positive (customers place multiple orders across the year).
+    import sqlite3
+    from datetime import date
+
+    ans = generator.answer_question(DB, "What is the average customer lifespan?")
+    assert ans.result.columns == ["avg_customer_lifespan_days"]
+    assert len(ans.result.rows) == 1
+    avg_days = ans.result.rows[0][0]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        dates_by_customer: dict[int, list[date]] = {}
+        for customer_id, order_date in conn.execute(
+            "SELECT customer_id, order_date FROM orders"
+        ):
+            dates_by_customer.setdefault(customer_id, []).append(
+                date.fromisoformat(order_date)
+            )
+    finally:
+        conn.close()
+
+    spans = [
+        (max(dates) - min(dates)).days for dates in dates_by_customer.values()
+    ]
+    expected = round(sum(spans) / len(spans), 1)
+    assert avg_days == expected
+    assert 0 < avg_days < 366
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average order value by month in 2024?",
+        "Show average order value per month.",
+        "How has monthly average order value trended?",
+        "What was the avg order value each month?",
+    ],
+)
+def test_offline_matches_monthly_avg_order_value_phrasings(question):
+    # Several monthly-AOV phrasings resolve to the time-series rule, which
+    # averages per-order totals (computed in a CTE) grouped by month.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WITH order_totals AS" in sql
+    assert "GROUP BY month" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_monthly_avg_order_value_does_not_shadow_overall_or_region_rules():
+    # A bare "average order value" must still route to the overall rule, and an
+    # "average order value by region" to the region rule -- the monthly rule
+    # only claims questions that name a month/over-time dimension.
+    overall = OfflineBackend().to_sql("What is the average order value?", schema="")
+    assert overall.lower().startswith("select")
+    assert "GROUP BY month" not in overall
+
+    by_region = OfflineBackend().to_sql(
+        "What is the average order value by region?", schema=""
+    )
+    assert "GROUP BY c.region" in by_region
+    assert "GROUP BY month" not in by_region
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_monthly_avg_order_value():
+    # All sample orders fall in 2024, so all 12 months appear in calendar order.
+    # Each month's value is cross-checked against an independent Python
+    # recomputation: average of that month's per-order totals, rounded to cents.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(
+        DB, "What is the average order value by month in 2024?"
+    )
+    assert ans.result.columns == ["month", "avg_order_value"]
+    months = [row[0] for row in ans.result.rows]
+    assert months == [f"2024-{m:02d}" for m in range(1, 13)]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        totals_by_month: dict[str, list[float]] = defaultdict(list)
+        for month, order_total in conn.execute(
+            """
+            SELECT strftime('%Y-%m', o.order_date) AS month,
+                   SUM(oi.quantity * oi.unit_price) AS order_total
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id
+            """
+        ):
+            totals_by_month[month].append(order_total)
+    finally:
+        conn.close()
+
+    for month, avg_value in ans.result.rows:
+        totals = totals_by_month[month]
+        expected = round(sum(totals) / len(totals), 2)
+        assert avg_value == expected

@@ -331,6 +331,45 @@ class OfflineBackend:
                 ORDER BY revenue DESC
                 """,
             ),
+            # Average order value bucketed by month -- the AOV time-series. Like
+            # the other order-value rules, order value is a per-order quantity,
+            # so each order's total is computed one level down (in the
+            # ``order_totals`` CTE, grouping by order id) before averaging;
+            # averaging the raw order_items rows would weight the mean by
+            # line-item count rather than by order. The CTE carries each order's
+            # month up so the outer query can AVG per month. This differs from
+            # the two AOV rules below it: the region rule groups the same
+            # per-order totals by customer region, and the plain rule averages
+            # them over all orders at once, whereas this one groups them by
+            # calendar month to show the trend across the year. The matcher
+            # requires a month/over-time phrase and is registered ahead of the
+            # plain "average order value" rule so a monthly question is not
+            # shadowed by it, while a bare "average order value" still routes to
+            # the plain rule.
+            (
+                re.compile(
+                    r"(average|avg).*order value.*"
+                    r"(by\s+month|per\s+month|each\s+month|monthly|over\s+time)|"
+                    r"monthly.*(average|avg).*order value",
+                    re.I,
+                ),
+                """
+                WITH order_totals AS (
+                    SELECT o.id AS order_id,
+                           strftime('%Y-%m', o.order_date) AS month,
+                           SUM(oi.quantity * oi.unit_price) AS order_total
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                    GROUP BY o.id
+                )
+                SELECT month,
+                       ROUND(AVG(order_total), 2) AS avg_order_value
+                FROM order_totals
+                GROUP BY month
+                ORDER BY month
+                """,
+            ),
             # Average order value broken out by customer region. Order value is a
             # per-order quantity, so it must be computed one level down (each
             # order's total in the subquery) before averaging -- averaging the
@@ -513,6 +552,45 @@ class OfflineBackend:
                 GROUP BY p1.name, p2.name
                 ORDER BY orders_together DESC, product_a, product_b
                 LIMIT 5
+                """,
+            ),
+            # Average customer lifespan: the mean number of days between a
+            # customer's first and last order. A first CTE collapses the orders
+            # table to one row per customer whose active_days is
+            # julianday(MAX(order_date)) - julianday(MIN(order_date)) -- julianday
+            # converts each date to a fractional day number so the two can be
+            # subtracted, which is how date differences are taken in SQLite (there
+            # is no DATEDIFF). This is the only rule that does date arithmetic
+            # rather than date *formatting* (the strftime rules bucket by month,
+            # quarter, or weekday; this one measures an elapsed span). The outer
+            # query then AVGs those per-customer spans -- a nested aggregate: MIN
+            # and MAX run per customer inside the CTE, AVG runs across customers
+            # outside it, which is why the CTE is needed rather than a single flat
+            # query. A customer with exactly one order has first == last and so
+            # contributes a span of 0, correctly pulling the average toward the
+            # behaviour of one-time buyers. The matcher owns the lifespan/tenure
+            # phrasings, which no other rule uses, so it neither shadows nor is
+            # shadowed by the customer-count or repeat-customer rules.
+            (
+                re.compile(
+                    r"customer\s+(lifespan|tenure|lifetime)|"
+                    r"(lifespan|tenure)\s+of\s+(a\s+|the\s+)?customers?|"
+                    r"how\s+long\s+.*customers?\s+(stay|remain|are)\s+active|"
+                    r"average\s+(active\s+)?(customer\s+)?lifespan|"
+                    r"days\s+between\s+(a\s+)?customers?['’]?s?\s+"
+                    r"first\s+and\s+last\s+order",
+                    re.I,
+                ),
+                """
+                WITH customer_span AS (
+                    SELECT customer_id,
+                           julianday(MAX(order_date))
+                               - julianday(MIN(order_date)) AS active_days
+                    FROM orders
+                    GROUP BY customer_id
+                )
+                SELECT ROUND(AVG(active_days), 1) AS avg_customer_lifespan_days
+                FROM customer_span
                 """,
             ),
             (

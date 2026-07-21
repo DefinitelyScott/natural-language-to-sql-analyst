@@ -78,7 +78,8 @@ Results (12 rows):
 
 1. **Offline (default).** A small rule-based matcher handles a fixed catalog of
    analytical question patterns — from simple counts and group-by aggregations
-   to per-order statistics (average order value, median order value — a
+   to per-order statistics (average order value overall, by region, and as a
+   monthly trend, median order value — a
    `LIMIT`/`OFFSET` middle-row query, since SQLite has no `MEDIAN` function —
    and basket size), time-series buckets
    (by month, by quarter, and by day of week) and
@@ -143,7 +144,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 27 questions  |  execution accuracy: 27/27 (100%)  [offline backend]
+Evaluated 30 questions  |  execution accuracy: 30/30 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -159,7 +160,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 17 of the 27 gold questions
+  `"ordered": true` and are compared as returned. 19 of the 30 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL
