@@ -91,7 +91,9 @@ Results (12 rows):
    above-average filtering (categories whose revenue beats the mean, via a
    scalar subquery in the `WHERE` clause), and market-basket affinity
    (the product pairs most often bought together, via a self-join of
-   `order_items` to itself on the same order).
+   `order_items` to itself on the same order), and at-risk (lapsed)
+   customers (buyers whose most recent order predates a recency cutoff
+   anchored to the data's newest order — the "Recency" lens of RFM).
    Deterministic,
    free, and used by the test suite and CI. This keeps the repo runnable and
    verifiable by anyone who clones it.

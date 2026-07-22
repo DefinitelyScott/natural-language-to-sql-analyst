@@ -593,6 +593,56 @@ class OfflineBackend:
                 FROM customer_span
                 """,
             ),
+            # At-risk (lapsed) customers: those who have bought before but whose
+            # most recent order is now old -- the "Recency" lens of RFM analysis.
+            # A first CTE collapses the orders table to one row per customer
+            # carrying MAX(order_date) (their latest order); the outer query then
+            # keeps only customers whose latest order predates a cutoff 90 days
+            # before the newest order in the data. Two deliberate design choices,
+            # noted so they can be defended:
+            #   * The cutoff is anchored to the dataset's own MAX(order_date), not
+            #     the wall-clock today(), so the answer is reproducible for anyone
+            #     who clones the repo -- the same reasoning the "orders in the last
+            #     30 days" rule uses. This rule reuses that date(..., '-N day')
+            #     idiom but applies it as a per-customer recency filter rather than
+            #     a single global count.
+            #   * The JOIN to orders is inner, so only customers with at least one
+            #     order are considered. A customer who never ordered is an
+            #     acquisition question, not a churn one; "at-risk" implies a prior
+            #     relationship that has since gone quiet.
+            # The matcher owns the churn/lapsed/inactive/at-risk and "customers
+            # haven't ordered" phrasings, none of which other rules use, so it
+            # neither shadows nor is shadowed by the repeat-customer or
+            # recent-orders rules. It is placed ahead of the broad aggregate rules
+            # for the same first-rule-wins reason as the other specific rules.
+            (
+                re.compile(
+                    r"at[-\s]?risk\s+customers?|"
+                    r"churn(?:ed|ing)?\s+customers?|"
+                    r"lapsed\s+customers?|"
+                    r"inactive\s+customers?|"
+                    r"customers?\s+(?:who\s+)?"
+                    r"(?:haven'?t|hasn'?t|have\s+not|has\s+not|not)\s+"
+                    r"(?:placed\s+an?\s+order|ordered)|"
+                    r"customers?\b.*\bno\s+orders?\s+in\s+the\s+last",
+                    re.I,
+                ),
+                """
+                WITH customer_last_order AS (
+                    SELECT c.id AS customer_id,
+                           c.name AS name,
+                           MAX(o.order_date) AS last_order_date
+                    FROM customers c
+                    JOIN orders o ON o.customer_id = c.id
+                    GROUP BY c.id
+                )
+                SELECT customer_id, name, last_order_date
+                FROM customer_last_order
+                WHERE last_order_date
+                      < date((SELECT MAX(order_date) FROM orders), '-90 day')
+                ORDER BY last_order_date, customer_id
+                """,
+            ),
             (
                 re.compile(r"(repeat|returning) customers", re.I),
                 """

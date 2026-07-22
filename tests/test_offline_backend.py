@@ -938,6 +938,92 @@ def test_end_to_end_customer_lifespan():
 @pytest.mark.parametrize(
     "question",
     [
+        "Which customers haven't ordered in the last 90 days?",
+        "List at-risk customers.",
+        "Show lapsed customers.",
+        "Which customers have not placed an order recently?",
+        "Find inactive customers.",
+    ],
+)
+def test_offline_matches_at_risk_customers_phrasings(question):
+    # Several churn/recency phrasings resolve to the at-risk rule, which keeps
+    # customers whose most recent order predates a cutoff anchored to the
+    # dataset's newest order (reproducible) rather than the wall-clock today().
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WITH customer_last_order AS" in sql
+    assert "MAX(o.order_date) AS last_order_date" in sql
+    assert "date((SELECT MAX(order_date) FROM orders), '-90 day')" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_at_risk_customers_does_not_shadow_repeat_or_recent_orders():
+    # "at-risk customers" (a per-customer recency filter) must not collide with
+    # the repeat-customer count rule or the global recent-orders count rule;
+    # each routes to its own rule.
+    at_risk = OfflineBackend().to_sql(
+        "Which customers haven't ordered in the last 90 days?", schema=""
+    )
+    assert "last_order_date" in at_risk
+
+    repeat = OfflineBackend().to_sql("How many repeat customers are there?", schema="")
+    assert "repeat_customers" in repeat
+    assert "last_order_date" not in repeat
+
+    recent = OfflineBackend().to_sql(
+        "How many orders were placed in the last 30 days?", schema=""
+    )
+    assert "recent_orders" in recent
+    assert "-30 day" in recent
+    assert "customer_last_order" not in recent
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_at_risk_customers():
+    # Every returned customer's last order must fall strictly before the 90-day
+    # cutoff (computed independently), the rows must be ordered by last order date
+    # then customer id, and the result must be a proper, non-empty subset of the
+    # buying customers -- cross-checked against a direct recomputation.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "Which customers haven't ordered in the last 90 days?"
+    )
+    assert ans.result.columns == ["customer_id", "name", "last_order_date"]
+
+    keys = [(row[2], row[0]) for row in ans.result.rows]  # (last_order_date, id)
+    assert keys == sorted(keys)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        cutoff = conn.execute(
+            "SELECT date((SELECT MAX(order_date) FROM orders), '-90 day')"
+        ).fetchone()[0]
+        expected = conn.execute(
+            """
+            SELECT c.id, MAX(o.order_date)
+            FROM customers c
+            JOIN orders o ON o.customer_id = c.id
+            GROUP BY c.id
+            HAVING MAX(o.order_date) < ?
+            """,
+            (cutoff,),
+        ).fetchall()
+        buying_customers = conn.execute(
+            "SELECT COUNT(DISTINCT customer_id) FROM orders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    for _customer_id, _name, last_order_date in ans.result.rows:
+        assert last_order_date < cutoff
+
+    assert {row[0] for row in ans.result.rows} == {cid for cid, _ in expected}
+    assert 0 < len(ans.result.rows) < buying_customers  # proper, non-empty subset
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "What is the average order value by month in 2024?",
         "Show average order value per month.",
         "How has monthly average order value trended?",
