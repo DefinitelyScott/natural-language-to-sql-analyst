@@ -214,6 +214,43 @@ class OfflineBackend:
                 ORDER BY quartile
                 """,
             ),
+            # Average revenue per customer (ARPU): mean lifetime spend per paying
+            # customer. A first CTE rolls the money up to one row per customer
+            # (their total spend); the outer query then AVGs those per-customer
+            # totals. The per-customer rollup is essential and is the whole point
+            # of this rule: ARPU divides revenue by *customers*, whereas average
+            # order value (AOV) divides the same revenue by *orders* -- so on data
+            # where customers place several orders each, ARPU is many times larger
+            # than AOV, and averaging the raw order-item rows would give neither.
+            # The denominator is customers who have actually ordered (the INNER
+            # JOIN drops never-buyers), which is the standard "per paying customer"
+            # definition and is reproducible from the data alone. The matcher owns
+            # the "per customer" revenue/spend phrasings and the ARPU acronym,
+            # which no other rule keys on; it is registered ahead of the broad
+            # "total revenue" and top-spenders rules so a per-customer question is
+            # not shadowed by them.
+            (
+                re.compile(
+                    r"\barpu\b|"
+                    r"(average|avg|mean).*(revenue|spend|sales).*per\s+customer|"
+                    r"(revenue|spend|sales)\s+per\s+customer|"
+                    r"per[- ]customer\s+(revenue|spend|sales)",
+                    re.I,
+                ),
+                """
+                WITH customer_revenue AS (
+                    SELECT o.customer_id AS customer_id,
+                           SUM(oi.quantity * oi.unit_price) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.customer_id
+                )
+                SELECT COUNT(*) AS paying_customers,
+                       ROUND(SUM(revenue), 2) AS total_revenue,
+                       ROUND(AVG(revenue), 2) AS avg_revenue_per_customer
+                FROM customer_revenue
+                """,
+            ),
             (
                 re.compile(r"customers?\b.*\bspent|top\s*(5|five)\s*customers", re.I),
                 """
@@ -482,6 +519,53 @@ class OfflineBackend:
                 re.compile(r"how many (customers|users)", re.I),
                 "SELECT COUNT(*) AS customer_count FROM customers",
             ),
+            # The best-selling product (by units) *within each category*: another
+            # "greatest-N-per-group" ranking, the product-and-category analogue of
+            # the top-customer-per-region rule above. A first CTE rolls units up to
+            # one row per product, carrying its category; the second ranks products
+            # *inside* each category with
+            # ROW_NUMBER() OVER (PARTITION BY category ORDER BY units_sold DESC);
+            # the outer query keeps only rank 1 per category. PARTITION BY restarts
+            # the numbering for every category, which is what turns one global
+            # ranking into a per-category one. product_id breaks ties in the
+            # ORDER BY so a category whose top two products are level resolves the
+            # same way on every run. This rule requires BOTH a best/top product
+            # phrase AND a category word, and is registered ahead of the broad
+            # "best selling product" rule below so a per-category question is not
+            # shadowed by the single-product global ranking.
+            (
+                re.compile(
+                    r"(best|top)[-\s]*(selling\s+)?products?.*"
+                    r"(in|per|by|within|for)\s+(each\s+)?categor(y|ies)|"
+                    r"categor(y|ies).*(best|top)[-\s]*(selling\s+)?products?",
+                    re.I,
+                ),
+                """
+                WITH product_units AS (
+                    SELECT p.category AS category,
+                           p.id AS product_id,
+                           p.name AS name,
+                           SUM(oi.quantity) AS units_sold
+                    FROM products p
+                    JOIN order_items oi ON oi.product_id = p.id
+                    GROUP BY p.id
+                ),
+                ranked AS (
+                    SELECT category,
+                           name,
+                           units_sold,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY category
+                               ORDER BY units_sold DESC, product_id
+                           ) AS rn
+                    FROM product_units
+                )
+                SELECT category, name, units_sold
+                FROM ranked
+                WHERE rn = 1
+                ORDER BY category
+                """,
+            ),
             (
                 re.compile(r"(best|top).*selling product", re.I),
                 """
@@ -643,6 +727,62 @@ class OfflineBackend:
                 ORDER BY last_order_date, customer_id
                 """,
             ),
+            # Revenue split between orders from *new* customers (their very first
+            # order) and *returning* customers (every order after the first) --
+            # the standard new-vs-returning revenue attribution. A first CTE rolls
+            # each order up to its total, carrying the customer and order date; the
+            # second labels every order by whether it is that customer's first with
+            # ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY order_date, order_id)
+            # == 1 -> 'new', else 'returning'. This reuses the same per-customer
+            # ROW_NUMBER idiom as the top-spender-per-region rule but to a different
+            # end: that rule *keeps* rank 1 to pick a single winner per group, while
+            # this one *labels* rank 1 vs the rest and keeps every order, so the two
+            # revenue buckets together sum to total revenue. order_id is a
+            # deterministic tiebreaker so two orders a customer placed on the same
+            # day resolve the same way on every run (only one can be the 'new' one).
+            # The matcher owns the new-vs-returning / first-time-vs-repeat contrast
+            # phrasings and is registered ahead of the plain "(repeat|returning)
+            # customers" count rule below so a question naming "returning customers"
+            # in a revenue-split context is not shadowed by that simpler counter.
+            (
+                re.compile(
+                    r"new\s+(?:vs\.?|versus|and|or|&)\s+returning|"
+                    r"returning\s+(?:vs\.?|versus|and|or|&)\s+new|"
+                    r"first[-\s]?time\s+(?:vs\.?|versus|and|or|&)\s+(?:returning|repeat)|"
+                    r"(?:revenue|sales|spend)\s+from\s+new\s+"
+                    r"(?:and|vs\.?|versus|&)\s+returning",
+                    re.I,
+                ),
+                """
+                WITH order_totals AS (
+                    SELECT o.id AS order_id,
+                           o.customer_id AS customer_id,
+                           o.order_date AS order_date,
+                           SUM(oi.quantity * oi.unit_price) AS order_total
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.id
+                ),
+                classified AS (
+                    SELECT order_total,
+                           CASE
+                               WHEN ROW_NUMBER() OVER (
+                                        PARTITION BY customer_id
+                                        ORDER BY order_date, order_id
+                                    ) = 1
+                               THEN 'new'
+                               ELSE 'returning'
+                           END AS customer_type
+                    FROM order_totals
+                )
+                SELECT customer_type,
+                       COUNT(*) AS orders,
+                       ROUND(SUM(order_total), 2) AS revenue
+                FROM classified
+                GROUP BY customer_type
+                ORDER BY customer_type
+                """,
+            ),
             (
                 re.compile(r"(repeat|returning) customers", re.I),
                 """
@@ -763,6 +903,84 @@ class OfflineBackend:
                 JOIN order_items oi ON oi.order_id = o.id
                 GROUP BY CAST(strftime('%w', o.order_date) AS INTEGER)
                 ORDER BY CAST(strftime('%w', o.order_date) AS INTEGER)
+                """,
+            ),
+            # Average time between a customer's consecutive orders (purchase
+            # cadence): a repeat-purchase engagement metric. The single CTE lines
+            # every order up next to that same customer's previous order using
+            # LAG(order_date) OVER (PARTITION BY customer_id ORDER BY order_date).
+            # This is the only rule with a *partitioned* window: the earlier LAG
+            # rule (month-over-month) has one unpartitioned series, whereas here
+            # PARTITION BY restarts the LAG for each customer so gaps never span
+            # two different customers. The order_date difference is taken in days
+            # via julianday(), which converts an ISO date to a Julian day number
+            # so the subtraction yields whole days. A customer's first order has
+            # no prior order, so its LAG is NULL and gap_days is NULL; the outer
+            # WHERE drops those rows, leaving one gap per repeat purchase, and AVG
+            # is the mean of all such gaps. The ORDER BY breaks ties on o.id so
+            # two orders a customer placed on the same day resolve identically on
+            # every run (their gap is 0). The matcher owns the "time/days/gap
+            # between orders" and "purchase/reorder cadence|frequency" phrasings,
+            # none of which any other rule uses, so it neither shadows nor is
+            # shadowed by the customer-lifespan or broad order-count rules.
+            (
+                re.compile(
+                    r"(time|days?|gap|interval)\s+between\s+(orders|purchases)|"
+                    r"between\s+(consecutive\s+)?(orders|purchases)|"
+                    r"(order|purchase|reorder|repurchase)\s+"
+                    r"(cadence|frequency|interval)|"
+                    r"how\s+(often|frequently)\s+.*(order|purchase)",
+                    re.I,
+                ),
+                """
+                WITH order_gaps AS (
+                    SELECT o.customer_id,
+                           julianday(o.order_date) - julianday(
+                               LAG(o.order_date) OVER (
+                                   PARTITION BY o.customer_id
+                                   ORDER BY o.order_date, o.id
+                               )
+                           ) AS gap_days
+                    FROM orders o
+                )
+                SELECT ROUND(AVG(gap_days), 1) AS avg_days_between_orders
+                FROM order_gaps
+                WHERE gap_days IS NOT NULL
+                """,
+            ),
+            # Distribution of orders per customer: a purchase-frequency histogram
+            # and the foundation of frequency-based (RFM) segmentation. This is a
+            # *nested aggregation* -- the only rule that groups by the output of a
+            # prior GROUP BY. The inner CTE collapses the orders table to one row
+            # per customer carrying that customer's order count; the outer query
+            # then groups those per-customer counts, so each result row reads
+            # "this many customers placed exactly this many orders." Ordering by
+            # order_count returns the histogram buckets low-to-high. It is a
+            # distribution, not the single-number cadence metric owned by the
+            # between-orders rule (which this does not use "frequency" wording to
+            # avoid), and it is registered ahead of the broad order-count rule
+            # below so "orders per customer" phrasings are not shadowed by it.
+            (
+                re.compile(
+                    r"distribution\s+of\s+(the\s+)?(number\s+of\s+)?orders|"
+                    r"orders?\s+per\s+customer|"
+                    r"(number|count)\s+of\s+orders\s+per\s+customer|"
+                    r"how\s+many\s+orders\s+(do|does)\s+(each|every|a)\s+customers?|"
+                    r"order[-\s]?count\s+(distribution|histogram|breakdown)|"
+                    r"(distribution|histogram|breakdown)\s+of\s+order\s+counts?",
+                    re.I,
+                ),
+                """
+                WITH orders_per_customer AS (
+                    SELECT customer_id, COUNT(*) AS order_count
+                    FROM orders
+                    GROUP BY customer_id
+                )
+                SELECT order_count,
+                       COUNT(*) AS customers
+                FROM orders_per_customer
+                GROUP BY order_count
+                ORDER BY order_count
                 """,
             ),
             # The rules below are intentionally placed last. Matching is

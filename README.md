@@ -32,7 +32,8 @@ nl2sql-analyst/
 ├── evals/
 │   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
 │   └── evaluate.py      # result-set comparison harness
-└── tests/               # pytest suite
+└── tests/               # pytest suite (incl. test_docs.py, which checks the
+                         # counts quoted below against evals/gold.jsonl)
 ```
 
 ## Quickstart
@@ -76,27 +77,10 @@ Results (12 rows):
 
 `nl2sql` resolves a question to SQL in two ways:
 
-1. **Offline (default).** A small rule-based matcher handles a fixed catalog of
-   analytical question patterns — from simple counts and group-by aggregations
-   to per-order statistics (average order value overall, by region, and as a
-   monthly trend, median order value — a
-   `LIMIT`/`OFFSET` middle-row query, since SQLite has no `MEDIAN` function —
-   and basket size), time-series buckets
-   (by month, by quarter, and by day of week) and
-   window-function queries for month-over-month revenue growth, cumulative
-   (running-total) revenue by month, each category's share of total revenue,
-   the top-spending customer within
-   each region (a partitioned greatest-N-per-group ranking), customer
-   spend quartiles (an `NTILE(4)` segmentation into four equal-sized tiers),
-   above-average filtering (categories whose revenue beats the mean, via a
-   scalar subquery in the `WHERE` clause), and market-basket affinity
-   (the product pairs most often bought together, via a self-join of
-   `order_items` to itself on the same order), and at-risk (lapsed)
-   customers (buyers whose most recent order predates a recency cutoff
-   anchored to the data's newest order — the "Recency" lens of RFM).
-   Deterministic,
-   free, and used by the test suite and CI. This keeps the repo runnable and
-   verifiable by anyone who clones it.
+1. **Offline (default).** A rule-based matcher over a fixed catalog of
+   analytical question patterns (listed below). Deterministic, free, and used by
+   the test suite and CI, which keeps the repo runnable and verifiable by anyone
+   who clones it.
 2. **LLM.** If `OPENAI_API_KEY` is set and you pass `--llm`, the question and the
    rendered schema are sent to an OpenAI-compatible chat model, which returns
    SQL. The generated SQL still passes through the same read-only guardrails.
@@ -105,6 +89,47 @@ Results (12 rows):
 export OPENAI_API_KEY=sk-...
 python -m nl2sql.cli ask "Which 5 customers spent the most last year?" --llm
 ```
+
+### The offline question catalog
+
+Matching is **first-rule-wins**, so specific patterns are registered ahead of
+broad ones — "orders in the last 30 days" must not be swallowed by "how many
+orders". The catalog currently covers:
+
+**Counts and totals** — customer count, order count, product count, total
+revenue.
+
+**Group-by breakdowns** — revenue by category, by region, and by region ×
+category; top products by revenue; best-selling product by units, both overall
+and within each category; each category's share of total revenue
+(`SUM(...) OVER ()`); categories whose revenue beats the mean (a scalar subquery
+in `WHERE`).
+
+**Time series** — total sales by month, revenue by quarter, revenue by day of
+week, new customers by month, unique active customers per month, orders in the
+last 30 days.
+
+**Window functions** — month-over-month revenue growth (`LAG`); cumulative
+running-total revenue by month (an explicit `ROWS BETWEEN UNBOUNDED PRECEDING
+AND CURRENT ROW` frame); the top-spending customer within each region (a
+partitioned greatest-N-per-group ranking via `ROW_NUMBER()`); customer spend
+quartiles (`NTILE(4)`); and the average gap between a customer's consecutive
+orders (a partitioned `LAG` over `order_date`).
+
+**Per-order statistics** — average order value overall, by region, and as a
+monthly trend; median order value (a `LIMIT`/`OFFSET` middle-row query, since
+SQLite has no `MEDIAN` function); average units per order (basket size).
+
+**Customer behavior (RFM-style)** — top 5 customers by spend; repeat customers;
+average revenue per customer; average customer lifespan; at-risk (lapsed)
+customers, whose most recent order predates a recency cutoff anchored to the
+data's newest order; the new-vs-returning revenue split; the distribution of
+orders per customer (a nested aggregation — a purchase-frequency histogram); and
+market-basket affinity (the product pairs most often bought together, via a
+self-join of `order_items`).
+
+Every pattern in this catalog has a matching row in `evals/gold.jsonl`, so each
+one is measured by the evaluation harness rather than merely asserted here.
 
 ## Exporting results
 
@@ -146,7 +171,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 30 questions  |  execution accuracy: 30/30 (100%)  [offline backend]
+Evaluated 36 questions  |  execution accuracy: 36/36 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -162,13 +187,17 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 19 of the 30 gold questions
+  `"ordered": true` and are compared as returned. 23 of the 36 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL
 have an `ORDER BY`" check — a gold query may sort purely so its output reads
 nicely (one row per region, listed alphabetically) without the order carrying
 any meaning. Those rows are deliberately left unordered.
+
+Those counts are not maintained by hand. `tests/test_docs.py` parses them back
+out of this README and compares them to `evals/gold.jsonl`, so adding a question
+without refreshing the numbers fails the suite.
 
 ## Tests
 

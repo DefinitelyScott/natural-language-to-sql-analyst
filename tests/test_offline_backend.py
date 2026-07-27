@@ -1089,3 +1089,368 @@ def test_end_to_end_monthly_avg_order_value():
         totals = totals_by_month[month]
         expected = round(sum(totals) / len(totals), 2)
         assert avg_value == expected
+
+
+def test_time_between_orders_uses_partitioned_lag():
+    # The purchase-cadence rule must use a per-customer (PARTITION BY) LAG so
+    # gaps never span two different customers, and must not be swallowed by the
+    # broad order-count rule that also mentions "orders".
+    sql = OfflineBackend().to_sql(
+        "What is the average time between orders?", schema=""
+    )
+    assert "PARTITION BY o.customer_id" in sql
+    assert "LAG(o.order_date)" in sql
+    assert "julianday" in sql
+    # Not the plain order-count fallback.
+    assert sql != "SELECT COUNT(*) AS order_count FROM orders"
+
+
+def test_time_between_orders_does_not_shadow_order_count():
+    # A bare "how many orders" must still route to the order-count rule, proving
+    # the cadence rule's matcher is specific to between-orders phrasing.
+    count_sql = OfflineBackend().to_sql("How many orders do we have?", schema="")
+    assert count_sql == "SELECT COUNT(*) AS order_count FROM orders"
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_time_between_orders():
+    # The single average is cross-checked against an independent Python
+    # recomputation: for each customer, sort their order dates and sum the
+    # day-gaps between consecutive orders, then average every gap across all
+    # customers (customers with a single order contribute no gap).
+    import sqlite3
+    from collections import defaultdict
+    from datetime import date
+
+    ans = generator.answer_question(DB, "What is the average time between orders?")
+    assert ans.result.columns == ["avg_days_between_orders"]
+    assert len(ans.result.rows) == 1
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        dates_by_customer: dict[int, list[str]] = defaultdict(list)
+        for customer_id, order_date in conn.execute(
+            "SELECT customer_id, order_date FROM orders"
+        ):
+            dates_by_customer[customer_id].append(order_date)
+    finally:
+        conn.close()
+
+    gaps: list[int] = []
+    for order_dates in dates_by_customer.values():
+        parsed = sorted(date.fromisoformat(d) for d in order_dates)
+        gaps.extend(
+            (parsed[i] - parsed[i - 1]).days for i in range(1, len(parsed))
+        )
+
+    expected = round(sum(gaps) / len(gaps), 1)
+    assert ans.result.rows[0][0] == expected
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average revenue per customer?",
+        "Show revenue per customer.",
+        "What is ARPU?",
+        "What is the mean spend per customer?",
+        "average sales per customer",
+    ],
+)
+def test_offline_matches_arpu_phrasings(question):
+    # Several ARPU phrasings resolve to the per-customer-rollup rule, which
+    # averages each customer's total spend (a CTE grouped by customer) rather
+    # than averaging orders or raw order-item rows.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WITH customer_revenue AS" in sql
+    assert "avg_revenue_per_customer" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_arpu_does_not_shadow_order_value_or_top_spenders():
+    # ARPU (revenue per customer) must stay distinct from average order value
+    # (revenue per order) and from the top-spenders ranking: a bare "average
+    # order value" question must still route to the per-order rule, and "top 5
+    # customers" to the LIMIT-5 ranking -- neither should hit the ARPU rule.
+    arpu = OfflineBackend().to_sql("What is the average revenue per customer?", schema="")
+    assert "avg_revenue_per_customer" in arpu
+
+    aov = OfflineBackend().to_sql("What is the average order value?", schema="")
+    assert "average_order_value" in aov
+    assert "avg_revenue_per_customer" not in aov
+
+    top = OfflineBackend().to_sql("Which 5 customers spent the most?", schema="")
+    assert "LIMIT 5" in top
+    assert "customer_revenue" not in top
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_arpu():
+    # A single summary row. ARPU is cross-checked against an independent Python
+    # recomputation over each customer's total spend, and must strictly exceed
+    # average order value on this data (customers place several orders each), the
+    # property that makes ARPU and AOV different metrics rather than one figure.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(DB, "What is the average revenue per customer?")
+    assert ans.result.columns == [
+        "paying_customers",
+        "total_revenue",
+        "avg_revenue_per_customer",
+    ]
+    assert len(ans.result.rows) == 1
+    paying_customers, total_revenue, arpu = ans.result.rows[0]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        revenue_by_customer: dict[int, float] = defaultdict(float)
+        for customer_id, line_total in conn.execute(
+            """
+            SELECT o.customer_id, oi.quantity * oi.unit_price
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            """
+        ):
+            revenue_by_customer[customer_id] += line_total
+    finally:
+        conn.close()
+
+    per_customer = list(revenue_by_customer.values())
+    assert paying_customers == len(per_customer)
+    assert total_revenue == round(sum(per_customer), 2)
+    assert arpu == round(sum(per_customer) / len(per_customer), 2)
+
+    # ARPU divides by customers, AOV by orders, so ARPU must be the larger figure.
+    aov = generator.answer_question(DB, "What is the average order value?")
+    assert arpu > aov.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show the distribution of orders per customer.",
+        "What is the distribution of the number of orders?",
+        "How many orders does each customer place?",
+        "orders per customer",
+        "order-count distribution",
+    ],
+)
+def test_offline_matches_orders_per_customer_distribution_phrasings(question):
+    # Every phrasing must route to the nested-aggregation histogram rule: an
+    # inner per-customer COUNT wrapped by an outer GROUP BY over those counts.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WITH orders_per_customer AS" in sql
+    assert "COUNT(*) AS order_count" in sql
+    assert "GROUP BY order_count" in sql
+    assert "ORDER BY order_count" in sql
+
+
+def test_orders_per_customer_does_not_shadow_order_or_customer_counts():
+    # The distribution rule must be specific enough that bare count questions
+    # still fall through to their own broad rules.
+    order_count_sql = OfflineBackend().to_sql("How many orders do we have?", schema="")
+    assert order_count_sql == "SELECT COUNT(*) AS order_count FROM orders"
+
+    customer_count_sql = OfflineBackend().to_sql(
+        "How many customers do we have?", schema=""
+    )
+    assert "FROM customers" in customer_count_sql
+    assert "order_count" not in customer_count_sql
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_orders_per_customer_distribution():
+    # The histogram is cross-checked against an independent Python recomputation:
+    # count each customer's orders, then count how many customers share each
+    # order count. Rows must come back ordered by order_count ascending.
+    import sqlite3
+    from collections import Counter
+
+    ans = generator.answer_question(
+        DB, "Show the distribution of orders per customer."
+    )
+    assert ans.result.columns == ["order_count", "customers"]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        orders_by_customer = Counter(
+            customer_id
+            for (customer_id,) in conn.execute("SELECT customer_id FROM orders")
+        )
+    finally:
+        conn.close()
+
+    expected = sorted(Counter(orders_by_customer.values()).items())
+    assert [tuple(row) for row in ans.result.rows] == expected
+    # Every customer that placed an order is accounted for exactly once.
+    assert sum(customers for _, customers in ans.result.rows) == len(orders_by_customer)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the best-selling product in each category?",
+        "Show the top selling product per category.",
+        "Best product by category",
+        "Which category's best-selling products lead in units?",
+    ],
+)
+def test_best_selling_product_per_category_routes_to_partition_rule(question):
+    # Every phrasing must route to the greatest-N-per-group rule that ranks
+    # products within each category, not the global single-product rule.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "PARTITION BY category" in sql
+    assert "WHERE rn = 1" in sql
+
+
+def test_best_selling_per_category_does_not_shadow_global_best_seller():
+    # A bare "best selling product" question (no category) must still fall
+    # through to the single-product global ranking, not the per-category rule.
+    sql = OfflineBackend().to_sql("What is the best selling product?", schema="")
+    assert "PARTITION BY category" not in sql
+    assert "LIMIT 1" in sql
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_best_selling_product_per_category():
+    # Cross-check the per-category winner against an independent Python
+    # recomputation: sum units per product, then pick the max-units product in
+    # each category (ties broken by product id, matching the SQL tiebreaker).
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "What is the best-selling product in each category?"
+    )
+    assert ans.result.columns == ["category", "name", "units_sold"]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT p.category, p.id, p.name, SUM(oi.quantity) AS units
+            FROM products p
+            JOIN order_items oi ON oi.product_id = p.id
+            GROUP BY p.id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    winners: dict[str, tuple] = {}
+    for category, pid, name, units in rows:
+        # Higher units win; on a tie the smaller product id wins.
+        best = winners.get(category)
+        if best is None or (units, -pid) > (best[0], -best[1]):
+            winners[category] = (units, pid, name)
+    expected = [
+        (category, winners[category][2], winners[category][0])
+        for category in sorted(winners)
+    ]
+
+    assert [tuple(row) for row in ans.result.rows] == expected
+    # One winner per category, and every category is represented.
+    assert len(ans.result.rows) == len(winners)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How much revenue comes from new vs returning customers?",
+        "Split revenue between new and returning customers.",
+        "Show revenue from new versus returning customers.",
+        "Break down sales by first-time vs repeat customers.",
+    ],
+)
+def test_offline_matches_new_vs_returning_phrasings(question):
+    # Several new-vs-returning phrasings resolve to the revenue-attribution rule,
+    # which labels each order as a customer's first ('new') or a later one
+    # ('returning') with a per-customer ROW_NUMBER, then sums revenue per label.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "PARTITION BY customer_id" in sql
+    assert "THEN 'new'" in sql
+    assert "GROUP BY customer_type" in sql
+    assert sql.lower().startswith("with")
+
+
+def test_new_vs_returning_does_not_shadow_repeat_customer_count():
+    # The new-vs-returning revenue split names "returning customers", but a bare
+    # "how many repeat customers" question must still route to the simple count
+    # rule -- the split rule only claims the new-vs-returning contrast phrasing.
+    split = OfflineBackend().to_sql(
+        "How much revenue comes from new vs returning customers?", schema=""
+    )
+    assert "customer_type" in split
+
+    repeat = OfflineBackend().to_sql("How many repeat customers are there?", schema="")
+    assert repeat == (
+        "SELECT COUNT(*) AS repeat_customers FROM ( "
+        "SELECT customer_id FROM orders GROUP BY customer_id "
+        "HAVING COUNT(*) > 1 )"
+    )
+    assert split != repeat
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_new_vs_returning_revenue():
+    # Exactly two labelled buckets returned alphabetically ('new', 'returning').
+    # Each customer contributes exactly one 'new' order (their first), so the new
+    # order count must equal the number of buying customers; the two buckets'
+    # order counts must sum to the total order count and their revenues to total
+    # revenue -- every order is counted once. Cross-check against an independent
+    # Python recomputation that labels each order by first-order date per customer.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "How much revenue comes from new vs returning customers?"
+    )
+    assert ans.result.columns == ["customer_type", "orders", "revenue"]
+
+    types = [row[0] for row in ans.result.rows]
+    assert types == ["new", "returning"]
+    by_type = {row[0]: (row[1], row[2]) for row in ans.result.rows}
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        buying_customers = conn.execute(
+            "SELECT COUNT(DISTINCT customer_id) FROM orders"
+        ).fetchone()[0]
+        order_totals = conn.execute(
+            """
+            SELECT o.customer_id, o.id, o.order_date,
+                   SUM(oi.quantity * oi.unit_price) AS order_total
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY o.id
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    # One 'new' order per buying customer.
+    assert by_type["new"][0] == buying_customers
+
+    # Independent recomputation: the first order (by date, then id) per customer
+    # is 'new', the rest 'returning'.
+    first_order_id: dict[int, tuple] = {}
+    for customer_id, order_id, order_date, _total in order_totals:
+        key = (order_date, order_id)
+        if customer_id not in first_order_id or key < first_order_id[customer_id]:
+            first_order_id[customer_id] = key
+
+    expected = {"new": [0, 0.0], "returning": [0, 0.0]}
+    for customer_id, order_id, order_date, total in order_totals:
+        label = "new" if (order_date, order_id) == first_order_id[customer_id] else "returning"
+        expected[label][0] += 1
+        expected[label][1] += total
+
+    for label in ("new", "returning"):
+        assert by_type[label][0] == expected[label][0]
+        assert by_type[label][1] == round(expected[label][1], 2)
+
+    # The two buckets partition every order and all revenue.
+    total_orders = sum(by_type[label][0] for label in by_type)
+    total_revenue = round(sum(by_type[label][1] for label in by_type), 2)
+    assert total_orders == len(order_totals)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert total_revenue == total.result.rows[0][0]
