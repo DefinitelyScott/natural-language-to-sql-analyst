@@ -1454,3 +1454,132 @@ def test_end_to_end_new_vs_returning_revenue():
     assert total_orders == len(order_totals)
     total = generator.answer_question(DB, "What is the total revenue?")
     assert total_revenue == total.result.rows[0][0]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show monthly cohort retention.",
+        "What does our customer retention look like?",
+        "Break customers into cohorts by first order month.",
+        "How many customers are retained after their first purchase?",
+    ],
+)
+def test_offline_matches_cohort_retention_phrasings(question):
+    # The cohort rule owns the cohort/retention vocabulary. It buckets customers
+    # by the month of their first order and reports, per month offset, what share
+    # of that cohort was active again.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert sql.lower().startswith("with")
+    assert "cohort_month" in sql
+    assert "month_offset" in sql
+    assert "COUNT(DISTINCT a.customer_id)" in sql
+
+
+def test_cohort_retention_does_not_shadow_neighbouring_customer_rules():
+    # The cohort rule is registered first, so this is the direction of shadowing
+    # that actually needs guarding: it claims only the cohort/retention wording,
+    # so questions about repeat customers, lapsed customers, and the
+    # new-vs-returning split must still reach their own rules further down --
+    # all four concern the same customers but answer different things.
+    cohort = OfflineBackend().to_sql("Show monthly cohort retention.", schema="")
+    repeat = OfflineBackend().to_sql("How many repeat customers are there?", schema="")
+    lapsed = OfflineBackend().to_sql(
+        "Which customers haven't ordered in the last 90 days?", schema=""
+    )
+    split = OfflineBackend().to_sql(
+        "How much revenue comes from new vs returning customers?", schema=""
+    )
+
+    assert "repeat_customers" in repeat
+    assert "cohort_month" not in lapsed
+    assert "customer_type" in split
+    assert len({cohort, repeat, lapsed, split}) == 4
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_cohort_retention():
+    # Verified three ways: (1) structural invariants that must hold for any
+    # cohort grid -- offset 0 is a cohort's own first month, so its retention is
+    # 100% and its active count equals the cohort size; offsets are never
+    # negative; and the cohort sizes sum to the number of buying customers;
+    # (2) retention_pct is consistent with its own numerator and denominator;
+    # (3) an independent Python recomputation straight from the raw orders.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(DB, "Show monthly cohort retention.")
+    assert ans.result.columns == [
+        "cohort_month",
+        "month_offset",
+        "cohort_size",
+        "active_customers",
+        "retention_pct",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert rows, "the cohort grid should not be empty"
+
+    # Rows arrive as a stable grid: cohort ascending, then offset ascending.
+    assert rows == sorted(rows, key=lambda row: (row[0], row[1]))
+
+    sizes: dict[str, int] = {}
+    for cohort_month, offset, cohort_size, active, pct in rows:
+        assert offset >= 0, "a customer cannot be active before their first order"
+        assert 0 < active <= cohort_size
+        assert pct == round(100.0 * active / cohort_size, 1)
+        # cohort_size is a property of the cohort, so it is identical in every
+        # cell of that cohort's row.
+        assert sizes.setdefault(cohort_month, cohort_size) == cohort_size
+        if offset == 0:
+            assert active == cohort_size
+            assert pct == 100.0
+
+    # Every cohort has an offset-0 baseline row.
+    assert {row[0] for row in rows if row[1] == 0} == set(sizes)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        buying_customers = conn.execute(
+            "SELECT COUNT(DISTINCT customer_id) FROM orders"
+        ).fetchone()[0]
+        raw_orders = conn.execute("SELECT customer_id, order_date FROM orders").fetchall()
+    finally:
+        conn.close()
+
+    # The cohorts partition the set of customers who have ever ordered.
+    assert sum(sizes.values()) == buying_customers
+
+    # Independent recomputation from the raw orders.
+    first_month: dict[int, str] = {}
+    active_months: dict[int, set[str]] = defaultdict(set)
+    for customer_id, order_date in raw_orders:
+        month = order_date[:7]
+        active_months[customer_id].add(month)
+        if customer_id not in first_month or month < first_month[customer_id]:
+            first_month[customer_id] = month
+
+    def month_number(month: str) -> int:
+        """Absolute month index, so subtracting two gives a whole-month gap."""
+        return int(month[:4]) * 12 + int(month[5:7])
+
+    expected_sizes: dict[str, int] = defaultdict(int)
+    for cohort in first_month.values():
+        expected_sizes[cohort] += 1
+
+    expected_active: dict[tuple[str, int], int] = defaultdict(int)
+    for customer_id, months in active_months.items():
+        cohort = first_month[customer_id]
+        for month in months:
+            expected_active[(cohort, month_number(month) - month_number(cohort))] += 1
+
+    expected_rows = [
+        (
+            cohort,
+            offset,
+            expected_sizes[cohort],
+            active,
+            round(100.0 * active / expected_sizes[cohort], 1),
+        )
+        for (cohort, offset), active in sorted(expected_active.items())
+    ]
+    assert rows == expected_rows

@@ -35,6 +35,77 @@ class OfflineBackend:
 
     def __init__(self) -> None:
         self._rules: list[tuple[re.Pattern[str], str]] = [
+            # Monthly cohort retention: for each acquisition cohort (customers
+            # grouped by the month of their *first* order), what share of that
+            # cohort ordered again N months later. This is the standard retention
+            # grid -- one row per (cohort, month offset) cell -- and it is the
+            # only rule here that measures behavior *relative to each customer's
+            # own start date* rather than against the calendar.
+            #
+            # It is registered first because its vocabulary (cohort / retention /
+            # retained) is the narrowest in the catalog and no other rule uses
+            # any of those words, so it cannot shadow anything -- while several
+            # broad rules below would otherwise swallow it. "How many customers
+            # are retained after their first purchase?" is a retention question,
+            # but it also contains "how many customers", which the customer-count
+            # rule matches; first-rule-wins ordering is what keeps it here.
+            #
+            # Three CTEs keep each step separable: ``first_order`` assigns every
+            # customer their cohort; ``cohort_size`` is the denominator (the
+            # cohort's headcount, computed once so it is not re-derived per
+            # cell); ``activity`` lists the distinct months each customer was
+            # active in, tagged with their cohort.
+            #
+            # The month offset is deliberately arithmetic on the 'YYYY-MM'
+            # strings rather than a date function: SQLite has no month-difference
+            # builtin, and julianday() measures *days*, which would make offsets
+            # drift across months of unequal length. Converting each month to an
+            # absolute month number (year * 12 + month) and subtracting gives an
+            # exact whole-month distance. COUNT(DISTINCT customer_id) is used
+            # rather than COUNT(*) so the numerator is unambiguously "customers",
+            # independent of how ``activity`` happens to be deduplicated.
+            #
+            # Offset 0 is every cohort's own first month, so its retention is
+            # 100% by construction -- that row is the baseline the later
+            # percentages are read against, not a result.
+            (
+                re.compile(r"\bcohorts?\b|\bretention\b|\bretained\b", re.I),
+                """
+                WITH first_order AS (
+                    SELECT customer_id,
+                           strftime('%Y-%m', MIN(order_date)) AS cohort_month
+                    FROM orders
+                    GROUP BY customer_id
+                ),
+                cohort_size AS (
+                    SELECT cohort_month, COUNT(*) AS customers
+                    FROM first_order
+                    GROUP BY cohort_month
+                ),
+                activity AS (
+                    SELECT DISTINCT f.cohort_month AS cohort_month,
+                           o.customer_id AS customer_id,
+                           strftime('%Y-%m', o.order_date) AS active_month
+                    FROM orders o
+                    JOIN first_order f ON f.customer_id = o.customer_id
+                )
+                SELECT a.cohort_month,
+                       (CAST(substr(a.active_month, 1, 4) AS INTEGER) * 12
+                        + CAST(substr(a.active_month, 6, 2) AS INTEGER))
+                       - (CAST(substr(a.cohort_month, 1, 4) AS INTEGER) * 12
+                          + CAST(substr(a.cohort_month, 6, 2) AS INTEGER))
+                           AS month_offset,
+                       s.customers AS cohort_size,
+                       COUNT(DISTINCT a.customer_id) AS active_customers,
+                       ROUND(
+                           100.0 * COUNT(DISTINCT a.customer_id) / s.customers, 1
+                       ) AS retention_pct
+                FROM activity a
+                JOIN cohort_size s ON s.cohort_month = a.cohort_month
+                GROUP BY a.cohort_month, month_offset
+                ORDER BY a.cohort_month, month_offset
+                """,
+            ),
             (
                 re.compile(r"total sales by month.*2024", re.I),
                 """

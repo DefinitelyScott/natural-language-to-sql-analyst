@@ -128,6 +128,14 @@ orders per customer (a nested aggregation — a purchase-frequency histogram); a
 market-basket affinity (the product pairs most often bought together, via a
 self-join of `order_items`).
 
+**Cohort analysis** — monthly cohort retention: customers are grouped into
+acquisition cohorts by the month of their *first* order, and each cohort's
+retention is reported per month offset (one row per grid cell). This is the only
+pattern that measures behavior relative to each customer's own start date rather
+than the calendar, so the month offset is computed as arithmetic on `YYYY-MM`
+(year × 12 + month) rather than with `julianday()`, which measures days and would
+drift across months of unequal length.
+
 Every pattern in this catalog has a matching row in `evals/gold.jsonl`, so each
 one is measured by the evaluation harness rather than merely asserted here.
 
@@ -171,7 +179,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 36 questions  |  execution accuracy: 36/36 (100%)  [offline backend]
+Evaluated 37 questions  |  execution accuracy: 37/37 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -187,7 +195,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 23 of the 36 gold questions
+  `"ordered": true` and are compared as returned. 24 of the 37 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL
