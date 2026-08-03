@@ -244,10 +244,11 @@ class OfflineBackend:
             # groups as equal in size as possible, so quartile 1 is the
             # top-spending 25% of customers and quartile 4 the bottom 25%. The
             # outer query then rolls each quartile up into a one-row summary
-            # (customer count, total and average spend). This is the only rule
-            # that uses NTILE; it differs from the ROW_NUMBER top-per-region rule
-            # (which ranks every row to pick a single winner) in that NTILE only
-            # needs the bucket number, not a full ranking. customer_id is a
+            # (customer count, total and average spend). It differs from the
+            # ROW_NUMBER top-per-region rule (which ranks every row to pick a
+            # single winner) in that NTILE only needs the bucket number, not a
+            # full ranking; the RFM rule below is the only other NTILE user, and
+            # it buckets on three measures rather than one. customer_id is a
             # deterministic tiebreaker so tied spends fall on the same side of a
             # bucket boundary on every run. The matcher requires a quartile/tier
             # or "segment customers by spend" phrasing, so it does not shadow the
@@ -283,6 +284,100 @@ class OfflineBackend:
                 FROM bucketed
                 GROUP BY quartile
                 ORDER BY quartile
+                """,
+            ),
+            # RFM segmentation: score every buying customer on the three classic
+            # customer-value dimensions at once -- Recency (how long since their
+            # last order), Frequency (how many orders), Monetary (how much they
+            # spent) -- and label them with the combined RFM cell. Two other rules
+            # already look at one of these lenses in isolation: the at-risk rule
+            # is recency-only (a filter), and the spend-quartile rule is
+            # monetary-only (four buckets). This rule is what composes them, and
+            # the composition is the point: a customer can be a heavy spender and
+            # still be lapsing, which neither single-lens rule can express.
+            #
+            # ``customer_rfm`` reduces the order history to one row per customer
+            # holding all three raw measures. Recency is measured against the
+            # dataset's own MAX(order_date) rather than wall-clock today(), for
+            # the same reproducibility reason as the at-risk and last-30-days
+            # rules -- anchoring to the data keeps the answer stable for anyone
+            # who clones the repo. julianday() is the right function here (unlike
+            # in the cohort rule, which needs whole *months*) because recency is
+            # naturally counted in days, and CAST(... AS INTEGER) truncates the
+            # half-day artifact of differencing two date-only julian values.
+            # COUNT(DISTINCT o.id) is required rather than COUNT(*): the join to
+            # order_items multiplies each order by its line count, so COUNT(*)
+            # would measure items and silently inflate Frequency.
+            #
+            # ``scored`` then buckets each measure into fifths with NTILE(5).
+            # The three window functions deliberately do not sort the same way:
+            # Frequency and Monetary are ordered ASC so that more is better and
+            # 5 is the best score, while Recency is ordered DESC because for
+            # recency a *smaller* number is better -- the largest gap since the
+            # last order lands in bucket 1. Getting that inversion wrong is the
+            # classic RFM bug, and it is invisible in the output because the
+            # scores still look plausible. customer_id is a tiebreaker in every
+            # window so customers with identical measures fall on the same side
+            # of a bucket boundary on every run. The scores cannot be
+            # concatenated in the same SELECT that computes them (a window
+            # function's result is not addressable by alias in its own select
+            # list), which is why ``scored`` is a separate CTE and ``rfm_cell``
+            # is built in the outer query.
+            #
+            # The INNER JOIN means only customers who have ordered are scored: an
+            # RFM cell is undefined for someone with no recency and no frequency,
+            # and treating them as the worst-scoring segment would mix
+            # acquisition into a retention metric. The matcher owns the RFM
+            # acronym and the "recency, frequency, monetary" phrasing, which no
+            # other rule keys on.
+            (
+                re.compile(
+                    r"\brfm\b|"
+                    r"recency\s*,?\s*(and\s+)?frequency|"
+                    r"frequency\s*,?\s*(and\s+)?monetary",
+                    re.I,
+                ),
+                """
+                WITH customer_rfm AS (
+                    SELECT o.customer_id AS customer_id,
+                           CAST(
+                               julianday((SELECT MAX(order_date) FROM orders))
+                               - julianday(MAX(o.order_date)) AS INTEGER
+                           ) AS recency_days,
+                           COUNT(DISTINCT o.id) AS frequency,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS monetary
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.customer_id
+                ),
+                scored AS (
+                    SELECT r.customer_id AS customer_id,
+                           c.name AS name,
+                           r.recency_days AS recency_days,
+                           r.frequency AS frequency,
+                           r.monetary AS monetary,
+                           NTILE(5) OVER (
+                               ORDER BY r.recency_days DESC, r.customer_id
+                           ) AS r_score,
+                           NTILE(5) OVER (
+                               ORDER BY r.frequency ASC, r.customer_id
+                           ) AS f_score,
+                           NTILE(5) OVER (
+                               ORDER BY r.monetary ASC, r.customer_id
+                           ) AS m_score
+                    FROM customer_rfm r
+                    JOIN customers c ON c.id = r.customer_id
+                )
+                SELECT name,
+                       recency_days,
+                       frequency,
+                       monetary,
+                       r_score,
+                       f_score,
+                       m_score,
+                       r_score || f_score || m_score AS rfm_cell
+                FROM scored
+                ORDER BY monetary DESC, customer_id
                 """,
             ),
             # Average revenue per customer (ARPU): mean lifetime spend per paying
@@ -1079,14 +1174,47 @@ class OfflineBackend:
             ),
         ]
 
+    def rule_count(self) -> int:
+        """Return the number of question patterns registered in the catalog."""
+        return len(self._rules)
+
+    def rule_pattern(self, index: int) -> str:
+        """Return the regex source of the rule at ``index``.
+
+        Used to name a rule in a test failure message; a pattern is far more
+        recognizable than a bare index when a catalog invariant breaks.
+        """
+        return self._rules[index][0].pattern
+
+    def matching_rule_indexes(self, question: str) -> list[int]:
+        """Return the index of every rule whose matcher matches ``question``.
+
+        Resolution is first-rule-wins, so only ``[0]`` of this list decides the
+        SQL. The rest is what makes the catalog's ordering auditable: a rule
+        that matches but never wins is shadowed by a broader rule registered
+        ahead of it, and a rule that never appears first for any question is
+        unreachable. ``tests/test_rule_catalog.py`` asserts both properties
+        across the gold set.
+        """
+        return [
+            index
+            for index, (matcher, _) in enumerate(self._rules)
+            if matcher.search(question)
+        ]
+
     def to_sql(self, question: str, schema: str) -> str:  # noqa: ARG002
-        for matcher, sql in self._rules:
-            if matcher.search(question):
-                return " ".join(sql.split())
-        raise ValueError(
-            "Offline backend has no rule for this question. "
-            "Set OPENAI_API_KEY and use --llm for open-ended questions."
-        )
+        # Deliberately reuses ``matching_rule_indexes`` instead of short-circuiting
+        # on the first match: routing and the ordering diagnostic then share one
+        # implementation and cannot drift apart. Scanning ~40 small regexes is not
+        # a meaningful cost next to executing the query.
+        matches = self.matching_rule_indexes(question)
+        if not matches:
+            raise ValueError(
+                "Offline backend has no rule for this question. "
+                "Set OPENAI_API_KEY and use --llm for open-ended questions."
+            )
+        _, sql = self._rules[matches[0]]
+        return " ".join(sql.split())
 
 
 # --------------------------------------------------------------------------- #

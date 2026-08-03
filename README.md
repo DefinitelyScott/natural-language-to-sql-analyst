@@ -128,6 +128,15 @@ orders per customer (a nested aggregation — a purchase-frequency histogram); a
 market-basket affinity (the product pairs most often bought together, via a
 self-join of `order_items`).
 
+**Customer segmentation** — RFM scoring: every buying customer is scored 1–5 on
+recency, frequency and monetary value with three `NTILE(5)` windows, and labelled
+with the combined RFM cell. This is the pattern that *composes* the single-lens
+rules above — at-risk is recency-only, spend quartiles are monetary-only — which
+matters because a customer can be a heavy spender and still be lapsing. The
+recency window sorts `DESC` while the other two sort `ASC`, so that 5 always
+means "best"; inverting that is the classic RFM bug and it is invisible in the
+output, so a test pins the sort direction of each window.
+
 **Cohort analysis** — monthly cohort retention: customers are grouped into
 acquisition cohorts by the month of their *first* order, and each cohort's
 retention is reported per month offset (one row per grid cell). This is the only
@@ -139,17 +148,34 @@ drift across months of unequal length.
 Every pattern in this catalog has a matching row in `evals/gold.jsonl`, so each
 one is measured by the evaluation harness rather than merely asserted here.
 
+First-rule-wins has one failure mode: a pattern registered behind a broader one
+that also matches its questions can never win, so it becomes dead code that
+still *looks* implemented. `tests/test_rule_catalog.py` guards the whole catalog
+against that — it resolves every gold question and asserts the mapping from
+questions to rules is one-to-one, so a rule that no question reaches (shadowed,
+or missing a gold row) and a rule that two questions share both fail the suite.
+`OfflineBackend.matching_rule_indexes()` makes this checkable by returning
+*every* rule a question matches, not just the winning one; `to_sql` takes the
+first entry of that same list, so the diagnostic and the router cannot drift.
+
 ## Exporting results
 
-By default `ask` prints a human-readable table (truncated to 20 rows for
-readability). Pass `--format csv` or `--format json` to get the full result set
-in a machine-readable form. In these modes only the data is written to stdout —
+By default `ask` prints a human-readable table (previewing 20 rows for
+readability). Pass `--format csv` or `--format json` for a machine-readable
+form with no preview limit. In these modes only the data is written to stdout —
 the generated SQL goes to stderr — so you can redirect straight to a file:
 
 ```bash
 python -m nl2sql.cli ask "Show revenue by category" --format csv > revenue.csv
 python -m nl2sql.cli ask "Show revenue by region" --format json > revenue.json
 ```
+
+Every format is still bounded by the `--max-rows` safety cap (default 1000).
+A capped result is *flagged*, not silently shortened: `runner` fetches one row
+past the cap purely to learn whether more existed, and the CLI writes a warning
+to stderr (never to stdout, so a redirected export stays clean) naming the cap
+and how to raise it. This matters most for exports — a partial CSV that looks
+complete is worse than one that admits it is partial.
 
 ## Inspecting the schema
 
@@ -168,7 +194,8 @@ Generated SQL is never trusted blindly. `runner.py` enforces:
 
 - single-statement, `SELECT`-only execution (no `INSERT/UPDATE/DELETE/DDL`);
 - a connection opened in read-only mode;
-- a row cap on returned results.
+- a row cap on returned results, reported via `QueryResult.truncated` so a
+  capped result is never mistaken for a complete one.
 
 ## Evaluating quality
 
@@ -179,10 +206,97 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 37 questions  |  execution accuracy: 37/37 (100%)  [offline backend]
+Evaluated 38 questions  |  execution accuracy: 38/38 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
+
+### Per-question results
+
+A single accuracy number tells you *that* a backend regressed, not *why*. Every
+question therefore produces a structured record — the SQL that was generated,
+whether the run errored or merely disagreed, the row counts on both sides, and
+the first row where the two result sets diverge. Failures print that diagnostic
+inline:
+
+```
+Failures:
+  - What is the average order value?  [mismatch: first differing row (in sorted order, index 0): generated (612.44) vs gold (598.31)]
+  - Show revenue by quarter in 2024.  [error: UnsafeQueryError: only SELECT/WITH queries are allowed]
+```
+
+A row-count difference is reported on its own, because when the two result sets
+are different lengths the first positional disagreement is usually an artifact
+of the misalignment rather than the real defect. The reported index is read
+against the ordering the comparison actually used, which is why the message says
+which one that was: order-sensitive questions are compared as returned, the rest
+in sorted order.
+
+`--json` writes the same records to a file, so a CI run can archive them and two
+runs can be diffed:
+
+```bash
+python evals/evaluate.py --json eval-report.json
+```
+
+```json
+{
+  "backend": "offline",
+  "total": 38,
+  "passed": 38,
+  "execution_accuracy": 1.0,
+  "questions": [
+    {
+      "question": "What were total sales by month in 2024?",
+      "ordered": true,
+      "status": "pass",
+      "gold_sql": "SELECT strftime('%Y-%m', o.order_date) AS month, ...",
+      "generated_sql": "SELECT strftime('%Y-%m', o.order_date) AS month, ...",
+      "generated_rows": 12,
+      "gold_rows": 12,
+      "detail": null
+    }
+  ]
+}
+```
+
+`execution_accuracy` is a fraction rather than a rounded percentage so a machine
+consumer keeps full precision; only the console line rounds.
+
+### Comparing two runs
+
+Accuracy alone cannot answer "did anything break". Two runs can post the same
+number while failing a *different* set of questions — a regression and a fix
+cancelling out — which is the normal case when benchmarking prompt or model
+changes against the LLM backend, where accuracy is rarely 100%. `--compare`
+diffs the current run against a report previously written by `--json` and
+buckets every question by what changed:
+
+```bash
+python evals/evaluate.py --llm --json baseline.json   # record a baseline
+# ...change the prompt or model...
+python evals/evaluate.py --llm --compare baseline.json
+```
+
+The comparison block is printed after the usual run summary:
+
+```
+Comparison vs baseline  |  accuracy 89.5% -> 89.5%
+  [REGRESSED] What is the best-selling product in each category?
+  [fixed] What is the median order value?
+```
+
+Questions present in only one report are reported as `[new question]` or
+`[dropped question]` rather than as a fix or a regression: a newly added gold
+question that fails means the gold set grew to cover something the backend never
+handled, not that something broke. Reports are keyed by question text, so a
+report containing the same question twice is rejected rather than diffed
+ambiguously.
+
+The diff deliberately does not change the exit code. A regressed question is by
+definition failing now, so it already makes the run exit non-zero; gating on it
+a second time would add a condition that can never fire on its own. The
+comparison's job is to say *which* questions moved.
 
 ### What counts as a matching result
 
@@ -195,7 +309,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 24 of the 37 gold questions
+  `"ordered": true` and are compared as returned. 25 of the 38 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

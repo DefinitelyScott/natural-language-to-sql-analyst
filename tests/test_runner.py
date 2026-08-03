@@ -45,7 +45,33 @@ def test_run_caps_rows():
     if not os.path.exists(DB):
         pytest.skip("sample DB not built")
     res = runner.run(DB, "SELECT id FROM order_items", max_rows=5)
-    assert len(res) <= 5
+    assert len(res) == 5
+    assert res.truncated is True
+
+
+def test_run_does_not_flag_a_complete_result():
+    """A result well under the cap is complete, so nothing is flagged."""
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    res = runner.run(DB, "SELECT id FROM products", max_rows=1000)
+    # The sample DB is deterministic: 12 products.
+    assert len(res) == 12
+    assert res.truncated is False
+
+
+def test_run_result_exactly_at_the_cap_is_not_truncated():
+    """The boundary case: as many rows as the cap allows is still complete.
+
+    This is what the extra probe row buys. Fetching exactly ``max_rows`` would
+    make a result of precisely that length look identical to a truncated one,
+    and warning about a complete export is as misleading as staying silent
+    about a partial one.
+    """
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    res = runner.run(DB, "SELECT id FROM products", max_rows=12)
+    assert len(res) == 12
+    assert res.truncated is False
 
 
 def test_run_is_read_only():

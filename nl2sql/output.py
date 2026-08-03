@@ -9,7 +9,11 @@ by name:
   of values that contain commas, quotes, or newlines).
 * ``format_json`` — a JSON array of row objects keyed by column name.
 
-``csv`` and ``format_json`` never truncate: an export should contain every row.
+``format_csv`` and ``format_json`` apply no limit of their own: an export should
+contain every row it is handed. They cannot promise a *complete* export, though
+— ``runner.run`` caps how many rows reach them (``--max-rows``), and the CLI
+warns when that cap actually bit.
+
 Keeping these as pure functions (no I/O, no globals) makes them trivial to unit
 test and to reuse outside the CLI.
 """
@@ -58,7 +62,7 @@ def format_table(
 
 
 def format_csv(columns: Sequence[str], rows: Sequence[Row]) -> str:
-    """Render results as CSV with a header row. Never truncates."""
+    """Render results as CSV with a header row. Writes every row given."""
     buffer = io.StringIO()
     writer = csv.writer(buffer)
     writer.writerow(columns)
@@ -67,7 +71,7 @@ def format_csv(columns: Sequence[str], rows: Sequence[Row]) -> str:
 
 
 def format_json(columns: Sequence[str], rows: Sequence[Row]) -> str:
-    """Render results as a JSON array of row objects. Never truncates.
+    """Render results as a JSON array of row objects. Writes every row given.
 
     ``default=str`` keeps the call from failing on any value type SQLite can
     return that is not natively JSON-serializable (e.g. ``bytes``).

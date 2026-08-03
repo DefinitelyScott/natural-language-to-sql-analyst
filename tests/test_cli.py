@@ -46,6 +46,36 @@ def test_ask_command_table_output(capsys):
 
 
 @needs_db
+def test_ask_warns_on_stderr_when_the_row_cap_truncates(capsys):
+    """A capped result must announce itself, in every output format.
+
+    "Show revenue by category" returns one row per category (4 in the sample
+    DB), so a cap of 2 reliably truncates it.
+    """
+    exit_code = cli.main(
+        ["ask", "Show revenue by category", "--db", DB, "--max-rows", "2"]
+    )
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "truncated to 2 rows" in captured.err
+    # The warning is a diagnostic: it must not contaminate the data stream.
+    assert "truncated" not in captured.out
+
+
+@needs_db
+def test_ask_csv_export_is_clean_and_unwarned_when_complete(capsys):
+    """An export that fits under the cap is complete, so stderr carries no warning."""
+    exit_code = cli.main(["ask", "Show revenue by category", "--db", DB, "--format", "csv"])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "truncated" not in captured.err
+    lines = captured.out.strip().splitlines()
+    # Header + one row per category (4 categories in the sample DB).
+    assert lines[0] == "category,revenue"
+    assert len(lines) == 5
+
+
+@needs_db
 def test_ask_command_unrecognized_question_errors(capsys):
     assert cli.main(["ask", "what is the meaning of life?", "--db", DB]) == 1
     err = capsys.readouterr().err

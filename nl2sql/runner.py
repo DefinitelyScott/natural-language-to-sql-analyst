@@ -23,8 +23,19 @@ class UnsafeQueryError(ValueError):
 
 @dataclass
 class QueryResult:
+    """A materialized result set, plus whether the row cap cut it short.
+
+    ``truncated`` is True when the query had more rows available than the
+    caller's ``max_rows`` allowed. Without that flag a capped result is
+    indistinguishable from a complete one, so an export could quietly drop rows
+    while still looking like the whole answer. It defaults to False so a result
+    constructed by hand (in tests, say) is a complete one unless it says
+    otherwise.
+    """
+
     columns: list[str]
     rows: list[tuple]
+    truncated: bool = False
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -52,13 +63,24 @@ def validate(sql: str) -> str:
 
 
 def run(db_path: str, sql: str, *, max_rows: int = 1000) -> QueryResult:
-    """Execute validated SQL against a read-only connection."""
+    """Execute validated SQL against a read-only connection.
+
+    At most ``max_rows`` rows are returned. One row beyond the cap is fetched
+    purely as a probe: the cursor gives no "there is more" signal, so fetching
+    exactly ``max_rows`` cannot distinguish a result that happens to be that
+    long from one that was cut short. The extra row is discarded and only its
+    existence is reported, via ``QueryResult.truncated``.
+    """
     cleaned = validate(sql)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
         cur = conn.execute(cleaned)
         columns = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchmany(max_rows)
-        return QueryResult(columns=columns, rows=rows)
+        fetched = cur.fetchmany(max_rows + 1)
+        return QueryResult(
+            columns=columns,
+            rows=fetched[:max_rows],
+            truncated=len(fetched) > max_rows,
+        )
     finally:
         conn.close()

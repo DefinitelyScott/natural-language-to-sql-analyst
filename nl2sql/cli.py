@@ -37,7 +37,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "output format (default: table). With csv/json, only the data is "
             "written to stdout so it can be redirected to a file; the generated "
-            "SQL is written to stderr."
+            "SQL and any truncation warning go to stderr. csv/json write every "
+            "row the --max-rows cap allowed through, with no preview limit of "
+            "their own."
         ),
     )
 
@@ -86,6 +88,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     columns, rows = ans.result.columns, ans.result.rows
+
+    # Warn on stderr in every format. It is a diagnostic, not data, so it must
+    # not land in a redirected csv/json file — and in table mode the preview's
+    # "... (N more rows)" line would otherwise read as the full remainder when
+    # the row cap has already discarded rows behind it.
+    if ans.result.truncated:
+        print(
+            f"Warning: result truncated to {args.max_rows} rows by the "
+            "--max-rows cap; re-run with a larger --max-rows for the "
+            "complete result.",
+            file=sys.stderr,
+        )
 
     if args.format == "table":
         print(f"\nQuestion: {ans.question}\n")

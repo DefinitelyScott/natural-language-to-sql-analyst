@@ -1583,3 +1583,150 @@ def test_end_to_end_cohort_retention():
         for (cohort, offset), active in sorted(expected_active.items())
     ]
     assert rows == expected_rows
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Score customers into RFM segments.",
+        "Build an RFM segmentation of our customer base.",
+        "Rank customers by recency, frequency, and monetary value.",
+        "Show each customer's recency frequency and monetary scores.",
+    ],
+)
+def test_offline_matches_rfm_phrasings(question):
+    # The RFM rule owns the acronym and the spelled-out three-measure phrasing.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert sql.lower().startswith("with")
+    assert "NTILE(5)" in sql
+    assert "rfm_cell" in sql
+
+
+def test_rfm_scores_order_recency_opposite_to_frequency_and_monetary():
+    # The one thing that is easy to get wrong and invisible in the output: a
+    # high score must always mean "good", so recency (where a smaller gap is
+    # better) sorts DESC while frequency and monetary sort ASC.
+    sql = OfflineBackend().to_sql("Score customers into RFM segments.", schema="")
+    assert "NTILE(5) OVER ( ORDER BY r.recency_days DESC, r.customer_id )" in sql
+    assert "NTILE(5) OVER ( ORDER BY r.frequency ASC, r.customer_id )" in sql
+    assert "NTILE(5) OVER ( ORDER BY r.monetary ASC, r.customer_id )" in sql
+
+
+def test_rfm_does_not_shadow_quartile_or_at_risk_rules():
+    # RFM composes the recency and monetary lenses that two neighbouring rules
+    # own individually, so both must still reach their own patterns: the
+    # quartile rule (monetary-only buckets) and the at-risk rule (recency-only
+    # filter). All three concern customer value but answer different questions.
+    backend = OfflineBackend()
+    rfm = backend.to_sql("Score customers into RFM segments.", schema="")
+    quartiles = backend.to_sql("Segment customers into spend quartiles.", schema="")
+    at_risk = backend.to_sql("Which customers haven't ordered in the last 90 days?", schema="")
+
+    assert "NTILE(4)" in quartiles and "rfm_cell" not in quartiles
+    assert "last_order_date" in at_risk and "NTILE" not in at_risk
+    assert len({rfm, quartiles, at_risk}) == 3
+
+
+def _ntile(sorted_ids: list[int], buckets: int) -> dict[int, int]:
+    """Reproduce SQL ``NTILE`` in Python: map each id to its 1-based bucket.
+
+    ``NTILE`` splits ``n`` ordered rows into ``buckets`` groups as equal in size
+    as possible, giving the first ``n % buckets`` groups one extra row rather
+    than distributing the remainder evenly. Recomputing that rule here — instead
+    of assuming the groups divide evenly — is what makes the test independent of
+    how many customers the sample database happens to contain.
+    """
+    total = len(sorted_ids)
+    base, remainder = divmod(total, buckets)
+    assignment: dict[int, int] = {}
+    index = 0
+    for bucket in range(1, buckets + 1):
+        size = base + (1 if bucket <= remainder else 0)
+        for identifier in sorted_ids[index : index + size]:
+            assignment[identifier] = bucket
+        index += size
+    return assignment
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_rfm_segmentation():
+    # Verified two ways: (1) structural invariants that must hold for any RFM
+    # grid -- one row per buying customer, every score in 1..5, the cell string
+    # being the three scores concatenated, and the rows ranked by spend; and
+    # (2) an independent Python recomputation of all three measures and all
+    # three NTILE assignments straight from the raw orders.
+    import sqlite3
+    from collections import defaultdict
+    from datetime import date
+
+    ans = generator.answer_question(DB, "Score customers into RFM segments.")
+    assert ans.result.columns == [
+        "name",
+        "recency_days",
+        "frequency",
+        "monetary",
+        "r_score",
+        "f_score",
+        "m_score",
+        "rfm_cell",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert rows, "the RFM table should not be empty"
+
+    for _name, recency, frequency, monetary, r, f, m, cell in rows:
+        assert recency >= 0
+        assert frequency >= 1
+        assert monetary > 0
+        assert {r, f, m} <= {1, 2, 3, 4, 5}
+        assert cell == f"{r}{f}{m}"
+
+    # Ranked by spend, so the ordering is part of the answer.
+    assert [row[3] for row in rows] == sorted((row[3] for row in rows), reverse=True)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        raw = conn.execute(
+            "SELECT o.customer_id, o.id, o.order_date, oi.quantity, oi.unit_price "
+            "FROM orders o JOIN order_items oi ON oi.order_id = o.id"
+        ).fetchall()
+        names = dict(conn.execute("SELECT id, name FROM customers").fetchall())
+        as_of = conn.execute("SELECT MAX(order_date) FROM orders").fetchone()[0]
+    finally:
+        conn.close()
+
+    last_order: dict[int, str] = {}
+    order_ids: dict[int, set[int]] = defaultdict(set)
+    spend: dict[int, float] = defaultdict(float)
+    for customer_id, order_id, order_date, quantity, unit_price in raw:
+        last_order[customer_id] = max(last_order.get(customer_id, ""), order_date)
+        order_ids[customer_id].add(order_id)
+        spend[customer_id] += quantity * unit_price
+
+    anchor = date.fromisoformat(as_of)
+    recency = {
+        customer_id: (anchor - date.fromisoformat(latest)).days
+        for customer_id, latest in last_order.items()
+    }
+    frequency = {customer_id: len(ids) for customer_id, ids in order_ids.items()}
+    monetary = {customer_id: round(total, 2) for customer_id, total in spend.items()}
+    customers = sorted(recency)
+    assert len(rows) == len(customers)
+
+    r_score = _ntile(sorted(customers, key=lambda c: (-recency[c], c)), 5)
+    f_score = _ntile(sorted(customers, key=lambda c: (frequency[c], c)), 5)
+    m_score = _ntile(sorted(customers, key=lambda c: (monetary[c], c)), 5)
+
+    expected_rows = [
+        (
+            names[customer_id],
+            recency[customer_id],
+            frequency[customer_id],
+            monetary[customer_id],
+            r_score[customer_id],
+            f_score[customer_id],
+            m_score[customer_id],
+            f"{r_score[customer_id]}{f_score[customer_id]}{m_score[customer_id]}",
+        )
+        for customer_id in sorted(customers, key=lambda c: (-monetary[c], c))
+    ]
+    assert rows == expected_rows

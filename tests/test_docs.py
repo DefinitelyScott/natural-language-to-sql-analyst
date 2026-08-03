@@ -1,10 +1,10 @@
 """Keep the numbers quoted in the README in step with ``evals/gold.jsonl``.
 
-The README states two concrete figures: how many gold questions the evaluation
-harness runs, and how many of those are order-sensitive. Both change every time
-a question pattern is added, and a stale figure in a README is worse than no
-figure at all — it reads as a metric that was reported once and never
-re-measured.
+The README states three concrete figures: how many gold questions the evaluation
+harness runs, how many of those are order-sensitive, and the ``total``/``passed``
+pair in the sample ``--json`` report. All change every time a question pattern is
+added, and a stale figure in a README is worse than no figure at all — it reads
+as a metric that was reported once and never re-measured.
 
 Rather than rely on remembering to edit prose, these tests parse the claims back
 out of the README and compare them to the gold file itself. The regexes are
@@ -31,6 +31,9 @@ _TOTAL_RE = re.compile(r"Evaluated (\d+) questions")
 _ACCURACY_RE = re.compile(r"execution accuracy: (\d+)/(\d+)")
 # "23 of the 36 gold questions are order-sensitive."
 _ORDERED_RE = re.compile(r"(\d+) of the (\d+) gold questions\s+are order-sensitive")
+# `"total": 36,` / `"passed": 36,` — the sample `--json` report body.
+_JSON_TOTAL_RE = re.compile(r'"total":\s*(\d+)')
+_JSON_PASSED_RE = re.compile(r'"passed":\s*(\d+)')
 
 
 @pytest.fixture(scope="module")
@@ -74,6 +77,19 @@ def test_readme_accuracy_line_matches_gold(readme: str, gold_counts: tuple[int, 
             f"README shows execution accuracy {passed}/{evaluated}; "
             f"evals/gold.jsonl has {total} questions and the offline backend passes all of them"
         )
+
+
+def test_readme_json_report_sample_matches_gold(readme: str, gold_counts: tuple[int, int]) -> None:
+    """The sample ``--json`` report shows a passing run, so both keys are the total."""
+    total, _ = gold_counts
+    claimed_total = _JSON_TOTAL_RE.findall(readme)
+    claimed_passed = _JSON_PASSED_RE.findall(readme)
+    assert claimed_total, 'README no longer shows a \'"total": N\' line in the sample report'
+    assert claimed_passed, 'README no longer shows a \'"passed": N\' line in the sample report'
+    assert all(int(count) == total for count in claimed_total + claimed_passed), (
+        f"README sample report claims total={claimed_total} passed={claimed_passed} "
+        f"but evals/gold.jsonl has {total} questions, all of which the offline backend passes"
+    )
 
 
 def test_readme_order_sensitive_count_matches_gold(
