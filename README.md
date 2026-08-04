@@ -109,6 +109,16 @@ in `WHERE`).
 week, new customers by month, unique active customers per month, orders in the
 last 30 days.
 
+**Period-over-period comparison** — first-half vs second-half 2024 revenue for
+every product, with the absolute and percentage change between them. This is the
+catalog's only *conditional aggregation*: `SUM(CASE WHEN ... THEN ... ELSE 0 END)`
+pivots two date ranges into side-by-side columns in a single pass, so the change
+the question asks for can be subtracted within one row. `ELSE 0` (not `ELSE
+NULL`) keeps a product sold in only one half in the result instead of letting
+NULL propagate through the subtraction and drop exactly the products whose
+change is most extreme; `NULLIF` guards the percentage against a product with no
+first-half sales.
+
 **Window functions** — month-over-month revenue growth (`LAG`); cumulative
 running-total revenue by month (an explicit `ROWS BETWEEN UNBOUNDED PRECEDING
 AND CURRENT ROW` frame); the top-spending customer within each region (a
@@ -206,7 +216,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 38 questions  |  execution accuracy: 38/38 (100%)  [offline backend]
+Evaluated 39 questions  |  execution accuracy: 39/39 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -242,8 +252,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 38,
-  "passed": 38,
+  "total": 39,
+  "passed": 39,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -309,7 +319,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 25 of the 38 gold questions
+  `"ordered": true` and are compared as returned. 26 of the 39 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

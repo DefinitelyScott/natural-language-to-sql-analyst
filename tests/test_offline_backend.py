@@ -1730,3 +1730,116 @@ def test_end_to_end_rfm_segmentation():
         for customer_id in sorted(customers, key=lambda c: (-monetary[c], c))
     ]
     assert rows == expected_rows
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which products grew or declined in the second half of 2024?",
+        "Compare product revenue in the first half of 2024 with the rest of the year.",
+        "Show me first half vs second half sales by product.",
+        "Break product revenue into H1 and H2.",
+        "Give me half-over-half revenue by product.",
+    ],
+)
+def test_offline_matches_half_over_half_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "h1_revenue" in sql and "h2_revenue" in sql
+    assert "CASE WHEN o.order_date < '2024-07-01'" in sql
+
+
+def test_half_over_half_does_not_shadow_quarter_or_top_products():
+    # The half comparison and the quarterly time series both slice revenue by a
+    # date range, and both this rule and the top-products rule mention products
+    # and revenue. Each pair must keep routing to its own pattern.
+    backend = OfflineBackend()
+
+    quarter_sql = backend.to_sql("Show revenue by quarter in 2024.", schema="")
+    assert "'2024-Q'" in quarter_sql
+    assert "h1_revenue" not in quarter_sql
+
+    top_products_sql = backend.to_sql("What are the top 5 products by revenue?", schema="")
+    assert "LIMIT 5" in top_products_sql
+    assert "h1_revenue" not in top_products_sql
+
+    half_sql = backend.to_sql(
+        "Which products grew or declined in the second half of 2024?", schema=""
+    )
+    assert "'2024-Q'" not in half_sql and "LIMIT" not in half_sql
+
+
+def test_half_over_half_keeps_products_sold_in_only_one_half():
+    """``ELSE 0`` is what keeps an appeared/vanished product in the result.
+
+    With ``ELSE NULL`` the untouched half would be NULL, the subtraction would
+    yield NULL, and the products with the most extreme change would sort out of
+    the answer they exist to surface. Pinning the branch keeps that from being
+    "simplified" away later.
+    """
+    sql = OfflineBackend().to_sql("Show half-over-half revenue by product.", schema="")
+    assert sql.count("ELSE 0 END") == 2
+    assert "ELSE NULL" not in sql
+    # The percentage, unlike the absolute change, must decline to divide by zero.
+    assert "NULLIF(h1_revenue, 0)" in sql
+
+
+def test_end_to_end_half_over_half_product_revenue():
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(
+        DB, "Which products grew or declined in the second half of 2024?"
+    )
+    assert ans.result.columns == [
+        "product",
+        "h1_revenue",
+        "h2_revenue",
+        "revenue_change",
+        "pct_change",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert rows, "the half-over-half table should not be empty"
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        raw = conn.execute(
+            "SELECT p.name, o.order_date, oi.quantity, oi.unit_price "
+            "FROM products p "
+            "JOIN order_items oi ON oi.product_id = p.id "
+            "JOIN orders o ON o.id = oi.order_id"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    h1: dict[str, float] = defaultdict(float)
+    h2: dict[str, float] = defaultdict(float)
+    for name, order_date, quantity, unit_price in raw:
+        if not ("2024-01-01" <= order_date < "2025-01-01"):
+            continue
+        half = h1 if order_date < "2024-07-01" else h2
+        half[name] += quantity * unit_price
+
+    products = sorted(set(h1) | set(h2))
+    expected = sorted(
+        (
+            (
+                name,
+                round(h1[name], 2),
+                round(h2[name], 2),
+                round(h2[name] - h1[name], 2),
+            )
+            for name in products
+        ),
+        key=lambda row: (-row[3], row[0]),
+    )
+    assert [row[:4] for row in rows] == expected
+
+    for name, first_half, second_half, change, pct in rows:
+        # The two halves must partition the year: nothing double-counted, and
+        # nothing (an order in neither half) dropped.
+        assert round(first_half + second_half, 2) == round(
+            h1[name] + h2[name], 2
+        )
+        assert change == round(second_half - first_half, 2)
+        # Rounded to one decimal by SQL, so compare within half a step.
+        assert pct == pytest.approx(100.0 * change / first_half, abs=0.05)

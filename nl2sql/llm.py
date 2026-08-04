@@ -1041,6 +1041,72 @@ class OfflineBackend:
                 ORDER BY quarter
                 """,
             ),
+            # First-half vs second-half 2024 revenue for every product: the
+            # "what is trending up, what is trending down" question, which is
+            # asked of products far more often than of the business as a whole.
+            #
+            # This is the catalog's only *conditional aggregation* (a pivot):
+            # two date ranges become two side-by-side columns rather than two
+            # rows, because SUM(CASE WHEN ... THEN ... ELSE 0 END) applies a
+            # different filter per output column within one GROUP BY. The
+            # alternative -- grouping by half and reading two rows per product,
+            # or self-joining a filtered aggregate to itself -- makes the
+            # subtraction that the question actually asks for (h2 - h1) awkward:
+            # it cannot be expressed until the two halves sit in the same row.
+            # This form scans the join once and lands both halves together.
+            #
+            # ELSE 0 rather than ELSE NULL is deliberate. A product sold in only
+            # one half must report 0.00 for the other, not NULL: NULL would
+            # propagate through the subtraction and drop exactly the products
+            # whose change is most extreme -- the ones that appeared or vanished
+            # -- from a result whose whole purpose is to surface them.
+            #
+            # pct_change divides by NULLIF(h1_revenue, 0) so a product with no
+            # first-half sales yields NULL rather than a meaningless percentage
+            # (SQLite returns NULL for x/0 rather than raising, so the guard is
+            # about stating the intent, not about avoiding an error). Its
+            # absolute change is still reported, which is the honest reading:
+            # growth from zero has a magnitude but no percentage.
+            #
+            # The matcher owns the half/H1/H2 vocabulary, which no other rule
+            # uses, and the ordering tiebreak on product name keeps two products
+            # with an identical change in a stable order across runs.
+            (
+                re.compile(
+                    r"(first|1st|second|2nd)\s+half\s+of\s+(the\s+)?(year|2024)|"
+                    r"(first|1st)\s+half\b.*\b(second|2nd)\s+half\b|"
+                    r"\bh1\b.*\bh2\b|"
+                    r"half[-\s]?over[-\s]?half",
+                    re.I,
+                ),
+                """
+                WITH product_halves AS (
+                    SELECT p.name AS product,
+                           SUM(CASE WHEN o.order_date < '2024-07-01'
+                                    THEN oi.quantity * oi.unit_price
+                                    ELSE 0 END) AS h1_revenue,
+                           SUM(CASE WHEN o.order_date >= '2024-07-01'
+                                    THEN oi.quantity * oi.unit_price
+                                    ELSE 0 END) AS h2_revenue
+                    FROM products p
+                    JOIN order_items oi ON oi.product_id = p.id
+                    JOIN orders o ON o.id = oi.order_id
+                    WHERE o.order_date >= '2024-01-01'
+                      AND o.order_date < '2025-01-01'
+                    GROUP BY p.id
+                )
+                SELECT product,
+                       ROUND(h1_revenue, 2) AS h1_revenue,
+                       ROUND(h2_revenue, 2) AS h2_revenue,
+                       ROUND(h2_revenue - h1_revenue, 2) AS revenue_change,
+                       ROUND(
+                           100.0 * (h2_revenue - h1_revenue)
+                           / NULLIF(h1_revenue, 0), 1
+                       ) AS pct_change
+                FROM product_halves
+                ORDER BY revenue_change DESC, product
+                """,
+            ),
             # Revenue split by day of the week (Sunday..Saturday). SQLite's
             # strftime('%w', ...) returns the weekday as a digit 0-6 with
             # Sunday == 0; a CASE expression turns that digit into a readable
