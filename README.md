@@ -138,6 +138,16 @@ orders per customer (a nested aggregation — a purchase-frequency histogram); a
 market-basket affinity (the product pairs most often bought together, via a
 self-join of `order_items`).
 
+**Revenue concentration** — the Pareto ("80-20") view: customers are ranked by
+lifetime revenue, split into five equal groups with `NTILE(5)`, and each quintile
+reports its revenue, its share of total revenue, and the *cumulative* share
+through that quintile. The cumulative column is what separates this from the
+spend quartiles below — quartiles say how much a tier is worth, concentration
+says how much of the whole it accounts for, which is the question a running share
+answers and a per-bucket total does not. (On this synthetic dataset the curve is
+shallow: the top quintile takes ~36% of revenue, not 80%. The sample data is
+generated from a uniform draw, so it has no long tail to find.)
+
 **Customer segmentation** — RFM scoring: every buying customer is scored 1–5 on
 recency, frequency and monetary value with three `NTILE(5)` windows, and labelled
 with the combined RFM cell. This is the pattern that *composes* the single-lens
@@ -216,7 +226,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 39 questions  |  execution accuracy: 39/39 (100%)  [offline backend]
+Evaluated 40 questions  |  execution accuracy: 40/40 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -252,8 +262,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 39,
-  "passed": 39,
+  "total": 40,
+  "passed": 40,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -319,7 +329,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 26 of the 39 gold questions
+  `"ordered": true` and are compared as returned. 27 of the 40 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

@@ -1843,3 +1843,85 @@ def test_end_to_end_half_over_half_product_revenue():
         assert change == round(second_half - first_half, 2)
         # Rounded to one decimal by SQL, so compare within half a step.
         assert pct == pytest.approx(100.0 * change / first_half, abs=0.05)
+
+
+def test_revenue_concentration_phrasings_route_to_the_pareto_rule():
+    """The concentration vocabulary must not fall through to a neighbouring rule.
+
+    "Top 20% of customers" reads like the top-spenders rule and "quintile" reads
+    like the quartiles rule, so these phrasings are the ones most likely to be
+    silently reabsorbed if the catalog is reordered later.
+    """
+    backend = OfflineBackend()
+    for question in (
+        "What share of revenue comes from the top 20% of customers?",
+        "Show revenue concentration by customer quintile.",
+        "Run a Pareto analysis of customer revenue.",
+        "Is our revenue an 80/20 split?",
+    ):
+        sql = backend.to_sql(question, schema="")
+        assert "NTILE(5)" in sql, question
+        assert "cumulative_share_pct" in sql, question
+
+
+def test_revenue_concentration_ntile_ordering_is_descending_and_tie_broken():
+    """Quintile 1 must be the *top* spenders, and bucketing must be repeatable.
+
+    An ASC ordering would silently invert the whole table -- the numbers still
+    look plausible, they just describe the bottom 20% -- and without the
+    customer_id tiebreak two customers on identical revenue could land in
+    different buckets from run to run.
+    """
+    sql = OfflineBackend().to_sql(
+        "Show revenue concentration by customer quintile.", schema=""
+    )
+    assert "NTILE(5) OVER (ORDER BY revenue DESC, customer_id)" in " ".join(sql.split())
+
+
+def test_end_to_end_revenue_concentration():
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "What share of revenue comes from the top 20% of customers?"
+    )
+    assert ans.result.columns == [
+        "quintile",
+        "customers",
+        "revenue",
+        "revenue_share_pct",
+        "cumulative_share_pct",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert [row[0] for row in rows] == [1, 2, 3, 4, 5]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        per_customer = [
+            revenue
+            for (revenue,) in conn.execute(
+                "SELECT SUM(oi.quantity * oi.unit_price) "
+                "FROM orders o JOIN order_items oi ON oi.order_id = o.id "
+                "GROUP BY o.customer_id"
+            )
+        ]
+    finally:
+        conn.close()
+
+    # Every buying customer is bucketed exactly once, and NTILE splits them into
+    # groups as equal in size as possible (sizes differ by at most one).
+    assert sum(row[1] for row in rows) == len(per_customer)
+    assert max(row[1] for row in rows) - min(row[1] for row in rows) <= 1
+
+    # The quintiles partition revenue: their shares sum to 100% and the
+    # cumulative column is the running sum of the per-quintile shares.
+    total_revenue = sum(per_customer)
+    assert sum(row[2] for row in rows) == pytest.approx(total_revenue, abs=0.05)
+    assert rows[-1][4] == pytest.approx(100.0, abs=0.05)
+    running = 0.0
+    for _, _, _, share, cumulative in rows:
+        running += share
+        assert cumulative == pytest.approx(running, abs=0.05)
+
+    # Quintile 1 holds the top spenders, so revenue must decline monotonically.
+    revenues = [row[2] for row in rows]
+    assert revenues == sorted(revenues, reverse=True)

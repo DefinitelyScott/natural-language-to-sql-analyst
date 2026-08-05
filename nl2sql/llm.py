@@ -286,6 +286,81 @@ class OfflineBackend:
                 ORDER BY quartile
                 """,
             ),
+            # Revenue concentration (Pareto / "80-20") across the customer base:
+            # customers are ranked by lifetime revenue and split into five equal
+            # groups with NTILE(5), then each quintile reports its revenue, its
+            # share of total revenue, and the *cumulative* share through that
+            # quintile. Reading down the last column answers the question the
+            # quintiles exist for -- "what share of revenue comes from the top
+            # 20% / 40% / ... of customers" -- in one pass.
+            #
+            # It shares NTILE with the spend-quartiles rule above but answers a
+            # different question: quartiles report each tier's own spend (how
+            # much a tier is worth), while this reports each tier's share of the
+            # whole (how concentrated the business is). Concentration is the
+            # question a running share answers and a per-bucket total does not,
+            # which is why the cumulative column is here and not there.
+            #
+            # Two window functions over the same pre-aggregated CTE keep the
+            # arithmetic readable: SUM(revenue) OVER () is the grand total (the
+            # denominator for both percentages), and the same sum with an
+            # explicit ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW frame,
+            # ordered by quintile, is the running numerator. Aggregating into
+            # ``per_quintile`` first means neither window has to nest an
+            # aggregate inside itself.
+            #
+            # customer_id breaks ties in the NTILE ordering so two customers with
+            # identical revenue always fall on the same side of a bucket boundary
+            # across runs. The matcher owns the pareto / 80-20 / concentration /
+            # quintile vocabulary, which no other rule uses -- note "quintile"
+            # is deliberately distinct from the quartiles rule's "quartile".
+            (
+                re.compile(
+                    r"\bpareto\b|"
+                    r"\b80[/\-\s]?20\b|"
+                    r"(revenue|sales|spend(?:ing)?)\s+concentration|"
+                    r"concentration\s+of\s+(revenue|sales|spend(?:ing)?)|"
+                    r"top\s*20\s*%|"
+                    r"\bquintiles?\b",
+                    re.I,
+                ),
+                """
+                WITH customer_revenue AS (
+                    SELECT o.customer_id AS customer_id,
+                           SUM(oi.quantity * oi.unit_price) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.customer_id
+                ),
+                ranked AS (
+                    SELECT revenue,
+                           NTILE(5) OVER (ORDER BY revenue DESC, customer_id)
+                               AS quintile
+                    FROM customer_revenue
+                ),
+                per_quintile AS (
+                    SELECT quintile,
+                           COUNT(*) AS customers,
+                           SUM(revenue) AS revenue
+                    FROM ranked
+                    GROUP BY quintile
+                )
+                SELECT quintile,
+                       customers,
+                       ROUND(revenue, 2) AS revenue,
+                       ROUND(100.0 * revenue / SUM(revenue) OVER (), 2)
+                           AS revenue_share_pct,
+                       ROUND(
+                           100.0 * SUM(revenue) OVER (
+                               ORDER BY quintile
+                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                           ) / SUM(revenue) OVER (),
+                           2
+                       ) AS cumulative_share_pct
+                FROM per_quintile
+                ORDER BY quintile
+                """,
+            ),
             # RFM segmentation: score every buying customer on the three classic
             # customer-value dimensions at once -- Recency (how long since their
             # last order), Frequency (how many orders), Monetary (how much they
