@@ -299,6 +299,6 @@ def test_ordered_flag_has_teeth_against_the_real_database():
 
 def test_gold_file_is_valid_jsonl():
     with open(GOLD_PATH, encoding="utf-8") as fh:
-        for lineno, line in enumerate(fh, 1):
+        for line in fh:
             if line.strip():
                 json.loads(line)  # raises on malformed JSON

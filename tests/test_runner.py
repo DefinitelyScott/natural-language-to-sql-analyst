@@ -79,3 +79,84 @@ def test_run_is_read_only():
         pytest.skip("sample DB not built")
     with pytest.raises((UnsafeQueryError, sqlite3.OperationalError)):
         runner.run(DB, "DELETE FROM customers")
+
+
+# --------------------------------------------------------------------------- #
+# Engine-level authorizer (second guardrail layer)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "action",
+    [
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE,
+    ],
+)
+def test_authorizer_allows_read_only_actions(action):
+    assert runner._authorizer(action, None, None, None, None) == sqlite3.SQLITE_OK
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        sqlite3.SQLITE_INSERT,
+        sqlite3.SQLITE_UPDATE,
+        sqlite3.SQLITE_DELETE,
+        sqlite3.SQLITE_DROP_TABLE,
+        sqlite3.SQLITE_ATTACH,
+        sqlite3.SQLITE_DETACH,
+        sqlite3.SQLITE_PRAGMA,
+        sqlite3.SQLITE_TRANSACTION,
+        sqlite3.SQLITE_CREATE_TABLE,
+    ],
+)
+def test_authorizer_denies_everything_else(action):
+    assert runner._authorizer(action, None, None, None, None) == sqlite3.SQLITE_DENY
+
+
+def test_authorizer_catches_what_the_validator_misses(monkeypatch):
+    """The two guardrail layers must be independent.
+
+    ``run`` calls :func:`runner.validate` first, so under normal operation the
+    string check refuses an ``ATTACH`` before the engine ever sees it — which
+    also means the normal path can never *demonstrate* that the second layer
+    works. Disabling the first layer is the only way to test the second one in
+    isolation: with ``validate`` stubbed out to wave everything through, an
+    ``ATTACH`` (which would open another file on disk) must still be refused,
+    now by the authorizer at statement-compile time.
+    """
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    monkeypatch.setattr(runner, "validate", lambda sql: sql)
+    with pytest.raises(UnsafeQueryError, match="engine-level authorizer"):
+        runner.run(DB, "ATTACH ':memory:' AS other")
+
+
+def test_authorizer_still_allows_real_analytics_queries():
+    """Aggregates, CTEs, and window functions all pass the allowlist.
+
+    This is the counterpart to the denial tests: an allowlist that is too
+    narrow would break legitimate queries, and this query deliberately
+    exercises every allowed action code at once — SELECT, table/column reads,
+    function calls (strftime, SUM, a window function), and a CTE.
+    """
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    res = runner.run(
+        DB,
+        """
+        WITH monthly AS (
+            SELECT strftime('%Y-%m', o.order_date) AS month,
+                   SUM(oi.quantity * oi.unit_price) AS revenue
+            FROM orders o
+            JOIN order_items oi ON oi.order_id = o.id
+            GROUP BY month
+        )
+        SELECT month, revenue, SUM(revenue) OVER (ORDER BY month) AS running
+        FROM monthly
+        ORDER BY month
+        """,
+    )
+    assert res.columns == ["month", "revenue", "running"]
+    assert len(res) > 0

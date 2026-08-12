@@ -13,7 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 llm = ["openai>=1.0"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "ruff>=0.16"]
 
 [project.scripts]
 nl2sql = "nl2sql.cli:main"
@@ -22,3 +22,30 @@ nl2sql = "nl2sql.cli:main"
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# A deliberately curated set rather than ALL: each family here catches a class
+# of defect this codebase actually contains guards against (unused arguments in
+# protocol impls, blind excepts, private-member access), so a violation is
+# signal, not noise. The inline `noqa` codes that predate this config (E402,
+# BLE001, ARG002, SLF001) are load-bearing under exactly these families.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort import ordering
+    "UP",  # pyupgrade (keep syntax at the 3.10 floor, no older idioms)
+    "B",   # bugbear (e.g. zip() without strict=, mutable default args)
+    "ARG", # unused function/method/lambda arguments
+    "BLE", # blind `except Exception` without a reason
+    "SLF", # private-member access across module boundaries
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests legitimately reach into internals (that is what they test) and define
+# stubs/mocks that take a protocol's full signature without consulting it.
+"tests/*" = ["SLF001", "ARG"]

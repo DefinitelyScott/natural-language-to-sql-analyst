@@ -179,7 +179,7 @@ def test_end_to_end_revenue_growth():
 
     assert ans.result.rows[0][2] is None
     for (_, revenue, change), (_, prev_revenue, _) in zip(
-        ans.result.rows[1:], ans.result.rows[:-1]
+        ans.result.rows[1:], ans.result.rows[:-1], strict=True
     ):
         assert change == round(revenue - prev_revenue, 2)
 
@@ -531,7 +531,7 @@ def test_end_to_end_cumulative_revenue():
     assert cumulatives == sorted(cumulatives)  # non-decreasing
     assert cumulatives[0] == ans.result.rows[0][1]  # first month: no prior sum
     for (_, revenue, cumulative), prev_cumulative in zip(
-        ans.result.rows[1:], cumulatives[:-1]
+        ans.result.rows[1:], cumulatives[:-1], strict=True
     ):
         assert cumulative == round(prev_cumulative + revenue, 2)
 
@@ -1925,3 +1925,266 @@ def test_end_to_end_revenue_concentration():
     # Quintile 1 holds the top spenders, so revenue must decline monotonically.
     revenues = [row[2] for row in rows]
     assert revenues == sorted(revenues, reverse=True)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show the 7-day moving average of daily revenue.",
+        "What is the rolling average of daily sales?",
+        "Plot smoothed daily revenue.",
+        "Show a trailing mean of daily revenue.",
+    ],
+)
+def test_offline_matches_moving_average_phrasings(question):
+    # All the smoothed-trend phrasings must land on the bounded-frame window
+    # rule, built over the recursive calendar spine.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "ROWS BETWEEN 6 PRECEDING AND CURRENT ROW" in sql, question
+    assert sql.lower().startswith("with recursive"), question
+
+
+def test_moving_average_fills_calendar_gaps():
+    """The spine join must be a LEFT JOIN with zero-fill.
+
+    An inner join would drop days with no orders, silently widening the
+    "7-day" window to whatever span holds seven *selling* days — the exact
+    defect the calendar spine exists to prevent.
+    """
+    sql = " ".join(
+        OfflineBackend()
+        .to_sql("Show the 7-day moving average of daily revenue.", schema="")
+        .split()
+    )
+    assert "LEFT JOIN daily d ON d.day = c.day" in sql
+    assert "COALESCE(d.revenue, 0)" in sql
+
+
+def test_moving_average_does_not_shadow_neighbouring_rules():
+    """The new vocabulary must not absorb nearby average/window questions.
+
+    "Moving average" shares words with the AOV rules ("average") and sits next
+    to the cumulative rule in the catalog, so these are the questions most at
+    risk of being re-routed if the matcher is ever loosened.
+    """
+    backend = OfflineBackend()
+
+    cumulative = backend.to_sql("Show cumulative revenue by month in 2024.", schema="")
+    assert "UNBOUNDED PRECEDING" in cumulative
+    assert "6 PRECEDING" not in cumulative
+
+    aov = backend.to_sql("What is the average order value?", schema="")
+    assert "average_order_value" in aov
+
+    weekday = backend.to_sql("Show revenue by day of week.", schema="")
+    assert "weekday" in weekday
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_moving_average():
+    import sqlite3
+    from datetime import date, timedelta
+
+    ans = generator.answer_question(
+        DB, "Show the 7-day moving average of daily revenue."
+    )
+    assert ans.result.columns == ["day", "revenue", "avg_7day_revenue"]
+    rows = [tuple(row) for row in ans.result.rows]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        daily = dict(
+            conn.execute(
+                "SELECT o.order_date, SUM(oi.quantity * oi.unit_price) "
+                "FROM orders o JOIN order_items oi ON oi.order_id = o.id "
+                "GROUP BY o.order_date"
+            )
+        )
+        ((first, last),) = conn.execute(
+            "SELECT MIN(order_date), MAX(order_date) FROM orders"
+        )
+    finally:
+        conn.close()
+
+    # The calendar spine must cover every day from first to last order,
+    # consecutively, with no gaps — including days that had no orders.
+    start, end = date.fromisoformat(first), date.fromisoformat(last)
+    expected_days = [
+        (start + timedelta(days=offset)).isoformat()
+        for offset in range((end - start).days + 1)
+    ]
+    assert [row[0] for row in rows] == expected_days
+    assert len(rows) > len(daily), (
+        "expected at least one zero-order day; if the sample data ever fills "
+        "every calendar day this gap-fill assertion needs a synthetic fixture"
+    )
+
+    # Recompute the zero-filled series and the trailing window independently:
+    # each avg_7day_revenue must equal the mean of that day and the (up to) six
+    # days before it.
+    unrounded = [daily.get(day, 0.0) for day in expected_days]
+    for index, (_, revenue, avg7) in enumerate(rows):
+        assert revenue == pytest.approx(unrounded[index], abs=0.01)
+        window = unrounded[max(0, index - 6) : index + 1]
+        assert avg7 == pytest.approx(sum(window) / len(window), abs=0.01)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many orders contain products from more than one category?",
+        "How many orders include multiple categories?",
+        "How many orders span two or more categories?",
+        "How many cross-category orders are there?",
+    ],
+)
+def test_offline_matches_multi_category_order_phrasings(question):
+    # "What share of orders ..." phrasings are deliberately absent: the
+    # category-revenue-share rule owns share/percentage wording near
+    # "category", and this rule does not contest it -- it claims the
+    # count-style phrasings only (the SQL still reports the share alongside
+    # the count).
+    # Every phrasing must route to the basket-breadth rule: a per-order
+    # DISTINCT category count filtered to genuinely mixed baskets.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "COUNT(DISTINCT p.category)" in sql
+    assert "category_count > 1" in sql
+
+
+def test_multi_category_rule_does_not_shadow_broad_order_count():
+    # A bare order-count question must still fall through to the simple COUNT
+    # rule; only the mixed-basket phrasings belong to the breadth rule. The
+    # reverse shadowing is the designed-in case: the breadth question contains
+    # "how many orders", so the broad rule matches it too and must lose.
+    backend = OfflineBackend()
+    plain = backend.to_sql("How many orders do we have?", schema="")
+    assert plain == "SELECT COUNT(*) AS order_count FROM orders"
+
+    breadth_question = "How many orders contain products from more than one category?"
+    assert "category_count" in backend.to_sql(breadth_question, schema="")
+    matches = backend.matching_rule_indexes(breadth_question)
+    assert len(matches) == 2, (
+        "expected the breadth question to match its own rule plus the shadowed "
+        "broad order-count rule"
+    )
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_multi_category_orders():
+    # Cross-check against an independent Python recomputation: collect each
+    # order's distinct categories from the raw item rows, count the orders that
+    # touch more than one, and derive the share from the full orders table.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "How many orders contain products from more than one category?"
+    )
+    assert ans.result.columns == ["multi_category_orders", "pct_of_orders"]
+    ((multi, pct),) = [tuple(row) for row in ans.result.rows]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        categories_by_order: dict[int, set[str]] = {}
+        for order_id, category in conn.execute(
+            "SELECT oi.order_id, p.category FROM order_items oi "
+            "JOIN products p ON p.id = oi.product_id"
+        ):
+            categories_by_order.setdefault(order_id, set()).add(category)
+        ((total_orders,),) = conn.execute("SELECT COUNT(*) FROM orders")
+    finally:
+        conn.close()
+
+    expected_multi = sum(
+        1 for categories in categories_by_order.values() if len(categories) > 1
+    )
+    assert multi == expected_multi
+    assert pct == pytest.approx(round(100.0 * expected_multi / total_orders, 1))
+    # Sanity bounds: some but not all orders should mix categories -- the
+    # sample generator draws products uniformly, so both extremes would signal
+    # a data or query bug rather than a real distribution.
+    assert 0 < multi < total_orders
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What are the 10 largest orders?",
+        "Show the biggest orders",
+        "Top 10 orders by value",
+        "Which orders had the highest value?",
+    ],
+)
+def test_offline_matches_largest_orders_phrasings(question):
+    # Every phrasing must route to the drill-down rule: one row per order,
+    # ranked by its total with the order id as a deterministic tiebreaker.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY o.id" in sql
+    assert "ORDER BY order_total DESC, o.id" in sql
+    assert "LIMIT 10" in sql
+
+
+def test_largest_orders_owns_its_phrasings_exclusively():
+    # The largest/biggest/highest-value vocabulary is used by no other rule, so
+    # the drill-down neither shadows nor is shadowed by its neighbours: the
+    # broad order-count rule keeps its bare count question, and the top-N
+    # customer/product ranking rules keep theirs.
+    backend = OfflineBackend()
+    matches = backend.matching_rule_indexes("What are the 10 largest orders?")
+    assert len(matches) == 1, (
+        "expected the largest-orders question to match only its own rule; "
+        "a second match means another rule now contests this vocabulary"
+    )
+    assert backend.to_sql("How many orders do we have?", schema="") == (
+        "SELECT COUNT(*) AS order_count FROM orders"
+    )
+    customers_sql = backend.to_sql("Which 5 customers spent the most?", schema="")
+    assert "GROUP BY o.id" not in customers_sql
+    products_sql = backend.to_sql("What are the top 5 products by revenue?", schema="")
+    assert "GROUP BY o.id" not in products_sql
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_largest_orders():
+    # Cross-check against an independent Python recomputation: total every
+    # order from the raw item rows, sort by (total desc, order id), and the
+    # query's top 10 must agree row for row -- ids, dates, customer names, and
+    # totals alike.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "What are the 10 largest orders?")
+    assert ans.result.columns == ["order_id", "order_date", "customer", "order_total"]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert len(rows) == 10
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        totals: dict[int, float] = {}
+        for order_id, quantity, unit_price in conn.execute(
+            "SELECT order_id, quantity, unit_price FROM order_items"
+        ):
+            totals[order_id] = totals.get(order_id, 0.0) + quantity * unit_price
+        meta = {
+            order_id: (order_date, name)
+            for order_id, order_date, name in conn.execute(
+                "SELECT o.id, o.order_date, c.name FROM orders o "
+                "JOIN customers c ON c.id = o.customer_id"
+            )
+        }
+    finally:
+        conn.close()
+
+    # Sort on the *rounded* total because that is what the query orders by
+    # (the alias names the rounded column); the id tiebreaker keeps equal
+    # totals deterministic in both implementations.
+    expected = sorted(totals.items(), key=lambda kv: (-round(kv[1], 2), kv[0]))[:10]
+    for (order_id, total), (row_id, row_date, row_customer, row_total) in zip(
+        expected, rows, strict=True
+    ):
+        assert row_id == order_id
+        assert (row_date, row_customer) == meta[order_id]
+        assert row_total == pytest.approx(round(total, 2))
+
+    # Ranking must be non-increasing -- a wrong sort direction would still pass
+    # a set comparison, so pin the order explicitly.
+    result_totals = [row[3] for row in rows]
+    assert result_totals == sorted(result_totals, reverse=True)

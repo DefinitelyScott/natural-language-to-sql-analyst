@@ -23,7 +23,8 @@ from __future__ import annotations
 import csv
 import io
 import json
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 Row = Sequence[Any]
 
@@ -75,6 +76,10 @@ def format_json(columns: Sequence[str], rows: Sequence[Row]) -> str:
 
     ``default=str`` keeps the call from failing on any value type SQLite can
     return that is not natively JSON-serializable (e.g. ``bytes``).
+
+    ``strict=True`` turns a column/row length mismatch into an error instead of
+    silently dropping the extra cells — a truncated record that still looks
+    well-formed is the worst possible export.
     """
-    records = [dict(zip(columns, row)) for row in rows]
+    records = [dict(zip(columns, row, strict=True)) for row in rows]
     return json.dumps(records, indent=2, default=str)

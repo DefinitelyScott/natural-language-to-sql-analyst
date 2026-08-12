@@ -1,8 +1,9 @@
 """Command-line interface.
 
 Commands:
-    ask "<question>"   answer a natural-language question with SQL + results
-    schema [--counts]  print the introspected database schema
+    ask "<question>"      answer a natural-language question with SQL + results
+    explain "<question>"  show the SQL a question resolves to, without running it
+    schema [--counts]     print the introspected database schema
 """
 
 from __future__ import annotations
@@ -19,6 +20,37 @@ _DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "
 # How many rows to show in the human-readable table preview before truncating.
 # csv/json output is never truncated — an export should be complete.
 _TABLE_PREVIEW_ROWS = 20
+
+
+def _print_explanation(exp: generator.Explanation) -> int:
+    """Print a dry-run report. Return the process exit code.
+
+    An unsafe query exits 1 even though the command itself succeeded: the
+    linter convention (report findings, exit non-zero) is more useful here than
+    the "the command ran, so 0" one, because it lets a script gate on
+    ``explain`` before ever letting the SQL near the database.
+    """
+    print(f"\nQuestion: {exp.question}")
+    print(f"Backend:  {exp.backend}")
+
+    if exp.matched_rule is not None:
+        print(f"\nMatched offline rule #{exp.matched_rule}: {exp.matched_pattern}")
+        if exp.shadowed_rules:
+            # Later rules that also match are inert — first-rule-wins. Showing
+            # them is how you tell a deliberate ordering from an accidental one
+            # when adding a pattern to the catalog.
+            print("Also matched (shadowed, in catalog order):")
+            for index, pattern in exp.shadowed_rules:
+                print(f"  #{index}: {pattern}")
+
+    print("\nSQL (not executed):")
+    print("  " + exp.sql)
+
+    if exp.is_safe:
+        print("\nSafety: passes the read-only validator.\n")
+        return 0
+    print(f"\nSafety: REJECTED — {exp.safety_error}\n", file=sys.stderr)
+    return 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -42,6 +74,23 @@ def main(argv: list[str] | None = None) -> int:
             "their own."
         ),
     )
+
+    why = sub.add_parser(
+        "explain",
+        help="show the SQL a question resolves to, without executing it",
+        description=(
+            "Dry run: generate the SQL for a question and report how it was "
+            "produced — which offline rule matched, which other rules matched "
+            "but were shadowed by it, and whether the SQL passes the read-only "
+            "safety validator. The query is never executed, so this is safe to "
+            "point at SQL you do not yet trust. Exits 1 when the SQL would be "
+            "rejected as unsafe, so it can be used as a pre-flight check in a "
+            "script."
+        ),
+    )
+    why.add_argument("question", help="the question, in plain English")
+    why.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
+    why.add_argument("--llm", action="store_true", help="use the LLM backend")
 
     show = sub.add_parser(
         "schema",
@@ -78,6 +127,14 @@ def main(argv: list[str] | None = None) -> int:
             for name, count in counts:
                 print(f"  {name:<{width}}  {count:,}")
         return 0
+
+    if args.command == "explain":
+        try:
+            exp = generator.explain_question(args.db, args.question, use_llm=args.llm)
+        except (ValueError, RuntimeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        return _print_explanation(exp)
 
     try:
         ans = generator.answer_question(

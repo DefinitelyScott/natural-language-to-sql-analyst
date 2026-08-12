@@ -1,7 +1,21 @@
 """Safe, read-only execution of generated SQL.
 
-Generated SQL is untrusted. We enforce that it is a single SELECT statement,
-open the database read-only, and cap the number of returned rows.
+Generated SQL is untrusted, so it passes through two independent layers:
+
+1. :func:`validate` — a string-level check (single statement, SELECT-only, a
+   denylist of write/DDL keywords). It runs first because it produces clear,
+   specific error messages a user can act on.
+2. An engine-level *authorizer* — SQLite consults a callback for every
+   operation while compiling a statement, and anything outside a small
+   read-only allowlist is denied. A denylist can only reject what it thought
+   to name; the authorizer inverts that, so a construct the regex never
+   anticipated (say, ``ATTACH`` reaching the engine through some phrasing the
+   pattern misses — which would let a query open *other files on disk*) is
+   still refused. ``mode=ro`` protects the target database file, but only the
+   authorizer covers the whole engine surface.
+
+The connection is additionally opened read-only, and results are capped at
+``max_rows``.
 """
 
 from __future__ import annotations
@@ -19,6 +33,47 @@ _FORBIDDEN = re.compile(
 
 class UnsafeQueryError(ValueError):
     """Raised when generated SQL is not a safe, single read-only statement."""
+
+
+#: SQLite action codes a read-only analytics query legitimately needs.
+#:
+#: - SQLITE_SELECT: the statement (and any subquery) itself.
+#: - SQLITE_READ: each table/column access.
+#: - SQLITE_FUNCTION: every function call — aggregates (SUM), scalar functions
+#:   (strftime, ROUND), and window functions all authorize through this code.
+#: - SQLITE_RECURSIVE: WITH RECURSIVE — recursion over data we may already
+#:   read adds no new capability, so there is no reason to refuse it.
+#:
+#: Everything else — writes, DDL, ATTACH, PRAGMA, transaction control — is
+#: denied. Allowlisting what a SELECT needs is a much shorter (and safer) list
+#: than trying to enumerate everything that must be forbidden.
+_ALLOWED_ACTIONS = frozenset(
+    {
+        sqlite3.SQLITE_SELECT,
+        sqlite3.SQLITE_READ,
+        sqlite3.SQLITE_FUNCTION,
+        sqlite3.SQLITE_RECURSIVE,
+    }
+)
+
+
+def _authorizer(
+    action: int,
+    arg1: str | None,
+    arg2: str | None,
+    db_name: str | None,
+    trigger: str | None,
+) -> int:
+    """SQLite authorizer callback: allow read-only actions, deny the rest.
+
+    Installed on every connection :func:`run` opens. SQLite invokes it while
+    *compiling* a statement, so a denied action fails at prepare time with a
+    ``DatabaseError('not authorized')`` — before any part of the query runs.
+    The unused arguments carry per-action detail (table name, column name);
+    this policy is deliberately coarse and decides on the action code alone.
+    """
+    del arg1, arg2, db_name, trigger  # policy depends only on the action code
+    return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
 
 
 @dataclass
@@ -73,8 +128,21 @@ def run(db_path: str, sql: str, *, max_rows: int = 1000) -> QueryResult:
     """
     cleaned = validate(sql)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn.set_authorizer(_authorizer)
     try:
-        cur = conn.execute(cleaned)
+        try:
+            cur = conn.execute(cleaned)
+        except sqlite3.DatabaseError as exc:
+            # The authorizer reports a denial as a generic "not authorized"
+            # DatabaseError. Re-raise it as UnsafeQueryError so callers see one
+            # exception type for "this SQL was refused", whichever layer
+            # refused it; any other DatabaseError (bad table name, SQL syntax
+            # error) propagates unchanged.
+            if "not authorized" in str(exc):
+                raise UnsafeQueryError(
+                    f"query denied by the engine-level authorizer: {exc}"
+                ) from exc
+            raise
         columns = [d[0] for d in cur.description] if cur.description else []
         fetched = cur.fetchmany(max_rows + 1)
         return QueryResult(

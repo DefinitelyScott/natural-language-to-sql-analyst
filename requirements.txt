@@ -1,4 +1,5 @@
 # The core project runs on the Python standard library only.
 # These are for development and the optional LLM backend.
 pytest>=8.0
+ruff>=0.16    # lint; configured in pyproject.toml, run with `ruff check .`
 openai>=1.0   # optional: only needed for the --llm backend

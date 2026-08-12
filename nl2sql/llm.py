@@ -188,6 +188,75 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
+            # 7-day moving average of daily revenue: the smoothed daily trend.
+            # Daily revenue is noisy (a handful of orders per day), so the
+            # trailing average is what makes the direction readable. Three
+            # idioms appear here and nowhere else in the catalog:
+            #
+            #   * A *recursive CTE* (``calendar``) generates one row per
+            #     calendar day from the first order date to the last. It is
+            #     needed for correctness, not decoration: a "7-day" average
+            #     computed with ROWS over only the days that appear in the
+            #     orders table would silently widen whenever a day had no
+            #     orders — the frame counts rows, not days, so missing days
+            #     make "6 PRECEDING" reach further back than a week. Anchoring
+            #     the spine to MIN/MAX(order_date) keeps the result
+            #     reproducible from the data alone, like the other
+            #     data-anchored rules.
+            #   * A *LEFT JOIN* from the spine to the per-day revenue, with
+            #     COALESCE(revenue, 0) filling the gaps. An inner join would
+            #     drop the zero-revenue days and reintroduce exactly the bug
+            #     the spine exists to fix; a day with no orders contributes
+            #     0 to the average, which is the honest reading.
+            #   * A *bounded* window frame: ROWS BETWEEN 6 PRECEDING AND
+            #     CURRENT ROW is a sliding 7-day window, in contrast to the
+            #     cumulative rule's UNBOUNDED PRECEDING frame (which only ever
+            #     grows) and the LAG rules (which look at a single prior row).
+            #     Because the spine is gap-free, rows and days coincide and
+            #     the frame really is one week.
+            #
+            # The first six rows average over fewer than seven days (the
+            # window is truncated at the start of the data); SQL window
+            # frames do this by construction and reporting a partial-window
+            # average is the standard convention for a leading edge. The
+            # matcher owns the moving/rolling/trailing-average and "smoothed"
+            # vocabulary, which no other rule uses, so it neither shadows nor
+            # is shadowed by the AOV or cumulative-revenue rules.
+            (
+                re.compile(
+                    r"(moving|rolling|trailing)\s+(average|avg|mean)|"
+                    r"\b(7|seven)[-\s]?day\s+(average|avg|mean)|"
+                    r"smoothed\s+(daily\s+)?(revenue|sales)",
+                    re.I,
+                ),
+                """
+                WITH RECURSIVE calendar(day) AS (
+                    SELECT (SELECT MIN(order_date) FROM orders)
+                    UNION ALL
+                    SELECT date(day, '+1 day')
+                    FROM calendar
+                    WHERE day < (SELECT MAX(order_date) FROM orders)
+                ),
+                daily AS (
+                    SELECT o.order_date AS day,
+                           SUM(oi.quantity * oi.unit_price) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    GROUP BY o.order_date
+                )
+                SELECT c.day,
+                       ROUND(COALESCE(d.revenue, 0), 2) AS revenue,
+                       ROUND(
+                           AVG(COALESCE(d.revenue, 0)) OVER (
+                               ORDER BY c.day
+                               ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                           ), 2
+                       ) AS avg_7day_revenue
+                FROM calendar c
+                LEFT JOIN daily d ON d.day = c.day
+                ORDER BY c.day
+                """,
+            ),
             # The single highest-spending customer within each region: the classic
             # "greatest-N-per-group" (top-1-per-partition) problem. A first CTE
             # totals each customer's spend and carries their region; the second
@@ -1288,6 +1357,89 @@ class OfflineBackend:
                 FROM orders_per_customer
                 GROUP BY order_count
                 ORDER BY order_count
+                """,
+            ),
+            # Multi-category orders: how many orders mix products from more
+            # than one category, and what share of all orders that is. This is
+            # a *basket-breadth* measure -- where basket size (units per order)
+            # asks how much a customer buys at once, this asks how widely, which
+            # is the quantity a cross-sell effort is trying to move.
+            #
+            # COUNT(DISTINCT p.category) is what makes the per-order count a
+            # breadth: two Electronics items in one order are one category, not
+            # two, so only genuinely mixed baskets clear the > 1 bar. The CTE
+            # keeps "how many categories does each order touch" as its own
+            # reusable per-order fact, and the *outer* WHERE applies the
+            # more-than-one cut -- the filter belongs to this question, not to
+            # the fact. The share's denominator is the orders table itself
+            # rather than the CTE, so the reported percentage is honestly "of
+            # all orders" even for a hypothetical order with no items (which
+            # would be absent from the CTE).
+            #
+            # The natural phrasing contains "how many orders", which the broad
+            # order-count rule below also matches; registering this rule ahead
+            # of it is what routes the question here (first-rule-wins), and
+            # `explain` reports the broad rule as shadowed for exactly this
+            # question.
+            (
+                re.compile(
+                    r"orders?\b.*\b(more than one|multiple|two or more|several)\b"
+                    r".*categor|cross[-\s]categor",
+                    re.I,
+                ),
+                """
+                WITH categories_per_order AS (
+                    SELECT oi.order_id,
+                           COUNT(DISTINCT p.category) AS category_count
+                    FROM order_items oi
+                    JOIN products p ON p.id = oi.product_id
+                    GROUP BY oi.order_id
+                )
+                SELECT COUNT(*) AS multi_category_orders,
+                       ROUND(
+                           100.0 * COUNT(*) / (SELECT COUNT(*) FROM orders), 1
+                       ) AS pct_of_orders
+                FROM categories_per_order
+                WHERE category_count > 1
+                """,
+            ),
+            # The 10 largest orders by value -- the catalog's only *drill-down*:
+            # every other rule aggregates away individual rows (by month, by
+            # category, by customer), while this one surfaces specific orders,
+            # with date and customer attached so an outlier can be followed up
+            # ("who placed it, and when?"). That is the natural next question
+            # after any aggregate looks off -- a spike in a monthly total is
+            # usually one or two unusually large orders, and this is the query
+            # that finds them.
+            #
+            # GROUP BY o.id is safe here even though order_date and the customer
+            # name are selected bare: o.id is the orders table's primary key, so
+            # both are single-valued within each group -- there is exactly one
+            # date and one customer per order, so nothing is being arbitrarily
+            # picked. Ordering is by the rounded alias (what the user sees) with
+            # o.id as a deterministic tiebreaker, so two orders with equal totals
+            # rank the same way on every run. The matcher owns the
+            # largest/biggest/highest-value orders phrasings, which no other rule
+            # uses; "top N orders" is claimed only with a following "orders" so
+            # it cannot collide with the top-customers or top-products rules.
+            (
+                re.compile(
+                    r"(largest|biggest|highest[-\s]?value)\s+(\d+\s+)?orders?|"
+                    r"top\s+\d+\s+orders\b|"
+                    r"orders?\b.*\bhighest\s+(value|total)",
+                    re.I,
+                ),
+                """
+                SELECT o.id AS order_id,
+                       o.order_date,
+                       c.name AS customer,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS order_total
+                FROM orders o
+                JOIN customers c ON c.id = o.customer_id
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY o.id
+                ORDER BY order_total DESC, o.id
+                LIMIT 10
                 """,
             ),
             # The rules below are intentionally placed last. Matching is

@@ -126,7 +126,9 @@ def describe_difference(
         return f"row count differs: generated {len(generated)}, gold {len(gold)}"
 
     order_note = "as returned" if ordered else "in sorted order"
-    for index, (got, want) in enumerate(zip(generated, gold)):
+    # strict=True is safe here — the length check above already returned on a
+    # mismatch — and documents that the walk assumes aligned result sets.
+    for index, (got, want) in enumerate(zip(generated, gold, strict=True)):
         if got != want:
             return (
                 f"first differing row ({order_note}, index {index}): "

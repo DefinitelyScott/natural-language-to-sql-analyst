@@ -27,7 +27,7 @@ nl2sql-analyst/
 │   ├── generator.py     # orchestrates NL question -> SQL
 │   ├── runner.py        # read-only, guarded SQL execution
 │   ├── output.py        # table / CSV / JSON result formatters
-│   └── cli.py           # `nl2sql ask "..."` / `nl2sql schema`
+│   └── cli.py           # `nl2sql ask "..."` / `explain "..."` / `schema`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
 │   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
@@ -121,14 +121,28 @@ first-half sales.
 
 **Window functions** — month-over-month revenue growth (`LAG`); cumulative
 running-total revenue by month (an explicit `ROWS BETWEEN UNBOUNDED PRECEDING
-AND CURRENT ROW` frame); the top-spending customer within each region (a
+AND CURRENT ROW` frame); a 7-day moving average of daily revenue (a *bounded*
+`ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` frame over a gap-free calendar spine
+— the catalog's only recursive CTE and only `LEFT JOIN`; without the spine's
+zero-filled days, a rows-based frame would silently span more than a week
+whenever a day had no orders); the top-spending customer within each region (a
 partitioned greatest-N-per-group ranking via `ROW_NUMBER()`); customer spend
 quartiles (`NTILE(4)`); and the average gap between a customer's consecutive
 orders (a partitioned `LAG` over `order_date`).
 
 **Per-order statistics** — average order value overall, by region, and as a
 monthly trend; median order value (a `LIMIT`/`OFFSET` middle-row query, since
-SQLite has no `MEDIAN` function); average units per order (basket size).
+SQLite has no `MEDIAN` function); average units per order (basket size); and
+multi-category orders — the count and share of orders mixing more than one
+product category (basket *breadth*, the cross-sell measure basket size is not).
+A CTE computes `COUNT(DISTINCT category)` per order so repeated products in one
+category count once, and the share's denominator is the `orders` table itself so
+the percentage stays "of all orders" rather than "of orders with items".
+This group also holds the catalog's only *drill-down*: the 10 largest orders by
+value, returned as individual orders with their date and customer attached.
+Every other rule aggregates rows away; this one surfaces the specific outliers
+an aggregate points at — a spike in a monthly total is usually one or two
+unusually large orders, and this is the query that finds them.
 
 **Customer behavior (RFM-style)** — top 5 customers by spend; repeat customers;
 average revenue per customer; average customer lifespan; at-risk (lapsed)
@@ -197,6 +211,41 @@ to stderr (never to stdout, so a redirected export stays clean) naming the cap
 and how to raise it. This matters most for exports — a partial CSV that looks
 complete is worse than one that admits it is partial.
 
+## Explaining a query before running it
+
+`explain` is a dry run: it generates the SQL for a question and reports how that
+SQL was produced, without executing anything.
+
+```bash
+python -m nl2sql.cli explain "How many orders were placed in the last 30 days?"
+```
+
+```
+Question: How many orders were placed in the last 30 days?
+Backend:  offline
+
+Matched offline rule #28: orders.*last (30|thirty) days
+Also matched (shadowed, in catalog order):
+  #38: how many orders|number of orders|total orders|order count
+
+SQL (not executed):
+  SELECT COUNT(*) AS recent_orders FROM orders WHERE order_date >= date((SELECT MAX(order_date) FROM orders), '-30 day')
+
+Safety: passes the read-only validator.
+```
+
+Two things it is good for:
+
+- **Auditing catalog ordering.** Matching is first-rule-wins, so a rule that
+  matches but is registered later is inert. `explain` names those shadowed rules
+  explicitly, which is how you tell a deliberate ordering from an accidental one
+  when adding a pattern. (`tests/test_rule_catalog.py` enforces the same
+  property across the whole gold set; `explain` is the interactive view of it.)
+- **Pre-flighting untrusted SQL.** With `--llm` the model's output is shown and
+  run through the same read-only validator `ask` uses — but never executed. The
+  command exits `1` when the SQL would be rejected, so it can gate a script the
+  way a linter does.
+
 ## Inspecting the schema
 
 `schema` prints the introspected schema exactly as it is rendered into the LLM
@@ -212,7 +261,16 @@ python -m nl2sql.cli schema --counts
 
 Generated SQL is never trusted blindly. `runner.py` enforces:
 
-- single-statement, `SELECT`-only execution (no `INSERT/UPDATE/DELETE/DDL`);
+- single-statement, `SELECT`-only execution (no `INSERT/UPDATE/DELETE/DDL`),
+  checked at the string level first because a string check can say *why* it
+  refused ("multiple statements are not allowed");
+- an **engine-level authorizer** as a second, independent layer: SQLite
+  consults a callback for every operation while compiling a statement, and
+  anything outside a four-item read-only allowlist (`SELECT`, table/column
+  reads, function calls, recursive CTEs) is denied. The string check is a
+  denylist and a denylist only rejects what it thought to name — the
+  authorizer inverts that, so a construct the regex never anticipated (e.g.
+  an `ATTACH`, which would open other files on disk) is still refused;
 - a connection opened in read-only mode;
 - a row cap on returned results, reported via `QueryResult.truncated` so a
   capped result is never mistaken for a complete one.
@@ -226,7 +284,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 40 questions  |  execution accuracy: 40/40 (100%)  [offline backend]
+Evaluated 43 questions  |  execution accuracy: 43/43 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -262,8 +320,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 40,
-  "passed": 40,
+  "total": 43,
+  "passed": 43,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -329,7 +387,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 27 of the 40 gold questions
+  `"ordered": true` and are compared as returned. 29 of the 43 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL
@@ -341,11 +399,21 @@ Those counts are not maintained by hand. `tests/test_docs.py` parses them back
 out of this README and compares them to `evals/gold.jsonl`, so adding a question
 without refreshing the numbers fails the suite.
 
-## Tests
+## Tests and linting
 
 ```bash
 pytest -q
+ruff check .   # same config CI runs, from pyproject.toml
 ```
+
+CI runs the lint as its own job alongside the test matrix. The ruff ruleset is
+deliberately curated rather than `ALL` — each enabled family (pyflakes,
+bugbear's `zip(strict=)` and mutable-default checks, unused-argument,
+blind-except, private-member access) catches a class of defect this codebase
+actively guards against, so any violation is signal. Tests are exempted from
+the unused-argument and private-member rules: stubs implement a protocol's full
+signature without consulting it, and reaching into internals is what a unit
+test is for.
 
 ## License
 
