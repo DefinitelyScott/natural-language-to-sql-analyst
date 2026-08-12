@@ -103,7 +103,12 @@ revenue.
 category; top products by revenue; best-selling product by units, both overall
 and within each category; each category's share of total revenue
 (`SUM(...) OVER ()`); categories whose revenue beats the mean (a scalar subquery
-in `WHERE`).
+in `WHERE`); revenue by price tier — fixed-threshold `CASE` *banding* of a
+continuous variable, the complement of the `NTILE` spend quartiles below: bands
+have fixed, meaningful boundaries whose populations move with the data, while
+quantiles have equal-count populations whose boundaries move. Tiers are assigned
+from the catalog list price, not the transacted unit price, so a product cannot
+straddle bands if a sale happened at a different price.
 
 **Time series** — total sales by month, revenue by quarter, revenue by day of
 week, new customers by month, unique active customers per month, orders in the
@@ -284,7 +289,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 43 questions  |  execution accuracy: 43/43 (100%)  [offline backend]
+Evaluated 44 questions  |  execution accuracy: 44/44 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -320,8 +325,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 43,
-  "passed": 43,
+  "total": 44,
+  "passed": 44,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -387,7 +392,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 29 of the 43 gold questions
+  `"ordered": true` and are compared as returned. 30 of the 44 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

@@ -2188,3 +2188,90 @@ def test_end_to_end_largest_orders():
     # a set comparison, so pin the order explicitly.
     result_totals = [row[3] for row in rows]
     assert result_totals == sorted(result_totals, reverse=True)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by price tier.",
+        "What is the revenue by price band?",
+        "Break down sales by price bracket.",
+        "How much revenue does each price tier bring in?",
+    ],
+)
+def test_offline_matches_price_tier_phrasings(question):
+    # All price-banding phrasings resolve to the fixed-threshold CASE rule,
+    # which tiers products by catalog list price (p.price), not the transacted
+    # unit price.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WHEN p.price < 20" in sql
+    assert "GROUP BY price_tier" in sql
+    assert "ORDER BY MIN(p.price)" in sql
+
+
+def test_price_tier_does_not_shadow_other_revenue_rules():
+    # "price tier" vocabulary is unique to the banding rule: plain revenue
+    # breakdowns and the NTILE spend-quartile rule must be untouched by it,
+    # and the tier question must match exactly one rule.
+    backend = OfflineBackend()
+    assert len(backend.matching_rule_indexes("Show revenue by price tier.")) == 1
+
+    by_category = backend.to_sql("Show revenue by category", schema="")
+    assert "price_tier" not in by_category
+
+    by_region = backend.to_sql("Show revenue by region", schema="")
+    assert "price_tier" not in by_region
+
+    quartiles = backend.to_sql("Segment customers into spend quartiles.", schema="")
+    assert "price_tier" not in quartiles
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_revenue_by_price_tier():
+    # Cross-check against an independent Python recomputation over the raw
+    # item rows: bucket each product by its catalog price, accumulate units
+    # and revenue per bucket, and the query must agree tier for tier. The
+    # tiers must come back cheapest-first, and their revenues must sum to
+    # total revenue -- every item row lands in exactly one band.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "Show revenue by price tier.")
+    assert ans.result.columns == ["price_tier", "products", "units_sold", "revenue"]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert [row[0] for row in rows] == [
+        "Budget (under $20)",
+        "Mid-range ($20-$39.99)",
+        "Premium ($40 and up)",
+    ]
+
+    def tier(price: float) -> str:
+        if price < 20:
+            return "Budget (under $20)"
+        if price < 40:
+            return "Mid-range ($20-$39.99)"
+        return "Premium ($40 and up)"
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        expected: dict[str, dict[str, float]] = {}
+        seen_products: dict[str, set[int]] = {}
+        for product_id, price, quantity, unit_price in conn.execute(
+            "SELECT p.id, p.price, oi.quantity, oi.unit_price "
+            "FROM order_items oi JOIN products p ON p.id = oi.product_id"
+        ):
+            band = tier(price)
+            bucket = expected.setdefault(band, {"units": 0, "revenue": 0.0})
+            bucket["units"] += quantity
+            bucket["revenue"] += quantity * unit_price
+            seen_products.setdefault(band, set()).add(product_id)
+    finally:
+        conn.close()
+
+    for band, products, units, revenue in rows:
+        assert products == len(seen_products[band])
+        assert units == expected[band]["units"]
+        assert revenue == pytest.approx(round(expected[band]["revenue"], 2))
+
+    tier_total = round(sum(row[3] for row in rows), 2)
+    total = generator.answer_question(DB, "What is the total revenue?")
+    assert tier_total == pytest.approx(total.result.rows[0][0], abs=0.02)

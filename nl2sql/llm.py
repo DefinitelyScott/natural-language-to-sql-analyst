@@ -1125,6 +1125,53 @@ class OfflineBackend:
                 ORDER BY revenue DESC
                 """,
             ),
+            # Revenue by price tier -- fixed-threshold *banding* of a continuous
+            # variable: each product falls into Budget / Mid-range / Premium by
+            # comparing its price against dollar cutoffs. This is the complement
+            # of the NTILE(4) spend-quartile rule: NTILE builds equal-*count*
+            # buckets whose boundaries move with the data, while a CASE band has
+            # fixed, meaningful boundaries ("under $20") whose *populations*
+            # move with the data. An analyst reaches for bands when the
+            # thresholds themselves carry business meaning (a pricing strategy,
+            # a free-shipping cutoff) and for quantiles when they only need
+            # equal-sized cohorts.
+            #
+            # The tier is derived from p.price (the catalog list price), not
+            # oi.unit_price (the transacted price): a product's tier is a
+            # property of the product, so it must not straddle tiers if a
+            # historical sale happened at a different price. Revenue still sums
+            # oi.unit_price, because money earned is a property of the
+            # transaction. In the sample DB the two are equal, but keeping the
+            # roles distinct is what makes the query correct on data where they
+            # are not.
+            #
+            # SQLite allows GROUP BY on the SELECT alias, so the CASE is not
+            # repeated. ORDER BY MIN(p.price) sorts the tiers cheapest-first --
+            # by their actual contents rather than alphabetically (which would
+            # interleave them: Budget, Mid-range, Premium only sorts correctly
+            # by accident of these labels).
+            (
+                re.compile(
+                    r"(revenue|sales)\b.*\bprice\s+(tier|band|bracket)s?|"
+                    r"\bprice\s+(tier|band|bracket)s?\b.*\b(revenue|sales)|"
+                    r"by\s+price\s+(tier|band|bracket)s?",
+                    re.I,
+                ),
+                """
+                SELECT CASE
+                           WHEN p.price < 20 THEN 'Budget (under $20)'
+                           WHEN p.price < 40 THEN 'Mid-range ($20-$39.99)'
+                           ELSE 'Premium ($40 and up)'
+                       END AS price_tier,
+                       COUNT(DISTINCT p.id) AS products,
+                       SUM(oi.quantity) AS units_sold,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM order_items oi
+                JOIN products p ON p.id = oi.product_id
+                GROUP BY price_tier
+                ORDER BY MIN(p.price)
+                """,
+            ),
             (
                 re.compile(r"(monthly )?new customers.*(by month|2024)", re.I),
                 """
@@ -1140,8 +1187,8 @@ class OfflineBackend:
             # metric: how many *distinct* customers placed at least one order in
             # each month, as opposed to the raw order count. COUNT(DISTINCT
             # customer_id) collapses a customer's multiple orders in a month down
-            # to one, so a repeat buyer is counted once per month. This is the
-            # only rule that uses COUNT(DISTINCT ...). It requires a distinctness
+            # to one, so a repeat buyer is counted once per month. It requires
+            # a distinctness
             # word (unique/distinct/active) plus a customer/buyer word, so it does
             # not shadow the plain "how many customers" count or the "new
             # customers by month" signup rule above it (which counts signups, not
