@@ -425,7 +425,34 @@ which is handy for sanity-checking the sample data build:
 ```bash
 python -m nl2sql.cli schema
 python -m nl2sql.cli schema --counts
+python -m nl2sql.cli schema --no-values   # structure only
 ```
+
+Text columns holding at most **12 distinct values** are annotated with those
+values:
+
+```
+TABLE customers (
+  id INTEGER PRIMARY KEY,
+  name TEXT,
+  region TEXT,  -- one of: 'East', 'North', 'South', 'West'
+  signup_date TEXT
+)
+```
+
+Structure alone would tell a model that `region` exists and holds text, but not
+that the four strings in it are capitalised compass points. Asked to filter on
+one, a model has to guess the literal — `'north'`, `'Northern'`, a region that
+is not in the data — and a wrong guess does not raise an error. It returns zero
+rows, which reads like a real answer to a question with no matches. Neither the
+read-only validator nor the repair loop catches that, because nothing failed;
+listing the values is what prevents it.
+
+The cap is what makes this safe to leave on. Columns above it — `signup_date`,
+`order_date`, customer names — are free-form data, not categories, and are left
+out: listing them would bloat every prompt and copy row data into it for no
+gain. Keys are skipped by kind for the same reason. Pass `--no-values` (or
+`schema_context(..., max_distinct=0)`) for structure only.
 
 ## Safety guardrails
 

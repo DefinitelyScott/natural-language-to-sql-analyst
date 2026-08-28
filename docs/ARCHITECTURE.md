@@ -43,7 +43,17 @@ Two properties fall out of drawing the boundary there:
 ### `nl2sql/schema.py`
 
 Introspects the SQLite database and renders it as compact prompt context —
-tables, columns with types, primary and foreign keys.
+tables, columns with types, primary and foreign keys, and the distinct values of
+columns that behave like categories.
+
+The value hints exist because structure alone does not tell a model which
+literals a `WHERE` clause has to match. A guessed category (`'north'` for
+`'North'`) does not raise; it returns zero rows, and an empty result is the one
+wrong answer neither the read-only validator nor the repair loop can see. Only
+non-key text columns with at most `DEFAULT_MAX_DISTINCT` (12) short distinct
+values are listed — above that a column is free-form data, and listing it would
+copy rows into every prompt. The cap does the classifying, so no per-column
+allowlist has to be kept in step with the schema.
 
 The schema is rendered *once per question* and passed down as a plain string,
 rather than each layer re-reading the database. That matters for the repair

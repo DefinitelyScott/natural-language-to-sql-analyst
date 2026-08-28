@@ -228,7 +228,10 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Print the introspected schema exactly as it is rendered for the "
             "LLM prompt — useful for seeing what context the model works from, "
-            "and for orienting yourself in an unfamiliar database."
+            "and for orienting yourself in an unfamiliar database. Text columns "
+            "holding only a handful of distinct values are annotated with those "
+            "values, so you can see the exact literals a WHERE clause has to "
+            "match."
         ),
     )
     show.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
@@ -236,6 +239,15 @@ def main(argv: list[str] | None = None) -> int:
         "--counts",
         action="store_true",
         help="also show the number of rows in each table",
+    )
+    show.add_argument(
+        "--no-values",
+        action="store_true",
+        help=(
+            "omit the categorical value hints and print structure only "
+            f"(hints cover text columns with at most "
+            f"{schema.DEFAULT_MAX_DISTINCT} distinct values)"
+        ),
     )
 
     args = parser.parse_args(argv)
@@ -267,7 +279,8 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "schema":
-        print(schema.schema_context(args.db))
+        max_distinct = 0 if args.no_values else schema.DEFAULT_MAX_DISTINCT
+        print(schema.schema_context(args.db, max_distinct=max_distinct))
         if args.counts:
             counts = schema.table_row_counts(args.db)
             width = max((len(name) for name, _ in counts), default=0)
