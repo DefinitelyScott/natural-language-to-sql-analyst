@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import random
 import sqlite3
+from bisect import bisect_right
 from datetime import date, timedelta
 
 SEED = 42
@@ -84,13 +85,29 @@ def build(db_path: str = DB_PATH) -> None:
         customers.append((cid, name, region, signup.isoformat()))
     conn.executemany("INSERT INTO customers VALUES (?,?,?,?)", customers)
 
+    # An order may only be attributed to a customer who had already signed up
+    # on the day it was placed. Drawing the customer uniformly from all 120 --
+    # as this generator used to -- put 42% of first orders *before* the
+    # customer's own signup_date, which makes any signup-relative metric
+    # (time to first order, activation rate) meaningless.
+    #
+    # The constraint is applied to the customer, not the date: order dates stay
+    # uniform across 2024, and a late-2024 signup simply has fewer days on
+    # which it could have ordered. Clamping the date instead would have bunched
+    # orders toward year-end and distorted every monthly series in the catalog.
+    signups = sorted((date.fromisoformat(row[3]), row[0]) for row in customers)
+    signup_days = [day for day, _ in signups]
+
     # orders + items across 2024
     order_id = 1
     item_id = 1
     orders, items = [], []
     for _ in range(900):
-        cid = rng.randint(1, 120)
         order_day = date(2024, 1, 1) + timedelta(days=rng.randint(0, 364))
+        # bisect_right gives the number of customers signed up on or before
+        # order_day; that prefix of `signups` is the eligible pool.
+        eligible = bisect_right(signup_days, order_day)
+        cid = signups[rng.randrange(eligible)][1]
         orders.append((order_id, cid, order_day.isoformat()))
         for _ in range(rng.randint(1, 4)):
             prod = rng.choice(products)

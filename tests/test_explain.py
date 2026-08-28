@@ -24,10 +24,17 @@ DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db"
 
 needs_db = pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
 
-# Matches both the date-scoped "orders in the last 30 days" rule and the broad
-# "how many orders" rule, so it exercises the shadowed-rule reporting. The same
-# question anchors the routing contract in test_rule_catalog.py.
-SHADOWING_QUESTION = "How many orders were placed in the last 30 days?"
+# Matches both the multi-category-orders rule and the broad "how many orders"
+# rule, so it exercises the shadowed-rule reporting. The same question anchors
+# the routing contract in test_rule_catalog.py.
+#
+# It used to be "How many orders were placed in the last 30 days?". That
+# stopped being a shadowing case when the broad count rules gained the
+# _UNSCOPED_ONLY guard: a period-scoped question no longer reaches them at all,
+# which is the point of the guard. This question shadows for the ordinary
+# reason — a specific rule and a broad one both match a question carrying no
+# period.
+SHADOWING_QUESTION = "How many orders contain products from more than one category?"
 
 
 @needs_db

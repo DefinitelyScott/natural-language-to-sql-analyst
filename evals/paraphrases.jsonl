@@ -1,0 +1,35 @@
+{"canonical": "What is the total revenue?", "paraphrase": "How much revenue have we made overall?"}
+{"canonical": "How many customers do we have?", "paraphrase": "How many customers are there?"}
+{"canonical": "How many orders do we have?", "paraphrase": "How many orders are there in total?"}
+{"canonical": "How many products are in the catalog?", "paraphrase": "How many products do we sell?"}
+{"canonical": "Which 5 customers spent the most?", "paraphrase": "Show me the top 5 customers by spend"}
+{"canonical": "Show revenue by category", "paraphrase": "What is our revenue per category?"}
+{"canonical": "Show revenue by category", "paraphrase": "Break down sales by category"}
+{"canonical": "Show revenue by region", "paraphrase": "What are sales by region?"}
+{"canonical": "Show revenue by region and category.", "paraphrase": "Break revenue down by region and category."}
+{"canonical": "What is the average order value?", "paraphrase": "What is the avg order value?"}
+{"canonical": "What is the average order value by region?", "paraphrase": "What is the average order value per region?"}
+{"canonical": "What is the best selling product?", "paraphrase": "What is our top selling product?"}
+{"canonical": "What are the top 5 products by revenue?", "paraphrase": "Show the top 5 products by revenue"}
+{"canonical": "How many repeat customers are there?", "paraphrase": "How many returning customers do we have?"}
+{"canonical": "Show revenue by quarter in 2024.", "paraphrase": "What was revenue per quarter in 2024?"}
+{"canonical": "Show revenue by day of week.", "paraphrase": "What is revenue by day of the week?"}
+{"canonical": "Show revenue by price tier.", "paraphrase": "What is revenue by price tier?"}
+{"canonical": "Show month-over-month revenue growth in 2024.", "paraphrase": "What was our month over month revenue growth in 2024?"}
+{"canonical": "Show cumulative revenue by month in 2024.", "paraphrase": "Show running total revenue by month in 2024."}
+{"canonical": "Show monthly cohort retention.", "paraphrase": "What does our cohort retention look like by month?"}
+{"canonical": "Score customers into RFM segments.", "paraphrase": "Give me an RFM segmentation of customers."}
+{"canonical": "Segment customers into spend quartiles.", "paraphrase": "Split customers into spending quartiles."}
+{"canonical": "Which products are most frequently bought together?", "paraphrase": "Which products are often bought together?"}
+{"canonical": "What is the average revenue per customer?", "paraphrase": "What is the mean revenue per customer?"}
+{"canonical": "What are the 10 largest orders?", "paraphrase": "Show the 10 biggest orders."}
+{"canonical": "What percentage of revenue comes from each category?", "paraphrase": "What share of revenue does each category contribute?"}
+{"canonical": "Which customers haven't ordered in the last 90 days?", "paraphrase": "Which customers have not ordered in the last 90 days?"}
+{"canonical": "What is the average time between orders?", "paraphrase": "What is the typical time between orders?"}
+{"canonical": "How many unique customers placed an order each month in 2024?", "paraphrase": "How many distinct customers ordered each month in 2024?"}
+{"canonical": "Which categories have above-average revenue?", "paraphrase": "Which categories are above average in revenue?"}
+{"canonical": "What is the total revenue?", "paraphrase": "What are our total sales?", "known_gap": "the rule keys on 'total revenue' / 'overall revenue' / 'how much revenue'; 'total sales' is not in its vocabulary"}
+{"canonical": "Which 5 customers spent the most?", "paraphrase": "Who are our five biggest customers?", "known_gap": "the rule needs either 'spent' or the literal 'top five customers'; 'biggest customers' carries neither"}
+{"canonical": "Show revenue by region", "paraphrase": "Break down revenue per region", "known_gap": "the region rule accepts only 'by region', while the category rule accepts 'by' or 'per' — an inconsistency between two sibling rules"}
+{"canonical": "What is the median order value?", "paraphrase": "What's the median value of an order?", "known_gap": "the rule needs 'median' adjacent to 'order value/total/basket'; this phrasing splits the two across 'value of an order'"}
+{"canonical": "What is the average number of items per order?", "paraphrase": "How many items are in an average order?", "known_gap": "the rule needs 'items/units per order' or 'basket size'; this phrasing inverts the noun order"}

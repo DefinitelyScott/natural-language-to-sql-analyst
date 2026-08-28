@@ -1,6 +1,6 @@
 """Safe, read-only execution of generated SQL.
 
-Generated SQL is untrusted, so it passes through two independent layers:
+Generated SQL is untrusted, so it passes through three independent layers:
 
 1. :func:`validate` — a string-level check (single statement, SELECT-only, a
    denylist of write/DDL keywords). It runs first because it produces clear,
@@ -13,6 +13,14 @@ Generated SQL is untrusted, so it passes through two independent layers:
    pattern misses — which would let a query open *other files on disk*) is
    still refused. ``mode=ro`` protects the target database file, but only the
    authorizer covers the whole engine surface.
+3. A wall-clock *deadline*. The first two layers decide whether a query may
+   run at all; neither says anything about how long it may run for, and a
+   perfectly read-only ``SELECT`` can still be ruinously expensive — an
+   accidental cross join is the usual way, and it is exactly the mistake a
+   model writing SQL from a schema makes. Left alone it would hold the process
+   open indefinitely, which is a denial of service whether or not anyone meant
+   it. A progress handler checks the clock while the statement runs and
+   cancels it once ``timeout_ms`` has elapsed.
 
 The connection is additionally opened read-only, and results are capped at
 ``max_rows``.
@@ -22,6 +30,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import time
 from dataclasses import dataclass
 
 _FORBIDDEN = re.compile(
@@ -33,6 +42,37 @@ _FORBIDDEN = re.compile(
 
 class UnsafeQueryError(ValueError):
     """Raised when generated SQL is not a safe, single read-only statement."""
+
+
+class QueryTimeoutError(RuntimeError):
+    """Raised when a query was cancelled for exceeding its execution deadline.
+
+    Deliberately *not* a subclass of :class:`UnsafeQueryError` or of
+    ``sqlite3.DatabaseError``. A timeout is not a verdict about the SQL: the
+    query may be entirely correct and merely expensive, and the error text says
+    nothing a rewrite could act on. Keeping it outside the ``DatabaseError``
+    hierarchy is what stops :func:`nl2sql.generator.answer_question` from
+    handing it to the repair loop, where a second attempt could be no
+    better-informed than the first and would cost another full timeout.
+    """
+
+
+#: Default wall-clock budget for one query, in milliseconds.
+#:
+#: Every query in the offline catalog answers in single-digit milliseconds
+#: against the sample database, so five seconds leaves roughly three orders of
+#: magnitude of headroom: a query that reaches this limit is not slow, it is
+#: wrong. It is a default rather than a fixed constant because a legitimately
+#: long analysis over a larger database is a real use — callers can raise it,
+#: or pass ``None`` to opt out.
+DEFAULT_TIMEOUT_MS = 5_000
+
+#: SQLite virtual-machine instructions between deadline checks.
+#:
+#: How finely the deadline is sampled. Small enough that cancellation is prompt
+#: even where individual instructions do little work, large enough that the
+#: extra ``monotonic()`` calls are lost in the cost of running the query.
+_PROGRESS_STEP_INTERVAL = 1_000
 
 
 #: SQLite action codes a read-only analytics query legitimately needs.
@@ -76,6 +116,37 @@ def _authorizer(
     return sqlite3.SQLITE_OK if action in _ALLOWED_ACTIONS else sqlite3.SQLITE_DENY
 
 
+def _install_deadline(conn: sqlite3.Connection, timeout_ms: int) -> list[bool]:
+    """Arm a wall-clock deadline on ``conn``; return its "expired" flag.
+
+    SQLite calls the registered progress handler every
+    :data:`_PROGRESS_STEP_INTERVAL` virtual-machine instructions and aborts the
+    running statement if it returns non-zero. The handler runs on the calling
+    thread, between instructions, so this needs no watchdog thread and has no
+    race to get wrong: cancellation happens at a point where the engine is
+    already prepared to stop. (``Connection.interrupt`` from a second thread is
+    the alternative, and it buys nothing here while adding one.)
+
+    The abort surfaces as a generic ``OperationalError``, indistinguishable by
+    type from any other execution failure. The returned single-element list is
+    how :func:`run` tells them apart: the handler sets it *before* asking for
+    the abort, so a truthy flag means this deadline is what failed the query.
+    Reading a flag we set ourselves beats matching on SQLite's message text,
+    which is not part of its API and is free to change.
+    """
+    deadline = time.monotonic() + timeout_ms / 1000
+    expired = [False]
+
+    def handler() -> int:
+        if time.monotonic() < deadline:
+            return 0
+        expired[0] = True
+        return 1
+
+    conn.set_progress_handler(handler, _PROGRESS_STEP_INTERVAL)
+    return expired
+
+
 @dataclass
 class QueryResult:
     """A materialized result set, plus whether the row cap cut it short.
@@ -117,7 +188,13 @@ def validate(sql: str) -> str:
     return cleaned
 
 
-def run(db_path: str, sql: str, *, max_rows: int = 1000) -> QueryResult:
+def run(
+    db_path: str,
+    sql: str,
+    *,
+    max_rows: int = 1000,
+    timeout_ms: int | None = DEFAULT_TIMEOUT_MS,
+) -> QueryResult:
     """Execute validated SQL against a read-only connection.
 
     At most ``max_rows`` rows are returned. One row beyond the cap is fetched
@@ -125,14 +202,41 @@ def run(db_path: str, sql: str, *, max_rows: int = 1000) -> QueryResult:
     exactly ``max_rows`` cannot distinguish a result that happens to be that
     long from one that was cut short. The extra row is discarded and only its
     existence is reported, via ``QueryResult.truncated``.
+
+    The query is cancelled with :class:`QueryTimeoutError` if it is still
+    running ``timeout_ms`` milliseconds after execution begins. The deadline
+    covers fetching as well as compiling and executing, because a query can be
+    cheap to start and expensive to drain — a row cap bounds how much comes
+    back, not how much work SQLite does to produce it. Pass ``timeout_ms=None``
+    to run with no deadline.
     """
+    # Checked before the SQL is even looked at: a bad ``timeout_ms`` is the
+    # caller's own mistake, and reporting it as such is clearer than letting it
+    # surface later as a query that never times out.
+    if timeout_ms is not None and timeout_ms <= 0:
+        raise ValueError(
+            "timeout_ms must be a positive number of milliseconds, "
+            "or None to run without a deadline"
+        )
+
     cleaned = validate(sql)
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.set_authorizer(_authorizer)
+    expired = [False] if timeout_ms is None else _install_deadline(conn, timeout_ms)
     try:
         try:
             cur = conn.execute(cleaned)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            fetched = cur.fetchmany(max_rows + 1)
         except sqlite3.DatabaseError as exc:
+            # Tested first: an abort raises an ordinary OperationalError, so
+            # without the flag it would fall through to the clauses below and
+            # be reported as an unexplained engine error.
+            if expired[0]:
+                raise QueryTimeoutError(
+                    f"query cancelled after exceeding its {timeout_ms} ms "
+                    "execution deadline"
+                ) from exc
             # The authorizer reports a denial as a generic "not authorized"
             # DatabaseError. Re-raise it as UnsafeQueryError so callers see one
             # exception type for "this SQL was refused", whichever layer
@@ -143,8 +247,6 @@ def run(db_path: str, sql: str, *, max_rows: int = 1000) -> QueryResult:
                     f"query denied by the engine-level authorizer: {exc}"
                 ) from exc
             raise
-        columns = [d[0] for d in cur.description] if cur.description else []
-        fetched = cur.fetchmany(max_rows + 1)
         return QueryResult(
             columns=columns,
             rows=fetched[:max_rows],

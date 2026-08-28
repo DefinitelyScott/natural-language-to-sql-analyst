@@ -27,14 +27,26 @@ nl2sql-analyst/
 │   ├── generator.py     # orchestrates NL question -> SQL
 │   ├── runner.py        # read-only, guarded SQL execution
 │   ├── output.py        # table / CSV / JSON result formatters
-│   └── cli.py           # `nl2sql ask "..."` / `explain "..."` / `schema`
+│   ├── catalog.py       # pairs each offline rule with an example question
+│   └── cli.py           # `nl2sql ask` / `explain` / `rules` / `schema`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
 │   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
+│   ├── precision.jsonl  # questions the catalog must decline (over-match guard)
+│   ├── paraphrases.jsonl # rephrasings that must route to the same rule
 │   └── evaluate.py      # result-set comparison harness
+├── docs/ARCHITECTURE.md # module boundaries, data flow, and design rationale
+├── CONTRIBUTING.md      # how to add a question pattern, and the invariants to keep
 └── tests/               # pytest suite (incl. test_docs.py, which checks the
                          # counts quoted below against evals/gold.jsonl)
 ```
+
+For *why* the pieces fit together the way they do — where the trust boundary
+sits, why offline matching is first-rule-wins, why the repair budget is one —
+see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). For the step-by-step of adding
+a question pattern — where a rule has to sit, when it needs the unscoped-only
+guard, what the gold row's `ordered` flag changes — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quickstart
 
@@ -83,7 +95,9 @@ Results (12 rows):
    who clones it.
 2. **LLM.** If `OPENAI_API_KEY` is set and you pass `--llm`, the question and the
    rendered schema are sent to an OpenAI-compatible chat model, which returns
-   SQL. The generated SQL still passes through the same read-only guardrails.
+   SQL. The generated SQL still passes through the same read-only guardrails,
+   and if it fails to execute the model gets one chance to rewrite it — see
+   [Repairing SQL that fails](#repairing-sql-that-fails).
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -102,13 +116,35 @@ revenue.
 **Group-by breakdowns** — revenue by category, by region, and by region ×
 category; top products by revenue; best-selling product by units, both overall
 and within each category; each category's share of total revenue
-(`SUM(...) OVER ()`); categories whose revenue beats the mean (a scalar subquery
+(`SUM(...) OVER ()`); category purchase penetration — the share of the buyer
+base that bought from each category, which is the *reach* complement of that
+revenue share and can disagree with it (a cheap add-on can touch nearly every
+customer off a thin slice of revenue, and a big-ticket line can do the reverse).
+The buyer set is de-duplicated on (category, customer) so a repeat buyer counts
+once, and the denominator is the customers who placed any order rather than
+`COUNT(*) FROM customers`, so never-buying customers do not dilute a reach
+figure they cannot contribute to; the denominator is returned as its own column
+so the percentage can be re-derived from what is printed. This rule is
+registered ahead of the revenue-share rule, which would otherwise answer "what
+share of customers bought from each category" with revenue percentages.
+Also here: categories whose revenue beats the mean (a scalar subquery
 in `WHERE`); revenue by price tier — fixed-threshold `CASE` *banding* of a
 continuous variable, the complement of the `NTILE` spend quartiles below: bands
 have fixed, meaningful boundaries whose populations move with the data, while
 quantiles have equal-count populations whose boundaries move. Tiers are assigned
 from the catalog list price, not the transacted unit price, so a product cannot
 straddle bands if a sale happened at a different price.
+This group also holds the catalog's only *compound* `SELECT`: revenue by
+category with a grand-total row appended. Every other rule returns rows from a
+single query; this one `UNION ALL`s two result sets at different levels of
+aggregation, because SQLite has neither `ROLLUP` nor `GROUPING SETS`. The total
+is derived from the same CTE as the category rows rather than re-scanned from
+`order_items`, so the report *foots* by construction — it is the sum of the rows
+printed above it, not a second measurement that could disagree at the cent.
+`ORDER BY (category = 'Total')` uses SQLite's 0/1 booleans to pin the total last
+whatever the revenue ordering does, which matters because the total is by
+construction the largest value in the column and `revenue DESC` alone would sort
+it to the top.
 
 **Time series** — total sales by month, revenue by quarter, revenue by day of
 week, new customers by month, unique active customers per month, orders in the
@@ -124,7 +160,13 @@ NULL propagate through the subtraction and drop exactly the products whose
 change is most extreme; `NULLIF` guards the percentage against a product with no
 first-half sales.
 
-**Window functions** — month-over-month revenue growth (`LAG`); cumulative
+**Window functions** — month-over-month revenue growth (`LAG`); the same trend
+broken out per product category (a `LAG` partitioned by category, so each
+category is compared against its own previous month rather than across the
+category boundary — this rule is registered ahead of both the whole-business
+growth rule and the plain "revenue by category" rule, because either would
+otherwise answer a two-dimension question by silently dropping one of the
+dimensions and still returning a plausible-looking table); cumulative
 running-total revenue by month (an explicit `ROWS BETWEEN UNBOUNDED PRECEDING
 AND CURRENT ROW` frame); a 7-day moving average of daily revenue (a *bounded*
 `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` frame over a gap-free calendar spine
@@ -156,6 +198,32 @@ data's newest order; the new-vs-returning revenue split; the distribution of
 orders per customer (a nested aggregation — a purchase-frequency histogram); and
 market-basket affinity (the product pairs most often bought together, via a
 self-join of `order_items`).
+Also here: the repeat purchase rate per product — of the customers who ever
+bought a product, the share who came back and bought it again. This is the
+product-level counterpart of the repeat-customer count, and it measures
+something that count cannot: whether an *individual* product earns a second
+purchase (a consumable) or is bought once and done (a durable). The modelling
+decision that makes it a re-purchase measure rather than a basket-size one is
+`COUNT(DISTINCT o.id)` — a repeat buyer bought the product on two separate
+*orders*, so three units in one basket is still one purchase decision. The
+denominator is each product's own buyer base, not the customer table, so the
+rate is comparable across products with very different reach, and both counts
+are returned beside the percentage so a rate computed off a thin buyer base is
+visible rather than hidden. It is registered ahead of the broad repeat-customer
+rule, which would otherwise answer "which products have the most repeat
+customers?" with a single business-wide number that silently drops the product
+dimension.
+This group also holds the catalog's only *relational division* (a "for all"
+query): the customers who ordered in every quarter of 2024. Every other rule
+asks which rows satisfy a condition — an EXISTS-shaped question — but "in
+*every* quarter" quantifies over a set, which no plain `WHERE` clause can
+express. The division is written as `HAVING COUNT(DISTINCT quarter) = 4` rather
+than the textbook double-`NOT EXISTS`: one aggregate reads as "covered four
+distinct quarters" instead of burying the same test in two layers of negation.
+The `DISTINCT` is load-bearing (five orders all in Q1 cover one quarter, not
+five), and the 4 is deliberately a constant — it is a fact of the calendar, so
+deriving it from the quarters present in the data would quietly weaken the test
+in exactly the case where a quarter had no orders at all.
 
 **Revenue concentration** — the Pareto ("80-20") view: customers are ranked by
 lifetime revenue, split into five equal groups with `NTILE(5)`, and each quintile
@@ -184,6 +252,23 @@ than the calendar, so the month offset is computed as arithmetic on `YYYY-MM`
 (year × 12 + month) rather than with `julianday()`, which measures days and would
 drift across months of unequal length.
 
+**Activation** — time to first order, by signup cohort: for each month of
+signups, how many of those customers ever ordered (the activation rate) and how
+long the ones who did took to get there. It is the only pattern anchored on
+`customers.signup_date` as a per-customer clock rather than as a bucket to count
+signups in, and the only one whose join has to be a `LEFT JOIN` — a customer who
+never ordered is precisely the numerator's complement, and an inner join would
+drop them and report 100% activation for every month.
+
+Two reading caveats are inherent to the metric rather than to this
+implementation, and both are why the report is split by cohort instead of
+blended into one average. The newest cohorts are *censored*: they have had less
+time to convert than older ones, so a declining activation rate down the last
+rows is a property of the observation window. And a cohort that signed up before
+the first order in the database carries the gap to that date inside its average,
+which is why the 2023 cohorts show a far larger `avg_days_to_first_order` than
+the 2024 ones. Both are visible per cohort and invisible in a single number.
+
 Every pattern in this catalog has a matching row in `evals/gold.jsonl`, so each
 one is measured by the evaluation harness rather than merely asserted here.
 
@@ -196,6 +281,86 @@ or missing a gold row) and a rule that two questions share both fail the suite.
 `OfflineBackend.matching_rule_indexes()` makes this checkable by returning
 *every* rule a question matches, not just the winning one; `to_sql` takes the
 first entry of that same list, so the diagnostic and the router cannot drift.
+
+### Listing the catalog from the command line
+
+The prose above describes the catalog; `rules` prints it. Each row is a rule in
+matching order, with an example question that actually routes to it:
+
+```bash
+python -m nl2sql.cli rules
+python -m nl2sql.cli rules --search region
+python -m nl2sql.cli rules --format json
+```
+
+```
+4 offline rule(s), in matching order:
+
+rule  example                                           pattern
+6     Who is the top-spending customer in each region?  (top|best|highest)[-\s]*(spending|spender)?\s*custo...
+12    Show revenue by region and category.              (revenue|sales).*(region.*categor|categor.*region)|...
+19    What is the average order value by region?        (average|avg).*order value.*region
+33    Show revenue by region                            (revenue|sales).*by region
+```
+
+(Patterns abbreviated here for width; the command prints them in full.)
+
+This is the discoverability counterpart to `explain`: `explain` says how a
+question you already have resolves, `rules` says which questions exist to ask.
+The rule numbers are the same ones `explain` reports, so a dry run and the
+listing can be read against each other.
+
+The examples are not a second hand-maintained list — they are drawn from
+`evals/gold.jsonl` and re-matched through the live router on every run, so a
+rule is only ever shown with a question that currently reaches it. If a newly
+added broad pattern starts shadowing an older rule, that rule loses its example
+here (and prints `(no example)`) the moment it happens, rather than continuing
+to advertise a question that now routes elsewhere. A rule with no example is
+listed rather than hidden, for the same reason.
+
+`rules` needs no database — it inspects the in-process rule catalog only. A
+`--search` that matches nothing exits 1, following grep, so a script can gate on
+whether the catalog covers a topic.
+
+### When the catalog has no rule for your question
+
+`ask` and `explain` do not just fail — they offer the nearest questions the
+catalog *can* answer, on stderr:
+
+```bash
+python -m nl2sql.cli ask "revenue by store"
+```
+
+```
+Error: Offline backend has no rule for this question. Set OPENAI_API_KEY and use --llm for open-ended questions.
+
+Did you mean:
+  Show revenue by category
+  Show revenue by region
+  What is the total revenue?
+
+Run `nl2sql rules` to list every question the offline backend answers, or `nl2sql rules --search <text>` to filter it.
+```
+
+Candidates are ranked by how many content words they share with what you typed
+(filler words like "how" and "the" are ignored), with a character-similarity
+tiebreak. They come from the same live-matched pairing `rules` prints, so every
+question offered is one the backend provably answers rather than one that would
+fail the same way yours did.
+
+A question sharing no content word with the catalog gets no suggestions — only
+the pointer to `rules`. Padding the list to a fixed length would read as a guess
+and cost you a check per entry:
+
+```bash
+python -m nl2sql.cli ask "what is the meaning of life?"
+```
+
+```
+Error: Offline backend has no rule for this question. Set OPENAI_API_KEY and use --llm for open-ended questions.
+
+Run `nl2sql rules` to list every question the offline backend answers, or `nl2sql rules --search <text>` to filter it.
+```
 
 ## Exporting results
 
@@ -278,7 +443,71 @@ Generated SQL is never trusted blindly. `runner.py` enforces:
   an `ATTACH`, which would open other files on disk) is still refused;
 - a connection opened in read-only mode;
 - a row cap on returned results, reported via `QueryResult.truncated` so a
-  capped result is never mistaken for a complete one.
+  capped result is never mistaken for a complete one;
+- an **execution deadline** of **5000 ms** by default, enforced by a SQLite
+  progress handler that checks the clock every thousand virtual-machine
+  instructions and cancels the statement once the budget is spent.
+
+The first two layers decide whether a query may run; neither bounds how long it
+runs for. A read-only `SELECT` can still be ruinously expensive — an accidental
+cross join is the usual way, and it is exactly the mistake a model writing SQL
+from a schema makes — and without a deadline it would hold the process open
+indefinitely. `--max-rows` does not help: it bounds how much comes back, not
+how much work SQLite does to produce it.
+
+```bash
+python -m nl2sql.cli ask "Show revenue by category" --timeout-ms 250
+python -m nl2sql.cli ask "Show revenue by category" --timeout-ms 0   # no deadline
+```
+
+A cancelled query raises `runner.QueryTimeoutError`, which deliberately sits
+*outside* the `sqlite3.DatabaseError` hierarchy. That is what keeps it out of
+the repair loop below: a repair is worth making when the engine names something
+to fix, and a deadline names nothing — the query may be perfectly correct and
+merely expensive, so a rewrite would be a guess costing another full timeout.
+
+## Repairing SQL that fails
+
+An LLM writing SQL from a schema gets things wrong in a specific, recognizable
+way: a column that does not exist, a join on the wrong key, a function SQLite
+does not have. The engine names the problem precisely when it refuses to
+compile the query — so `answer_question` hands that error, and the query that
+caused it, back to the backend for one rewrite:
+
+```
+question ──► SQL ──► run ──► result
+               ▲       │
+               │       ▼ (error)
+               └── repair(sql, error)      at most once
+```
+
+Details that matter:
+
+- **The rewrite is re-validated.** It goes back through the same validator,
+  authorizer and read-only connection as the first attempt, so the loop can
+  change *what* is run, never what is allowed to run. A repair that returns
+  `DROP TABLE` is rejected exactly as the first attempt would have been.
+- **One attempt, not "until it works."** The errors a repair actually fixes are
+  shallow ones, and the model is told exactly what was wrong; if a second
+  rewrite is needed, the cause is usually a misreading of the schema that more
+  retries will not resolve. A fixed budget also keeps the worst case of one
+  question bounded and obvious — at most two model calls.
+- **Guardrail rejections are repairable too.** A model that emitted two
+  statements has made an ordinary mistake and can be told so; since the rewrite
+  is re-validated, nothing rejected on the first pass can slip through on the
+  second.
+- **A repair is disclosed, not hidden.** Each failed attempt is recorded on
+  `Answer.repairs` and reported on stderr by `ask`, because a result that
+  needed a retry is a weaker signal than one that ran first time.
+- **The offline backend opts out.** Repairing is an optional protocol
+  (`llm.RepairingBackend`); offline SQL is hand-written and keyed to a fixed
+  rule, so re-asking would return the same string. When the budget is exhausted
+  — or the backend cannot repair at all — the failure surfaces as a
+  `QueryFailedError` listing every attempt, rather than a raw SQLite traceback.
+
+`tests/test_repair.py` drives the loop with scripted stub backends, so the
+retry, the budget and the guardrail-on-rewrite property are all covered offline,
+with no API key.
 
 ## Evaluating quality
 
@@ -289,10 +518,16 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 44 questions  |  execution accuracy: 44/44 (100%)  [offline backend]
+Evaluated 50 questions  |  execution accuracy: 50/50 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
+
+The harness executes generated SQL directly and does **not** run the repair
+loop, so what it reports is first-attempt accuracy. That is the number worth
+tracking when comparing prompts or models — folding in a retry would let a
+weaker first attempt hide behind a second one — but it means the figure
+understates what `ask --llm` recovers from in practice.
 
 ### Per-question results
 
@@ -325,8 +560,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 44,
-  "passed": 44,
+  "total": 50,
+  "passed": 50,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -381,6 +616,55 @@ definition failing now, so it already makes the run exit non-zero; gating on it
 a second time would add a condition that can never fire on its own. The
 comparison's job is to say *which* questions moved.
 
+### Paraphrase robustness
+
+Execution accuracy has a blind spot the gold set cannot see past: it holds
+exactly one phrasing per rule. A rule that matches only its own gold question
+still scores 100%, and a newly added, broadly phrased rule inserted ahead of an
+older one can quietly capture some of the older rule's phrasings without ever
+touching the one phrasing the gold set uses.
+
+`evals/paraphrases.jsonl` pins that down. Each record pairs a gold question with
+an alternate phrasing and asserts the two route to the *same rule*:
+
+```json
+{"canonical": "Show revenue by category", "paraphrase": "Break down sales by category"}
+```
+
+Routing is compared, not the SQL. Two rules can emit identical SQL today and
+diverge tomorrow, so equal SQL would let a paraphrase drift onto the wrong rule
+unnoticed. Anchoring each canonical to a gold question is what makes routing
+enough: the gold row already proves the rule they both reach returns the right
+answer.
+
+A record may instead carry a `known_gap` — a phrasing the catalog does *not*
+reach today, with the reason:
+
+```json
+{"canonical": "Show revenue by region", "paraphrase": "Break down revenue per region",
+ "known_gap": "the region rule accepts only 'by region', while the category rule accepts 'by' or 'per'"}
+```
+
+Known gaps are recorded rather than left out. A set assembled only from
+phrasings that already work would measure nothing about the matcher's reach, and
+would quietly reward narrowing a rule. They are reported but do not fail the
+run, and they are excluded from the ratio's denominator, so documenting a gap
+can never improve the headline. The set currently holds **30 gating pairs and
+5 known gaps**:
+
+```
+Paraphrase robustness: 30/30 rephrasings route to the canonical rule
+  Known gaps (not gating): 5
+```
+
+The check gates the exit code for the same reason the precision guard does: a
+paraphrase that drifts onto another rule still returns a well-formed, correctly
+labelled table, so no accuracy number moves when it breaks. A known gap that
+starts routing correctly is flagged as `[NOW ROUTING]` — the fix is to drop its
+`known_gap` and let it join the gating set, so a later regression cannot undo it
+silently. `tests/test_paraphrase_guard.py` fails on a stale one, and on the two
+counts quoted above.
+
 ### What counts as a matching result
 
 Two details decide whether the reported accuracy is meaningful:
@@ -392,7 +676,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 30 of the 44 gold questions
+  `"ordered": true` and are compared as returned. 35 of the 50 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

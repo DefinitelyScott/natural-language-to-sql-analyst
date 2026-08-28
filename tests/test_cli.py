@@ -4,7 +4,8 @@ import os
 
 import pytest
 
-from nl2sql import cli
+from nl2sql import cli, llm
+from nl2sql.runner import QueryTimeoutError
 
 DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db")
 
@@ -80,3 +81,49 @@ def test_ask_command_unrecognized_question_errors(capsys):
     assert cli.main(["ask", "what is the meaning of life?", "--db", DB]) == 1
     err = capsys.readouterr().err
     assert "Error:" in err
+
+
+@needs_db
+def test_ask_reports_a_timeout_with_a_way_out(capsys, monkeypatch):
+    """A cancelled query must say what to change, not just that it failed.
+
+    The offline catalog has nothing slow enough to trip a deadline — that is
+    the point of the default — so the failure is injected at the boundary the
+    CLI actually depends on: ``generator.answer_question`` raising. What is
+    under test is the CLI's handling, and specifically that the clause sits
+    ahead of the general ``RuntimeError`` one it would otherwise be swallowed
+    by (``QueryTimeoutError`` subclasses it), which is the ordering an edit
+    could quietly undo.
+    """
+
+    def timeout(*args, **kwargs):
+        raise QueryTimeoutError("query cancelled after exceeding its 5 ms deadline")
+
+    monkeypatch.setattr(cli.generator, "answer_question", timeout)
+
+    assert cli.main(["ask", "How many customers do we have?", "--db", DB]) == 1
+    err = capsys.readouterr().err
+    assert "5 ms deadline" in err
+    assert "--timeout-ms" in err
+
+
+@needs_db
+def test_ask_translates_timeout_ms_zero_into_no_deadline(monkeypatch):
+    """``--timeout-ms 0`` is the CLI's spelling of the library's ``None``.
+
+    ``runner.run`` rejects 0 outright, so if the CLI passed the flag through
+    unchanged the "no deadline" case would fail with an argument error instead
+    of running. This asserts on the value handed to the generator rather than
+    on the query, because a query with no deadline has no observable behaviour
+    to test against — only a value.
+    """
+    seen = {}
+
+    def capture(*args, **kwargs):
+        seen.update(kwargs)
+        raise llm.NoRuleMatchError("stop here; the argument is what matters")
+
+    monkeypatch.setattr(cli.generator, "answer_question", capture)
+
+    assert cli.main(["ask", "anything", "--db", DB, "--timeout-ms", "0"]) == 1
+    assert seen["timeout_ms"] is None

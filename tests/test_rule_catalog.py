@@ -118,13 +118,15 @@ def test_shadowed_matches_are_reported_but_do_not_change_routing(
     contract: a question matched by more than one rule is answered by the
     earliest, and the later matches are visible rather than silent.
     """
-    question = "How many orders were placed in the last 30 days?"
+    question = "How many orders contain products from more than one category?"
     matches = backend.matching_rule_indexes(question)
     assert len(matches) > 1, (
-        "expected this question to match both the date-scoped rule and the "
+        "expected this question to match both the multi-category rule and the "
         "broad order-count rule; the fixture question needs updating"
     )
     assert backend.to_sql(question, "") == " ".join(
         backend._rules[matches[0]][1].split()  # noqa: SLF001 - asserting routing
     )
-    assert "order_date" in backend.to_sql(question, "")
+    # The specific rule answers it: the broad rule would return a bare
+    # COUNT(*) over orders with no category join at all.
+    assert "category" in backend.to_sql(question, "")

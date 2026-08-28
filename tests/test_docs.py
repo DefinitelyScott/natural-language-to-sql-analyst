@@ -1,10 +1,12 @@
-"""Keep the numbers quoted in the README in step with ``evals/gold.jsonl``.
+"""Keep the numbers quoted in the README in step with the code that produces them.
 
-The README states three concrete figures: how many gold questions the evaluation
-harness runs, how many of those are order-sensitive, and the ``total``/``passed``
-pair in the sample ``--json`` report. All change every time a question pattern is
-added, and a stale figure in a README is worse than no figure at all — it reads
-as a metric that was reported once and never re-measured.
+The README states four concrete figures: how many gold questions the evaluation
+harness runs, how many of those are order-sensitive, the ``total``/``passed``
+pair in the sample ``--json`` report, and the default query execution deadline.
+The first three change every time a question pattern is added, and a stale
+figure in a README is worse than no figure at all — it reads as a metric that
+was reported once and never re-measured. The fourth is a documented default that
+a reader will size their own timeouts against.
 
 Rather than rely on remembering to edit prose, these tests parse the claims back
 out of the README and compare them to the gold file itself. The regexes are
@@ -34,6 +36,8 @@ _ORDERED_RE = re.compile(r"(\d+) of the (\d+) gold questions\s+are order-sensiti
 # `"total": 36,` / `"passed": 36,` — the sample `--json` report body.
 _JSON_TOTAL_RE = re.compile(r'"total":\s*(\d+)')
 _JSON_PASSED_RE = re.compile(r'"passed":\s*(\d+)')
+# "an **execution deadline** of **5000 ms** by default" — the guardrails list.
+_TIMEOUT_RE = re.compile(r"execution deadline\*\* of \*\*(\d+) ms\*\* by default")
 
 
 @pytest.fixture(scope="module")
@@ -89,6 +93,23 @@ def test_readme_json_report_sample_matches_gold(readme: str, gold_counts: tuple[
     assert all(int(count) == total for count in claimed_total + claimed_passed), (
         f"README sample report claims total={claimed_total} passed={claimed_passed} "
         f"but evals/gold.jsonl has {total} questions, all of which the offline backend passes"
+    )
+
+
+def test_readme_default_timeout_matches_the_constant(readme: str) -> None:
+    """The documented deadline is the one the code actually enforces.
+
+    A reader sizes their own ``--timeout-ms`` against this number, so a stale
+    one is not a cosmetic defect: it would have them budget against a limit
+    that no longer exists.
+    """
+    from nl2sql import runner
+
+    match = _TIMEOUT_RE.search(readme)
+    assert match, "README no longer states the default execution deadline in ms"
+    assert int(match.group(1)) == runner.DEFAULT_TIMEOUT_MS, (
+        f"README claims a default deadline of {match.group(1)} ms, "
+        f"but runner.DEFAULT_TIMEOUT_MS is {runner.DEFAULT_TIMEOUT_MS}"
     )
 
 

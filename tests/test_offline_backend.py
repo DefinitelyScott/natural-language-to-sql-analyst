@@ -10,6 +10,31 @@ from nl2sql.llm import OfflineBackend
 DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db")
 
 
+def assert_rounds_to(reported: float, exact: float, places: int) -> None:
+    """Assert ``reported`` is ``exact`` correctly rounded to ``places`` places.
+
+    Compared against a half-unit-in-the-last-place tolerance rather than against
+    Python's ``round``, because the two disagree on exact halves: Python rounds
+    half to even (``round(56.25, 1)`` is ``56.2``) while SQLite's ``ROUND``
+    rounds half away from zero (``56.3``). Both are correct roundings of the
+    same quotient, and which convention a given cell lands on depends entirely
+    on the data, so pinning the SQL to Python's would make these tests fail on a
+    data change that broke nothing.
+
+    The property actually under test is that the figure a query reports is
+    consistent with the counts printed beside it, and the tolerance states that
+    directly. It stays tight in practice: at one decimal place it admits only
+    the two neighbours of an exact half, and a single value everywhere else.
+    """
+    tolerance = 0.5 * 10.0**-places
+    # A small epsilon absorbs the binary-float error in `exact` itself, which is
+    # a quotient of two floats and can land a hair outside a tolerance it is
+    # mathematically inside.
+    assert abs(reported - exact) <= tolerance + 1e-9, (
+        f"{reported} is not {exact} rounded to {places} decimal place(s)"
+    )
+
+
 def test_offline_matches_known_question():
     sql = OfflineBackend().to_sql("Show revenue by category", schema="")
     assert "GROUP BY p.category" in sql
@@ -187,6 +212,82 @@ def test_end_to_end_revenue_growth():
 @pytest.mark.parametrize(
     "question",
     [
+        "How has revenue by category changed month over month?",
+        "Show monthly revenue by category.",
+        "What is the revenue trend for each category?",
+        "Break down category sales over time.",
+    ],
+)
+def test_offline_matches_category_revenue_trend_phrasings(question):
+    # The category-trend rule keeps both dimensions. PARTITION BY category is
+    # the load-bearing detail: it is what stops the lag walking across the
+    # category boundary, so asserting on it (rather than just "a window
+    # function appears") is what makes this test able to fail usefully.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "PARTITION BY category" in sql
+    assert "GROUP BY category, month" in sql
+
+
+def test_category_trend_does_not_shadow_its_single_dimension_neighbours():
+    # The two rules this one sits ahead of each answer a *subset* of the same
+    # question, so a mis-ordering here would not raise -- it would silently
+    # return a table with a dimension missing. Both directions are pinned.
+    backend = OfflineBackend()
+
+    trend = backend.to_sql("How has revenue by category changed month over month?", "")
+    assert "PARTITION BY category" in trend
+
+    # No category word: still the whole-business growth rule.
+    growth = backend.to_sql("Show month-over-month revenue growth in 2024.", "")
+    assert "PARTITION BY category" not in growth
+    assert "LAG(revenue) OVER (ORDER BY month)" in growth
+
+    # No time word: still the single-number-per-category breakdown.
+    by_category = backend.to_sql("Show revenue by category", "")
+    assert "GROUP BY p.category" in by_category
+    assert "LAG(" not in by_category
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_category_revenue_trend():
+    # Every category sells in all 12 months of the sample data, so the result is
+    # a full 4 x 12 grid. Each category's series starts with NULL changes (no
+    # prior month) and every later row's change must be measured against the
+    # month before it *within the same category*.
+    ans = generator.answer_question(
+        DB, "How has revenue by category changed month over month?"
+    )
+    assert ans.result.columns == [
+        "category",
+        "month",
+        "revenue",
+        "revenue_change",
+        "revenue_change_pct",
+    ]
+    assert len(ans.result.rows) == 48
+
+    by_category: dict[str, list[tuple]] = {}
+    for row in ans.result.rows:
+        by_category.setdefault(row[0], []).append(row)
+
+    assert len(by_category) == 4
+    for rows in by_category.values():
+        assert len(rows) == 12
+        assert [row[1] for row in rows] == sorted(row[1] for row in rows)
+
+        first = rows[0]
+        assert first[3] is None and first[4] is None
+
+        for current, previous in zip(rows[1:], rows[:-1], strict=True):
+            assert current[3] == round(current[2] - previous[2], 2)
+            assert current[4] == round(
+                100.0 * (current[2] - previous[2]) / previous[2], 1
+            )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "What percentage of revenue comes from each category?",
         "Show revenue share by category.",
         "What share of total sales does each category represent?",
@@ -333,7 +434,7 @@ def test_end_to_end_avg_order_value_by_region():
                 """,
                 (region,),
             ).fetchone()
-            assert avg_order_value == round(revenue / order_count, 2)
+            assert_rounds_to(avg_order_value, revenue / order_count, 2)
     finally:
         conn.close()
 
@@ -1526,7 +1627,7 @@ def test_end_to_end_cohort_retention():
     for cohort_month, offset, cohort_size, active, pct in rows:
         assert offset >= 0, "a customer cannot be active before their first order"
         assert 0 < active <= cohort_size
-        assert pct == round(100.0 * active / cohort_size, 1)
+        assert_rounds_to(pct, 100.0 * active / cohort_size, 1)
         # cohort_size is a property of the cohort, so it is identical in every
         # cell of that cohort's row.
         assert sizes.setdefault(cohort_month, cohort_size) == cohort_size
@@ -1572,17 +1673,17 @@ def test_end_to_end_cohort_retention():
         for month in months:
             expected_active[(cohort, month_number(month) - month_number(cohort))] += 1
 
-    expected_rows = [
-        (
-            cohort,
-            offset,
-            expected_sizes[cohort],
-            active,
-            round(100.0 * active / expected_sizes[cohort], 1),
-        )
-        for (cohort, offset), active in sorted(expected_active.items())
+    expected_cells = sorted(expected_active.items())
+    # The four counted columns are compared exactly; the derived percentage goes
+    # through assert_rounds_to, since the recomputation here rounds with Python's
+    # convention and the query with SQLite's -- see that helper for why the two
+    # disagree on exact halves.
+    assert [row[:4] for row in rows] == [
+        (cohort, offset, expected_sizes[cohort], active)
+        for (cohort, offset), active in expected_cells
     ]
-    assert rows == expected_rows
+    for row, ((cohort, _), active) in zip(rows, expected_cells, strict=True):
+        assert_rounds_to(row[4], 100.0 * active / expected_sizes[cohort], 1)
 
 
 @pytest.mark.parametrize(
@@ -2275,3 +2376,494 @@ def test_end_to_end_revenue_by_price_tier():
     tier_total = round(sum(row[3] for row in rows), 2)
     total = generator.answer_question(DB, "What is the total revenue?")
     assert tier_total == pytest.approx(total.result.rows[0][0], abs=0.02)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which customers placed an order in every quarter of 2024?",
+        "Which customers ordered in all four quarters?",
+        "Who bought something in each quarter of the year?",
+        "Customers with orders in all 4 quarters",
+    ],
+)
+def test_offline_matches_every_quarter_phrasings(question):
+    # Every phrasing must route to the relational-division rule: a grouped
+    # customer/orders join whose HAVING counts *distinct* quarters covered.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "HAVING COUNT(DISTINCT" in sql
+    assert ") = 4" in sql
+    assert "GROUP BY c.id" in sql
+
+
+def test_every_quarter_owns_its_phrasings_exclusively():
+    # The every/each/all-four-quarters vocabulary belongs to the division rule
+    # alone. The revenue-by-quarter rule keeps plain "by quarter" phrasings
+    # (its regex requires a revenue/sales subject), and the division rule's
+    # requirement of a universal quantifier word directly before "quarter"
+    # keeps it from contesting them.
+    backend = OfflineBackend()
+    matches = backend.matching_rule_indexes(
+        "Which customers placed an order in every quarter of 2024?"
+    )
+    assert len(matches) == 1, (
+        "expected the every-quarter question to match only its own rule; "
+        "a second match means another rule now contests this vocabulary"
+    )
+    by_quarter = backend.to_sql("Show revenue by quarter in 2024.", schema="")
+    assert "HAVING" not in by_quarter
+    assert "SUM(oi.quantity * oi.unit_price)" in by_quarter
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_customers_in_every_quarter():
+    # Cross-check against an independent Python recomputation: derive each
+    # customer's set of covered quarters from the raw order rows, and the
+    # query's qualifying customer ids -- and their per-customer order counts --
+    # must agree exactly. The DISTINCT in the HAVING is what this pins: a
+    # customer with many orders concentrated in fewer than four quarters must
+    # not qualify however large their order count is.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "Which customers placed an order in every quarter of 2024?"
+    )
+    assert ans.result.columns == ["customer_id", "customer", "region", "orders_2024"]
+    rows = [tuple(row) for row in ans.result.rows]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        quarters: dict[int, set[int]] = {}
+        counts: dict[int, int] = {}
+        for customer_id, order_date in conn.execute(
+            "SELECT customer_id, order_date FROM orders "
+            "WHERE order_date >= '2024-01-01' AND order_date < '2025-01-01'"
+        ):
+            month = int(order_date[5:7])
+            quarters.setdefault(customer_id, set()).add((month + 2) // 3)
+            counts[customer_id] = counts.get(customer_id, 0) + 1
+        total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+    finally:
+        conn.close()
+
+    expected_ids = {cid for cid, qs in quarters.items() if qs == {1, 2, 3, 4}}
+    assert {row[0] for row in rows} == expected_ids
+    for customer_id, _name, _region, orders_2024 in rows:
+        assert orders_2024 == counts[customer_id]
+
+    # Sanity bounds: with ~7.5 orders per customer drawn uniformly over the
+    # year, some but not all customers should cover all four quarters -- either
+    # extreme would signal a data or query bug, not a real distribution.
+    assert 0 < len(rows) < total_customers
+
+    # Readability ordering: names ascending, id breaking ties.
+    assert rows == sorted(rows, key=lambda r: (r[1], r[0]))
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by category with a total row.",
+        "Revenue by category, with a grand total",
+        "Category revenue including a total",
+        "Show category revenue with subtotals",
+        "Revenue by category as a rollup",
+    ],
+)
+def test_offline_matches_category_total_row_phrasings(question):
+    # Every phrasing must route to the compound-SELECT rule: a UNION ALL that
+    # appends a 'Total' row to the per-category rows.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "UNION ALL" in sql
+    assert "'Total'" in sql
+    assert "GROUP BY p.category" in sql
+
+
+def test_category_total_row_does_not_shadow_the_plain_category_rules():
+    # The total-row rule sits ahead of both the revenue-share and the plain
+    # revenue-by-category rules, so this pins the boundary from both sides: a
+    # question that does not ask for a total must not pick up the UNION ALL,
+    # and a question that does must not be answered by the simple breakdown.
+    backend = OfflineBackend()
+
+    plain = backend.to_sql("Show revenue by category", schema="")
+    assert "UNION ALL" not in plain
+
+    share = backend.to_sql(
+        "What percentage of revenue comes from each category?", schema=""
+    )
+    assert "UNION ALL" not in share
+    assert "pct_of_total" in share
+
+    with_total = backend.to_sql(
+        "Show revenue by category with a total row.", schema=""
+    )
+    assert "UNION ALL" in with_total
+    assert with_total != plain
+
+
+def test_total_row_vocabulary_does_not_capture_total_aggregates():
+    # "Total revenue" and "total orders" are the aggregate rules' own wording.
+    # The total-row rule requires "total" to be qualified as a row/line, or
+    # introduced by with/including/plus, so it must not contest them.
+    backend = OfflineBackend()
+    for question in (
+        "What is the total revenue?",
+        "How many orders do we have?",
+        "What is the total number of orders?",
+    ):
+        sql = backend.to_sql(question, schema="")
+        assert "UNION ALL" not in sql, question
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_category_revenue_with_total_row():
+    # Two properties matter here and neither is visible in the SQL alone.
+    #
+    # First, the report must *foot*: the total row is derived from the same CTE
+    # that produced the category rows, so its figures must equal the sum of the
+    # rows printed above it exactly -- not approximately. A total recomputed
+    # independently from order_items could round differently and print a total a
+    # cent away from its own visible parts.
+    #
+    # Second, the total must land last regardless of its magnitude. It is by
+    # construction the largest revenue in the result, so a plain `revenue DESC`
+    # would sort it *first*; the boolean sort key is what keeps it at the
+    # bottom, and only checking position proves that key is doing its job.
+    ans = generator.answer_question(DB, "Show revenue by category with a total row.")
+    assert ans.result.columns == ["category", "units_sold", "revenue"]
+    rows = [tuple(row) for row in ans.result.rows]
+
+    assert rows[-1][0] == "Total"
+    categories, total = rows[:-1], rows[-1]
+    assert len(categories) == 4
+    assert "Total" not in {row[0] for row in categories}
+
+    assert total[1] == sum(row[1] for row in categories)
+    assert total[2] == pytest.approx(round(sum(row[2] for row in categories), 2))
+
+    # The category rows keep their own revenue ranking beneath the total.
+    revenues = [row[2] for row in categories]
+    assert revenues == sorted(revenues, reverse=True)
+    assert total[2] > max(revenues), (
+        "the total must exceed every category, so its last position is a "
+        "property of the sort key rather than of the data"
+    )
+
+    # Cross-check against the catalog's own total-revenue rule: two independent
+    # patterns computing the same quantity must agree, up to per-category
+    # rounding.
+    grand = generator.answer_question(DB, "What is the total revenue?")
+    assert total[2] == pytest.approx(grand.result.rows[0][0], abs=0.02)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What share of customers bought from each category?",
+        "How many customers bought from each category?",
+        "Show category penetration.",
+        "What is the penetration of each category?",
+        "Which categories cross-sell best?",
+        "Cross-selling by category",
+        "What percentage of buyers purchased from each category?",
+        "How many shoppers ordered from each category?",
+    ],
+)
+def test_offline_matches_category_penetration_phrasings(question):
+    # Every phrasing must reach the penetration rule, identified by the columns
+    # only it produces: a de-duplicated buyer count per category against the
+    # buyer base.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "penetration_pct" in sql, question
+    assert "category_buyers" in sql, question
+
+
+def test_category_penetration_does_not_shadow_the_revenue_share_rule():
+    # The penetration rule sits immediately ahead of the revenue-share rule and
+    # both are reached by "share ... category" phrasings, so this pins the
+    # boundary from both sides. The distinguishing token is the customer word:
+    # a share question about *revenue* must keep returning revenue percentages,
+    # and a share question about *customers* must not.
+    backend = OfflineBackend()
+
+    revenue_share = backend.to_sql(
+        "What percentage of revenue comes from each category?", schema=""
+    )
+    assert "pct_of_total" in revenue_share
+    assert "penetration_pct" not in revenue_share
+
+    customer_share = backend.to_sql(
+        "What share of customers bought from each category?", schema=""
+    )
+    assert "penetration_pct" in customer_share
+    assert "pct_of_total" not in customer_share
+
+    # The plain breakdown and the total-row variant are unaffected.
+    assert "penetration_pct" not in backend.to_sql("Show revenue by category", schema="")
+    assert "penetration_pct" not in backend.to_sql(
+        "Show revenue by category with a total row.", schema=""
+    )
+
+
+def test_category_penetration_does_not_capture_neighbouring_customer_rules():
+    # The pattern pairs a customer word with a purchase verb *and* a category
+    # word. Questions carrying only some of those must keep their own rules:
+    # the bare customer count, the lapsed-customer rule (customers + a purchase
+    # verb, no category), and the multi-category basket-breadth rule (a
+    # category and a purchase context, but counted over orders, not customers).
+    backend = OfflineBackend()
+    for question in (
+        "How many customers do we have?",
+        "Which customers haven't ordered in the last 90 days?",
+        "How many orders contain products from more than one category?",
+        "What is the best-selling product in each category?",
+        "Which categories have above-average revenue?",
+    ):
+        assert "penetration_pct" not in backend.to_sql(question, schema=""), question
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_category_penetration():
+    # Three properties, none of them visible in the SQL text alone.
+    #
+    # First, the buyer count per category must be a count of *customers*, not of
+    # order lines -- the failure mode this query's DISTINCT exists to prevent
+    # would push counts past the buyer base and percentages past 100.
+    #
+    # Second, the denominator must be the buying population, which is what the
+    # returned total_buyers column asserts: it has to equal the number of
+    # distinct customers in `orders`, and the percentage has to be re-derivable
+    # from the two counts printed beside it.
+    #
+    # Third, penetration and revenue share are different measures over the same
+    # categories, so the two rules must agree on the category set while being
+    # free to disagree on the ranking.
+    ans = generator.answer_question(
+        DB, "What share of customers bought from each category?"
+    )
+    assert ans.result.columns == [
+        "category",
+        "buyers",
+        "total_buyers",
+        "penetration_pct",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert len(rows) == 4
+
+    total_customers = generator.answer_question(
+        DB, "How many customers do we have?"
+    ).result.rows[0][0]
+
+    for category, buyers, total_buyers, pct in rows:
+        assert 0 < buyers <= total_buyers, category
+        assert total_buyers <= total_customers, category
+        assert pct == pytest.approx(round(100.0 * buyers / total_buyers, 1)), category
+        assert 0 < pct <= 100.0, category
+
+    # The denominator is one number, shared by every row.
+    assert len({row[2] for row in rows}) == 1
+
+    # Ordering: penetration descending, category name breaking ties.
+    assert rows == sorted(rows, key=lambda r: (-r[3], r[0]))
+
+    # Same categories as the revenue-share rule, computed by a different query.
+    share = generator.answer_question(
+        DB, "What percentage of revenue comes from each category?"
+    )
+    assert {row[0] for row in rows} == {row[0] for row in share.result.rows}
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show the repeat purchase rate by product.",
+        "What is the repeat purchase rate for each product?",
+        "What is the repurchase rate by product?",
+        "Which products do customers buy again?",
+        "Which products get ordered again?",
+        "Which products have the most repeat buyers?",
+        "Which products have the most repeat customers?",
+        "Which products are bought more than once?",
+        "Show repeat purchases by item.",
+    ],
+)
+def test_offline_matches_repeat_purchase_rate_phrasings(question):
+    # Every phrasing must reach the product repeat-rate rule, identified by the
+    # columns only it produces.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "repeat_rate_pct" in sql, question
+    assert "product_customer" in sql, question
+
+
+def test_repeat_purchase_rate_does_not_shadow_the_repeat_customer_rule():
+    # This rule sits immediately ahead of the broad "(repeat|returning)
+    # customers" rule, so the boundary is pinned from both sides. The
+    # distinguishing token is the product/item word: a repeat question about
+    # *products* must return the per-product rate, and one about the customer
+    # base as a whole must keep returning the single business-wide count.
+    backend = OfflineBackend()
+
+    per_product = backend.to_sql("Which products have the most repeat customers?", schema="")
+    assert "repeat_rate_pct" in per_product
+    assert "repeat_customers" not in per_product
+
+    business_wide = backend.to_sql("How many repeat customers are there?", schema="")
+    assert "repeat_customers" in business_wide
+    assert "repeat_rate_pct" not in business_wide
+
+    # The new-vs-returning split is reached by "returning" and must be
+    # unaffected: it is registered ahead of both.
+    assert "customer_type" in backend.to_sql(
+        "How much revenue comes from new vs returning customers?", schema=""
+    )
+
+
+def test_repeat_purchase_rate_does_not_capture_neighbouring_product_rules():
+    # The pattern pairs repeat/again vocabulary with a product word. Product
+    # questions carrying neither must keep their own rules -- in particular the
+    # market-basket rule, which is also about products bought in combination but
+    # measures co-purchase within one order rather than re-purchase over time.
+    backend = OfflineBackend()
+    for question in (
+        "Which products are most frequently bought together?",
+        "What are the top 5 products by revenue?",
+        "What is the best selling product?",
+        "What is the best-selling product in each category?",
+        "How many products are in the catalog?",
+        "Show revenue by price tier.",
+    ):
+        assert "repeat_rate_pct" not in backend.to_sql(question, schema=""), question
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_repeat_purchase_rate_by_product():
+    # Three properties, none of them readable from the SQL text alone.
+    #
+    # First, the arithmetic: repeat_buyers is a subset of buyers, and the
+    # printed percentage must be re-derivable from the two counts beside it.
+    #
+    # Second -- the property the query's COUNT(DISTINCT o.id) exists to
+    # guarantee -- a repeat buyer of a product must have placed more than one
+    # *order*. Buying three units of one product in a single basket is not a
+    # repeat purchase. That makes every product's repeat_buyers bounded by the
+    # business-wide repeat-customer count, which is computed by an entirely
+    # different rule over the orders table alone. An implementation that
+    # counted order_items rows instead would push some product past that bound.
+    #
+    # Third, a product's buyer base cannot exceed the number of customers who
+    # placed any order at all.
+    ans = generator.answer_question(DB, "Show the repeat purchase rate by product.")
+    assert ans.result.columns == [
+        "product",
+        "buyers",
+        "repeat_buyers",
+        "repeat_rate_pct",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+
+    product_count = generator.answer_question(
+        DB, "How many products are in the catalog?"
+    ).result.rows[0][0]
+    assert len(rows) == product_count
+
+    repeat_customers = generator.answer_question(
+        DB, "How many repeat customers are there?"
+    ).result.rows[0][0]
+    total_buyers = generator.answer_question(
+        DB, "What share of customers bought from each category?"
+    ).result.rows[0][2]
+
+    for product, buyers, repeat_buyers, pct in rows:
+        assert 0 < buyers <= total_buyers, product
+        assert 0 <= repeat_buyers <= buyers, product
+        assert repeat_buyers <= repeat_customers, product
+        assert_rounds_to(pct, 100.0 * repeat_buyers / buyers, 1)
+
+    # Ordering: rate descending, product name breaking ties.
+    assert rows == sorted(rows, key=lambda r: (-r[3], r[0]))
+
+
+def test_time_to_first_order_rule_is_not_shadowed():
+    # The activation rule sits behind cohort retention and ahead of everything
+    # else, so a duration question about a first order must reach it rather than
+    # any of the broad customer rules further down the catalog.
+    backend = OfflineBackend()
+    for question in (
+        "How long does it take a new customer to place their first order?",
+        "What is the average time from signup to first order?",
+        "Show the activation rate by signup month.",
+    ):
+        assert backend.matching_rule_indexes(question)[0:1] == [1], question
+        assert "avg_days_to_first_order" in backend.to_sql(question, schema="")
+
+    # And it must not capture questions that merely mention signups or first
+    # purchases without asking about the delay between them. The retention
+    # question is the interesting one: it says "first purchase" but is answered
+    # by the cohort rule, which is registered ahead of this one.
+    assert backend.matching_rule_indexes(
+        "How many customers are retained after their first purchase?"
+    )[0] == 0
+    assert not backend.matching_rule_indexes(
+        "How many new customers signed up by month in 2024?"
+    )[0:1] == [1]
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_time_to_first_order():
+    # Four properties, checked against the raw tables rather than the SQL text.
+    #
+    # First, the grid covers every signup month exactly once, in chronological
+    # order, and the per-month signup counts sum to the whole customer base --
+    # the LEFT JOIN must not have dropped a customer who never ordered.
+    #
+    # Second, activated is a subset of customers and activation_pct is
+    # re-derivable from the pair.
+    #
+    # Third -- the property that the sample-data fix in scripts/build_sample_db.py
+    # exists to make true -- no average is negative. A negative figure would mean
+    # a customer's first order predates their own signup, which was the case for
+    # 42% of customers before orders were constrained to signed-up customers.
+    #
+    # Fourth, avg_days_to_first_order is NULL exactly when no one in the cohort
+    # converted, because AVG skips the NULLs the LEFT JOIN produced.
+    import sqlite3
+
+    ans = generator.answer_question(
+        DB, "How long does it take a new customer to place their first order?"
+    )
+    assert ans.result.columns == [
+        "signup_month",
+        "customers",
+        "activated",
+        "activation_pct",
+        "avg_days_to_first_order",
+    ]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert rows, "the activation grid should not be empty"
+
+    months = [row[0] for row in rows]
+    assert months == sorted(months)
+    assert len(months) == len(set(months))
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        total_customers = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
+        buyers = conn.execute(
+            "SELECT COUNT(DISTINCT customer_id) FROM orders"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+    assert sum(row[1] for row in rows) == total_customers
+    assert sum(row[2] for row in rows) == buyers
+
+    for month, customers, activated, pct, avg_days in rows:
+        assert customers > 0, month
+        assert 0 <= activated <= customers, month
+        assert_rounds_to(pct, 100.0 * activated / customers, 1)
+        if activated == 0:
+            assert avg_days is None, month
+        else:
+            assert avg_days is not None, month
+            assert avg_days >= 0, month

@@ -1,0 +1,14 @@
+{"question": "What is the profit margin by product?", "reason": "no cost data exists; products carry a price but no cost of goods"}
+{"question": "Show me shipping costs by region.", "reason": "no shipping or fulfilment data in the schema"}
+{"question": "How many items were returned in March?", "reason": "no returns or refunds table"}
+{"question": "What is the average discount applied to orders?", "reason": "order_items records unit_price only; there is no discount column"}
+{"question": "Which marketing channel drove the most signups?", "reason": "customers carry a signup_date but no acquisition channel"}
+{"question": "What is the current inventory level for each product?", "reason": "no stock or inventory data"}
+{"question": "Which employees closed the most sales?", "reason": "no employees table; orders are not attributed to a seller"}
+{"question": "Show revenue by salesperson.", "reason": "same as above, phrased with the catalog's 'revenue by X' vocabulary"}
+{"question": "How many orders were placed in the last 7 days?", "reason": "period-scoped; only the 30-day window has a rule, and the broad order-count rule must not answer with the all-time total"}
+{"question": "How many customers churned last month?", "reason": "period-scoped, and churn is undefined here; must not fall through to the all-time customer count"}
+{"question": "What was total revenue in 2023?", "reason": "period-scoped; the total-revenue rule sums every order item with no date filter"}
+{"question": "How many products were added last month?", "reason": "period-scoped, and products carry no created-at date"}
+{"question": "Forecast revenue for next quarter.", "reason": "prediction, not a query over recorded facts"}
+{"question": "Delete every order placed before June.", "reason": "an instruction to write; the catalog answers questions and the runner denies writes outright"}

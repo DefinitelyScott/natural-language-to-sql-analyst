@@ -15,11 +15,75 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 
 class Backend(Protocol):
     def to_sql(self, question: str, schema: str) -> str: ...
+
+
+@runtime_checkable
+class RepairingBackend(Protocol):
+    """A backend that can revise SQL it wrote, given the error it raised.
+
+    Optional: a backend is repairable only if implementing ``repair`` can
+    actually change the outcome. ``LLMBackend`` qualifies — a model that
+    hallucinated a column name will often fix it when shown the error.
+    ``OfflineBackend`` deliberately does not: its SQL is hand-written and
+    keyed to a fixed rule, so re-asking the same question returns the same
+    string and a retry could only burn time. ``generator.answer_question``
+    checks for this protocol at runtime (``isinstance``, which for a
+    ``runtime_checkable`` Protocol tests only that the method exists) and
+    skips the repair step entirely when a backend does not implement it.
+    """
+
+    def repair(self, question: str, schema: str, sql: str, error: str) -> str: ...
+
+
+class NoRuleMatchError(ValueError):
+    """No rule in the offline catalog matches the question.
+
+    Subclasses :class:`ValueError` so existing callers that catch ``ValueError``
+    around ``to_sql`` keep working unchanged. It exists as its own type so the
+    CLI can distinguish "the catalog does not cover this question" — the one
+    failure a nearest-question suggestion can help with — from every other
+    ``ValueError`` a backend might raise, without matching on message text.
+    """
+
+
+#: Phrases that scope a question to a period — a relative window ("in the last
+#: 7 days", "this quarter", "past few months") or an explicit calendar year
+#: ("in 2023"). Used only as the body of :data:`_UNSCOPED_ONLY`.
+#:
+#: The single optional ``\w+`` between the qualifier and the unit is what lets
+#: one alternative cover "last month", "last 7 days" and "past few weeks"
+#: without enumerating the fillers.
+_PERIOD_SCOPED = (
+    r"\b(?:last|past|previous|this|current)\s+(?:\w+\s+)?"
+    r"(?:day|week|month|quarter|year)s?\b"
+    r"|\b(?:19|20)\d{2}\b"
+)
+
+#: Prefix for a rule whose SQL aggregates over a whole table with no date
+#: filter, e.g. ``SELECT COUNT(*) FROM orders``.
+#:
+#: Those rules are registered last and phrased broadly on purpose ("how many
+#: orders"), so a question that *scopes* the same aggregate to a period falls
+#: through to them and gets answered with the unscoped total. The answer looks
+#: right — it is a plausible number, correctly labelled "order_count" — while
+#: silently ignoring the window the user asked about, which is the most
+#: dangerous way for this catalog to be wrong.
+#:
+#: A negative lookahead anchored at ``\A`` is the narrowest fix available: the
+#: rule keeps matching every unscoped phrasing it used to, and declines only
+#: when the question carries a period the SQL does not honour. Declining routes
+#: the question to ``NoRuleMatchError``, so the CLI says it has no rule and
+#: suggests nearer catalog questions instead of inventing an answer.
+#:
+#: Periods the catalog *does* implement are unaffected: their rules ("orders in
+#: the last 30 days", "revenue by month in 2024") are registered earlier and
+#: win under first-match resolution before these are consulted.
+_UNSCOPED_ONLY = rf"\A(?!.*(?:{_PERIOD_SCOPED}))"
 
 
 # --------------------------------------------------------------------------- #
@@ -106,6 +170,73 @@ class OfflineBackend:
                 ORDER BY a.cohort_month, month_offset
                 """,
             ),
+            # Time to first order, by signup cohort: for each month of signups,
+            # how many of those customers ever placed an order, and how long the
+            # ones who did took to do it. This is the activation view -- the only
+            # rule in the catalog anchored on ``customers.signup_date`` as a
+            # per-customer clock rather than as a calendar bucket to count in.
+            #
+            # Registered second, immediately after cohort retention, for the same
+            # reason: its vocabulary is narrow (a duration word plus "first
+            # order"/"first purchase", or "activation rate") and no other rule
+            # uses it, while broader rules further down would otherwise swallow
+            # phrasings like "how long before a new customer places their first
+            # order". Retention keeps priority over it because a question that
+            # says both "retained" and "first purchase" is a retention question.
+            #
+            # LEFT JOIN, not JOIN: a customer who never ordered is the entire
+            # point of the activation rate, and an inner join would silently drop
+            # them and report 100% for every month. COUNT(*) therefore counts
+            # signups and COUNT(f.customer_id) counts the subset that converted,
+            # since COUNT of a column skips NULLs.
+            #
+            # avg_days_to_first_order is likewise an average over converted
+            # customers only, for the same NULL-skipping reason -- there is no
+            # defensible number of days to attribute to someone who has not
+            # ordered yet. It is NULL for a month in which nobody converted.
+            #
+            # Reading caveat, and the reason this is grouped by signup month at
+            # all: the most recent cohorts are censored. Someone who signed up
+            # weeks before the last order in the database has had far less time
+            # to convert than a cohort from a year earlier, so a declining
+            # activation_pct down the final rows is an artifact of the window,
+            # not a trend. The same goes the other way: a cohort that signed up
+            # before the earliest order in the database carries the gap to that
+            # date inside its average, which is why the 2023 cohorts of the
+            # sample data average far more days than the 2024 ones. Splitting by
+            # cohort is what makes both effects legible; a single blended
+            # average would bury them in one number.
+            (
+                re.compile(
+                    r"\b(?:time|days?|long|lag)\b[^?]*"
+                    r"\bfirst\s+(?:order|purchase)\b"
+                    r"|\bsign\s?-?up\s+to\s+(?:their\s+)?first\s+"
+                    r"(?:order|purchase)\b"
+                    r"|\bactivation\s+rate\b",
+                    re.I,
+                ),
+                """
+                WITH first_order AS (
+                    SELECT customer_id, MIN(order_date) AS first_order_date
+                    FROM orders
+                    GROUP BY customer_id
+                )
+                SELECT strftime('%Y-%m', c.signup_date) AS signup_month,
+                       COUNT(*) AS customers,
+                       COUNT(f.customer_id) AS activated,
+                       ROUND(100.0 * COUNT(f.customer_id) / COUNT(*), 1)
+                           AS activation_pct,
+                       ROUND(
+                           AVG(julianday(f.first_order_date)
+                               - julianday(c.signup_date)),
+                           1
+                       ) AS avg_days_to_first_order
+                FROM customers c
+                LEFT JOIN first_order f ON f.customer_id = c.id
+                GROUP BY signup_month
+                ORDER BY signup_month
+                """,
+            ),
             (
                 re.compile(r"total sales by month.*2024", re.I),
                 """
@@ -118,12 +249,87 @@ class OfflineBackend:
                 ORDER BY month
                 """,
             ),
-            # Month-over-month revenue growth. A ``LAG`` window function over a
-            # monthly-revenue CTE yields each month's change from the previous
-            # month; the first month's change is NULL because there is no prior
-            # month to compare against. This is the only rule that uses a window
-            # function, and it is placed ahead of the broad "total revenue" rule
-            # so "revenue growth" phrasings are not shadowed by it.
+            # Monthly revenue per category -- a category time series, not the
+            # single-number-per-category breakdown the plain "revenue by
+            # category" rule returns. Analysts ask this to see *which* category
+            # is carrying (or dragging) a total that looks flat overall, so the
+            # per-category month-over-month change is reported alongside the
+            # level.
+            #
+            # It is registered here, ahead of both the month-over-month growth
+            # rule below and the plain "revenue by category" rule further down,
+            # because either would otherwise answer these questions with the
+            # wrong shape: "monthly revenue by category" currently matched the
+            # category rule and silently dropped the month dimension, and
+            # "revenue by category month over month" matched the growth rule and
+            # silently dropped the category dimension. Both returned a plausible
+            # table, which is what makes the shadowing worth guarding: the
+            # answer looks right until you notice a dimension is missing. The
+            # pattern demands a category word *and* a monthly/trend word, in
+            # either order, so a single-dimension question still falls through
+            # to its own rule.
+            #
+            # ``LAG`` is partitioned by category so each category's series is
+            # compared against itself; without the PARTITION BY the lag would
+            # walk across the category boundary and compare, say, Fitness's
+            # January against Electronics' December. The prior month is lifted
+            # into its own CTE column rather than repeating the window
+            # expression, so the absolute and percentage change are provably
+            # derived from the same prior value. The first month of each
+            # category is NULL in both change columns -- there is no prior month
+            # to compare against, and NULL is the honest answer rather than 0.
+            #
+            # A category with no sales in some month produces no row for it, so
+            # the lag then reaches back to the last month that *did* have sales.
+            # On this dataset every category sells every month, so it does not
+            # arise; the ``month`` column is returned precisely so a reader can
+            # see a gap rather than have it silently smoothed over.
+            (
+                re.compile(
+                    r"categor(?:y|ies).*(?:monthly|by\s+month|per\s+month|"
+                    r"each\s+month|over\s+time|month[- ]over[- ]month|trend)|"
+                    r"(?:monthly|by\s+month|per\s+month|each\s+month|over\s+time|"
+                    r"month[- ]over[- ]month|trend).*categor(?:y|ies)",
+                    re.I,
+                ),
+                """
+                WITH monthly AS (
+                    SELECT p.category AS category,
+                           strftime('%Y-%m', o.order_date) AS month,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    JOIN products p ON p.id = oi.product_id
+                    WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                    GROUP BY category, month
+                ),
+                with_prior AS (
+                    SELECT category,
+                           month,
+                           revenue,
+                           LAG(revenue) OVER (
+                               PARTITION BY category
+                               ORDER BY month
+                           ) AS prior_revenue
+                    FROM monthly
+                )
+                SELECT category,
+                       month,
+                       revenue,
+                       ROUND(revenue - prior_revenue, 2) AS revenue_change,
+                       ROUND(100.0 * (revenue - prior_revenue) / prior_revenue, 1)
+                           AS revenue_change_pct
+                FROM with_prior
+                ORDER BY category, month
+                """,
+            ),
+            # Month-over-month revenue growth for the business as a whole. A
+            # ``LAG`` window function over a monthly-revenue CTE yields each
+            # month's change from the previous month; the first month's change is
+            # NULL because there is no prior month to compare against. It is
+            # placed ahead of the broad "total revenue" rule so "revenue growth"
+            # phrasings are not shadowed by it, and behind the per-category rule
+            # above so a question naming a category keeps that dimension.
             (
                 re.compile(
                     r"month[- ]over[- ]month|(revenue|sales)\s+growth|"
@@ -636,6 +842,145 @@ class OfflineBackend:
                 ORDER BY revenue DESC
                 """,
             ),
+            # Revenue by category with a grand-total row appended -- the shape a
+            # report is actually delivered in, where the reader wants the parts
+            # and the whole in one table. Postgres and friends would write this
+            # as GROUP BY ROLLUP(category), but SQLite has neither ROLLUP nor
+            # GROUPING SETS, so the total is produced as a second SELECT over
+            # the same CTE and stapled on with UNION ALL. This is the catalog's
+            # only *compound* SELECT: every other rule returns rows from a single
+            # query, while this one unions two result sets that are at different
+            # levels of aggregation.
+            #
+            # Deriving the total from the CTE rather than re-scanning
+            # `order_items` is what guarantees the report foots -- the total is
+            # by construction the sum of the rows printed above it, not a second
+            # independent measurement that could disagree at the cent. The CTE
+            # rounds once, so the outer SUM adds already-rounded figures; the
+            # outer ROUND then only mops up binary-float representation error
+            # from that addition. The alternative (round only at the end) is
+            # marginally more accurate but can print a total a cent away from
+            # the sum of its own visible parts, which reads as an arithmetic bug
+            # to anyone checking the column by hand.
+            #
+            # ORDER BY (category = 'Total') exploits SQLite evaluating a boolean
+            # as 0 or 1: every real category sorts 0 and the total sorts 1, so
+            # the total lands last whatever the revenue ordering does, without
+            # carrying a sort-key column through to the output. Revenue DESC
+            # then orders the categories themselves. The union is wrapped in a
+            # second CTE because SQLite only accepts a bare column name or an
+            # ordinal in a compound SELECT's own ORDER BY -- an expression there
+            # fails with "1st ORDER BY term does not match any column in the
+            # result set". Sorting the union's output as an ordinary table
+            # sidesteps that restriction and keeps the sort key out of the
+            # result.
+            #
+            # The matcher requires explicit total/rollup/subtotal vocabulary and
+            # is registered ahead of both category rules below, so a plain
+            # "revenue by category" still routes to the simple rule and only a
+            # question that asks for the total row gets the compound query.
+            (
+                re.compile(
+                    r"(grand\s+)?total\s+(row|line)\b|"
+                    r"\brollup\b|\bsub[-\s]?totals?\b|"
+                    r"(with|including|include|add|append|plus)\s+"
+                    r"(a\s+)?(grand\s+)?total\b",
+                    re.I,
+                ),
+                """
+                WITH category_revenue AS (
+                    SELECT p.category AS category,
+                           SUM(oi.quantity) AS units_sold,
+                           ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                    FROM products p
+                    JOIN order_items oi ON oi.product_id = p.id
+                    GROUP BY p.category
+                ),
+                report AS (
+                    SELECT category, units_sold, revenue
+                    FROM category_revenue
+                    UNION ALL
+                    SELECT 'Total', SUM(units_sold), ROUND(SUM(revenue), 2)
+                    FROM category_revenue
+                )
+                SELECT category, units_sold, revenue
+                FROM report
+                ORDER BY (category = 'Total'), revenue DESC
+                """,
+            ),
+            # Category purchase penetration: how many distinct customers bought
+            # from each category, and what share of the buyer base that is. This
+            # is a *reach* measure, not a value measure -- the complement of the
+            # category-share rule directly below, which splits revenue. The two
+            # can disagree in the way that matters commercially: a category can
+            # take a small slice of revenue while nearly every customer touches
+            # it (a cheap, universal add-on), or carry a large slice off a narrow
+            # set of buyers (a big-ticket item). Revenue share alone cannot tell
+            # those apart, which is why penetration is reported in customers.
+            #
+            # It is registered ahead of the category-share rule because "what
+            # share of customers bought from each category" contains both a
+            # share word and a category word, so that rule would otherwise
+            # answer it -- with revenue percentages, which look like a valid
+            # answer to a question that was about people. The pattern demands a
+            # customer word *and* a purchase verb alongside the category word
+            # (or the unambiguous "penetration" / "cross-sell" vocabulary), so a
+            # question about revenue share still falls through to the rule below.
+            #
+            # Two details carry the correctness of the metric:
+            #
+            # * ``category_buyers`` is DISTINCT on (category, customer_id), so a
+            #   customer who bought a category twenty times counts once. Without
+            #   it COUNT(*) would count order *lines* and the "percentage" could
+            #   exceed 100.
+            # * The denominator is the number of customers who placed any order,
+            #   not COUNT(*) FROM customers. Dividing by the full customer table
+            #   would fold never-buying customers into the base and understate
+            #   every category's reach -- the question is which of our *buyers*
+            #   reach a category, and non-buyers reach none of them by
+            #   definition. ``total_buyers`` is returned rather than left
+            #   implicit so the denominator is visible in the output and the
+            #   percentages can be re-derived from the columns shown.
+            #
+            # On this synthetic dataset the four categories all land near 96%:
+            # orders draw products uniformly, so with 900 orders across 120
+            # customers almost everyone eventually touches every category. The
+            # spread is real but small; the ``buyers`` column is what carries the
+            # ranking here, and a real catalog with niche lines would separate
+            # far more.
+            (
+                re.compile(
+                    r"\bpenetration\b|"
+                    r"cross[-\s]?sell(?:ing)?\b.*categor(?:y|ies)|"
+                    r"categor(?:y|ies).*\bcross[-\s]?sell(?:ing)?\b|"
+                    r"\b(?:customers?|buyers?|shoppers?)\b.*"
+                    r"\b(?:bought|buy|purchased?|ordered|order)\b.*"
+                    r"\bcategor(?:y|ies)\b",
+                    re.I,
+                ),
+                """
+                WITH category_buyers AS (
+                    SELECT DISTINCT p.category AS category,
+                           o.customer_id AS customer_id
+                    FROM orders o
+                    JOIN order_items oi ON oi.order_id = o.id
+                    JOIN products p ON p.id = oi.product_id
+                ),
+                buyer_base AS (
+                    SELECT COUNT(DISTINCT customer_id) AS buyers
+                    FROM orders
+                )
+                SELECT b.category,
+                       COUNT(*) AS buyers,
+                       (SELECT buyers FROM buyer_base) AS total_buyers,
+                       ROUND(
+                           100.0 * COUNT(*) / (SELECT buyers FROM buyer_base), 1
+                       ) AS penetration_pct
+                FROM category_buyers b
+                GROUP BY b.category
+                ORDER BY penetration_pct DESC, b.category
+                """,
+            ),
             # Each category's revenue as a share (percentage) of total revenue.
             # A CTE first computes per-category revenue; the outer query divides
             # each category by the grand total obtained with SUM(revenue) OVER ()
@@ -826,7 +1171,10 @@ class OfflineBackend:
                 """,
             ),
             (
-                re.compile(r"how many (customers|users)", re.I),
+                # Guarded by _UNSCOPED_ONLY: this counts every row in
+                # `customers`, so "how many customers churned last month?" is
+                # not a question it can answer.
+                re.compile(_UNSCOPED_ONLY + r".*how many (?:customers|users)", re.I),
                 "SELECT COUNT(*) AS customer_count FROM customers",
             ),
             # The best-selling product (by units) *within each category*: another
@@ -1093,6 +1441,75 @@ class OfflineBackend:
                 ORDER BY customer_type
                 """,
             ),
+            # Repeat purchase rate per product: of the customers who ever bought
+            # a product, what share came back and bought it again. This is the
+            # product-level counterpart of the whole-business repeat-customer
+            # count registered directly below, and it answers a different
+            # question -- repeat customers measures whether the *business*
+            # retains buyers, this measures whether an *individual product*
+            # earns a second purchase, which is what separates a consumable
+            # from a one-off (a coffee mug from a standing desk mat).
+            #
+            # The load-bearing modelling decision is COUNT(DISTINCT o.id): a
+            # "repeat" buyer is one who bought the product on two separate
+            # *orders*, not one who put two units in a single basket. Counting
+            # order_items rows instead would score buying three mugs at once as
+            # repeat behavior, which inverts the metric's meaning -- one basket
+            # is one purchase decision, and the whole point of the measure is
+            # whether the customer made a second one later.
+            #
+            # The denominator is the product's own buyer base, not the customer
+            # table, so the rate is comparable across products with very
+            # different reach; ``buyers`` and ``repeat_buyers`` are both
+            # returned so the percentage can be re-derived from the printed
+            # rows and a rate computed off a thin buyer base is visible as such
+            # rather than hidden behind a confident-looking percentage.
+            #
+            # Registered ahead of the broad "(repeat|returning) customers" rule
+            # on purpose. Without this rule, "which products have the most
+            # repeat customers?" falls through to that one and is answered with
+            # a single business-wide count -- a plausible number that silently
+            # drops the product dimension the question was about. The pattern
+            # here requires a product/item word, so the plain "how many repeat
+            # customers are there?" phrasing still reaches the rule below.
+            (
+                re.compile(
+                    r"repeat[-\s]?(?:purchase|buy|buying|order)\s*rate|"
+                    r"re-?purchase\s*rate|rebuy\s*rate|"
+                    r"(?:products?|items?)\b.*"
+                    r"\brepeat\s+(?:buyers?|purchasers?|purchases?|customers?)|"
+                    r"repeat\s+(?:buyers?|purchasers?|purchases?)\b.*"
+                    r"\b(?:products?|items?)|"
+                    r"(?:which|what)\s+products?\b.*"
+                    r"\b(?:buy|bought|purchase|purchased|order|ordered)\b.*\bagain\b|"
+                    r"products?\b.*\bbought\s+more\s+than\s+once",
+                    re.I,
+                ),
+                """
+                WITH product_customer AS (
+                    SELECT oi.product_id AS product_id,
+                           o.customer_id AS customer_id,
+                           COUNT(DISTINCT o.id) AS orders_with_product
+                    FROM order_items oi
+                    JOIN orders o ON o.id = oi.order_id
+                    GROUP BY oi.product_id, o.customer_id
+                )
+                SELECT p.name AS product,
+                       COUNT(*) AS buyers,
+                       SUM(CASE WHEN pc.orders_with_product > 1 THEN 1 ELSE 0 END)
+                           AS repeat_buyers,
+                       ROUND(
+                           100.0
+                           * SUM(CASE WHEN pc.orders_with_product > 1 THEN 1 ELSE 0 END)
+                           / COUNT(*),
+                           1
+                       ) AS repeat_rate_pct
+                FROM product_customer pc
+                JOIN products p ON p.id = pc.product_id
+                GROUP BY p.id
+                ORDER BY repeat_rate_pct DESC, product
+                """,
+            ),
             (
                 re.compile(r"(repeat|returning) customers", re.I),
                 """
@@ -1230,6 +1647,52 @@ class OfflineBackend:
                 WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
                 GROUP BY quarter
                 ORDER BY quarter
+                """,
+            ),
+            # Customers who ordered in *every* quarter of 2024: the catalog's
+            # only relational division (a "for all" query). Every other rule
+            # asks "which rows satisfy X" -- an EXISTS-shaped question; this one
+            # asks "which customers satisfy X for ALL members of a set" (all
+            # four quarters), which no plain WHERE clause can express.
+            #
+            # The division is done as HAVING COUNT(DISTINCT quarter) = 4 rather
+            # than the textbook double-NOT-EXISTS: one aggregate over a grouped
+            # join reads as "covered 4 distinct quarters", while nested negated
+            # quantifiers hide the same test inside two layers of negation. The
+            # DISTINCT is load-bearing -- a customer with five orders all in Q1
+            # has COUNT(*) = 5 but COUNT(DISTINCT quarter) = 1, and it is
+            # quarters covered, not orders placed, that the question asks about.
+            #
+            # The 4 is hardcoded because it is a fact of the calendar, not of
+            # the data: a year has four quarters whether or not anyone ordered
+            # in all of them. Deriving the denominator from the data (COUNT of
+            # quarters seen in orders) would quietly weaken the test in exactly
+            # the case where it matters -- a dead quarter would shrink the
+            # requirement to 3 and admit customers the question excludes.
+            #
+            # The quarter number reuses the (month + 2) / 3 integer-arithmetic
+            # derivation from the revenue-by-quarter rule above, so the two
+            # rules cannot disagree about which quarter a date belongs to.
+            #
+            # ORDER BY is readability only (name, with id as a deterministic
+            # tiebreaker since the sample generator can produce duplicate
+            # names); the answer is a *set* of customers, so the gold row is
+            # marked "ordered": false.
+            (
+                re.compile(r"(every|each|all\s+(four|4))\s+quarters?\b", re.I),
+                """
+                SELECT c.id AS customer_id,
+                       c.name AS customer,
+                       c.region,
+                       COUNT(o.id) AS orders_2024
+                FROM customers c
+                JOIN orders o ON o.customer_id = c.id
+                WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
+                GROUP BY c.id, c.name, c.region
+                HAVING COUNT(DISTINCT
+                           (CAST(strftime('%m', o.order_date) AS INTEGER) + 2) / 3
+                       ) = 4
+                ORDER BY c.name, c.id
                 """,
             ),
             # First-half vs second-half 2024 revenue for every product: the
@@ -1493,21 +1956,37 @@ class OfflineBackend:
             # first-rule-wins, so these broad aggregate phrasings ("how many
             # orders") do not shadow the more specific rules above (e.g. orders
             # in the last 30 days), which should take precedence.
+            #
+            # Each also carries the _UNSCOPED_ONLY guard: being both last and
+            # broad is what makes them the catch-all a period-scoped question
+            # lands on, and every one of them aggregates over a whole table
+            # with no date filter. See _UNSCOPED_ONLY for why declining beats
+            # answering there.
             (
-                re.compile(r"total revenue|overall revenue|how much revenue", re.I),
+                re.compile(
+                    _UNSCOPED_ONLY
+                    + r".*(?:total revenue|overall revenue|how much revenue)",
+                    re.I,
+                ),
                 """
                 SELECT ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_revenue
                 FROM order_items oi
                 """,
             ),
             (
-                re.compile(r"how many orders|number of orders|total orders|order count", re.I),
+                re.compile(
+                    _UNSCOPED_ONLY
+                    + r".*(?:how many orders|number of orders|total orders"
+                    r"|order count)",
+                    re.I,
+                ),
                 "SELECT COUNT(*) AS order_count FROM orders",
             ),
             (
                 re.compile(
-                    r"how many products|number of products|product count|"
-                    r"products in (the )?catalog",
+                    _UNSCOPED_ONLY
+                    + r".*(?:how many products|number of products|product count"
+                    r"|products in (?:the )?catalog)",
                     re.I,
                 ),
                 "SELECT COUNT(*) AS product_count FROM products",
@@ -1549,7 +2028,7 @@ class OfflineBackend:
         # a meaningful cost next to executing the query.
         matches = self.matching_rule_indexes(question)
         if not matches:
-            raise ValueError(
+            raise NoRuleMatchError(
                 "Offline backend has no rule for this question. "
                 "Set OPENAI_API_KEY and use --llm for open-ended questions."
             )
@@ -1568,6 +2047,17 @@ Rules:
 - Use only SELECT (or WITH ... SELECT). Never modify data.
 - Use the exact table and column names from the schema.
 - Prefer explicit JOINs and clear column aliases.
+"""
+
+_REPAIR_PROMPT = """You are a careful analytics engineer. A SQLite query you
+wrote for a question failed. Rewrite it so that it runs and still answers the
+same question.
+
+Rules:
+- Output ONLY the corrected SQL, no prose, no markdown fences.
+- Use only SELECT (or WITH ... SELECT). Never modify data.
+- Use only the exact table and column names from the schema.
+- Fix the reported error. Do not change what the query is trying to measure.
 """
 
 
@@ -1594,6 +2084,43 @@ class LLMBackend:
         )
         sql = resp.choices[0].message.content or ""
         return _strip_fences(sql).strip()
+
+    def repair(self, question: str, schema: str, sql: str, error: str) -> str:
+        """Return a rewritten query, given the SQL that failed and its error.
+
+        The failed SQL and the error text are the whole point: without them the
+        model is just being asked the same question again at temperature 0 and
+        would return the same query. With them, the common LLM text-to-SQL
+        failure modes — a column that does not exist, a table joined on the
+        wrong key, a function SQLite does not have — become directly
+        correctable, because the engine has already named what is wrong.
+
+        The original question and schema are re-sent rather than relying on a
+        conversation history so this call is stateless: one repair is
+        independent of any other, which keeps it cheap to reason about and
+        makes the backend safe to reuse across questions.
+
+        This method has no authority of its own. Whatever it returns goes back
+        through the same validator and read-only connection as the first
+        attempt, so a repair cannot widen what the system is willing to run.
+        """
+        resp = self._client.chat.completions.create(
+            model=self._model,
+            temperature=0,
+            messages=[
+                {"role": "system", "content": _REPAIR_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        f"Schema:\n{schema}\n\n"
+                        f"Question: {question}\n\n"
+                        f"SQL that failed:\n{sql}\n\n"
+                        f"Error:\n{error}"
+                    ),
+                },
+            ],
+        )
+        return _strip_fences(resp.choices[0].message.content or "").strip()
 
 
 def _strip_fences(text: str) -> str:
