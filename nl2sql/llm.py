@@ -13,6 +13,7 @@ Both return a raw SQL string; validation and execution happen in ``runner``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from typing import Protocol, runtime_checkable
@@ -235,6 +236,103 @@ class OfflineBackend:
                 LEFT JOIN first_order f ON f.customer_id = c.id
                 GROUP BY signup_month
                 ORDER BY signup_month
+                """,
+            ),
+            # Acquisition mix: which category each customer's *first* order came
+            # from, aggregated into the share of the customer base each category
+            # brought in. Activation above asks whether and how fast a signup
+            # converts; this asks what they converted *on*, which is the question
+            # behind deciding where to spend to win new customers.
+            #
+            # Registered third, behind the two rules above and ahead of everything
+            # else, on the same narrow-vocabulary reasoning: it needs "category"
+            # next to a first-purchase notion, which no other rule uses, while the
+            # broad "revenue by category" and category-share rules further down
+            # would otherwise swallow any phrasing containing the word. Retention
+            # and activation keep priority because a question that says both
+            # "retention" and "first order" is a retention question.
+            #
+            # Three CTEs, each doing one thing:
+            #   * ``first_order`` picks one order per customer. ROW_NUMBER() over
+            #     (order_date, id) rather than MIN(order_date), because two orders
+            #     can share a date and MIN would then match both, silently
+            #     double-counting that customer. The id tiebreaker makes the choice
+            #     deterministic -- the same idiom the new-vs-returning rule uses.
+            #   * ``category_spend`` totals that order's line items per category.
+            #   * ``primary_category`` keeps the highest-spending category per
+            #     customer, breaking ties by category name so the result is stable.
+            #
+            # That last step is an *attribution choice* and the one thing to defend
+            # here: 78 of the 115 customers in the sample data have a first order
+            # spanning more than one category, so "the" acquiring category does not
+            # exist in the data and has to be defined. Attributing the customer to
+            # where they spent the most treats the largest line as the reason for
+            # the visit, and -- unlike counting the customer once per category
+            # present -- partitions the base exactly once, so ``customers_acquired``
+            # sums to the number of customers who have ordered and the percentages
+            # sum to 100. The alternative is defensible too, but it yields a column
+            # that sums to ~196% here, which reads as a bug in a report even when it
+            # is not. The tradeoff is that a narrowly-lost second category is
+            # invisible; this is a mix question, not a basket question, and the
+            # market-basket rule already covers what else rides along in an order.
+            (
+                re.compile(
+                    r"\bcategor(?:y|ies)\b[^?]*"
+                    r"\b(?:buy|bought|purchase[ds]?|order(?:ed)?|start(?:s|ed)?)\b"
+                    r"[^?]*\bfirst\b|"
+                    r"\bfirst\b[^?]*\b(?:buy|bought|purchase[ds]?|order(?:ed)?)\b"
+                    r"[^?]*\bcategor(?:y|ies)\b|"
+                    r"\bfirst\s+(?:order|purchase)\b[^?]*\bcategor(?:y|ies)\b|"
+                    r"\bcategor(?:y|ies)\b[^?]*\bfirst\s+(?:order|purchase)\b|"
+                    r"\bacquisition\s+categor(?:y|ies)\b|"
+                    r"\bcategor(?:y|ies)\b[^?]*\bacquires?\b",
+                    re.I,
+                ),
+                """
+                WITH first_order AS (
+                    SELECT order_id, customer_id
+                    FROM (
+                        SELECT o.id AS order_id,
+                               o.customer_id AS customer_id,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY o.customer_id
+                                   ORDER BY o.order_date, o.id
+                               ) AS seq
+                        FROM orders o
+                    )
+                    WHERE seq = 1
+                ),
+                category_spend AS (
+                    SELECT f.customer_id AS customer_id,
+                           p.category AS category,
+                           SUM(oi.quantity * oi.unit_price) AS category_total
+                    FROM first_order f
+                    JOIN order_items oi ON oi.order_id = f.order_id
+                    JOIN products p ON p.id = oi.product_id
+                    GROUP BY f.customer_id, p.category
+                ),
+                primary_category AS (
+                    SELECT customer_id, category
+                    FROM (
+                        SELECT customer_id,
+                               category,
+                               ROW_NUMBER() OVER (
+                                   PARTITION BY customer_id
+                                   ORDER BY category_total DESC, category
+                               ) AS spend_rank
+                        FROM category_spend
+                    )
+                    WHERE spend_rank = 1
+                )
+                SELECT category,
+                       COUNT(*) AS customers_acquired,
+                       ROUND(
+                           100.0 * COUNT(*)
+                           / (SELECT COUNT(*) FROM primary_category), 1
+                       ) AS pct_of_customers
+                FROM primary_category
+                GROUP BY category
+                ORDER BY customers_acquired DESC, category
                 """,
             ),
             (
@@ -474,15 +572,30 @@ class OfflineBackend:
             # the other window rules here (LAG for month-over-month, SUM() OVER ()
             # for category share), neither of which partitions. customer_id is a
             # deterministic tiebreaker in the ORDER BY so ties resolve the same
-            # way on every run. This rule requires BOTH a top/best/highest word
-            # and "region", and is registered ahead of the plain "top 5 customers
-            # by spend" rule below so a per-region question is not shadowed by the
-            # global top-spenders rule.
+            # way on every run. This rule requires a per-region phrase together
+            # with a superlative about customer spend, and is registered ahead of
+            # the plain "top 5 customers by spend" rule below so a per-region
+            # question is not shadowed by the global top-spenders rule.
+            #
+            # The first two alternatives key on a top/best/highest word next to
+            # "customer". The third exists because that vocabulary is not the only
+            # way to ask: "for every region, which customer spent the most?" says
+            # the same thing with "spent ... most" and no superlative adjective,
+            # and used to fall through to the global top-spenders rule below --
+            # which answered it with one overall ranking, silently dropping the
+            # per-region grouping. Requiring "each/every/per region" *and*
+            # "customer" *and* "spent/spend/spending" *and* "most" keeps the
+            # branch narrow enough not to reclaim the global rule's questions,
+            # none of which mention a region.
             (
                 re.compile(
                     r"(top|best|highest)[-\s]*(spending|spender)?\s*customers?.*"
                     r"(in|per|by|within|for)\s+(each\s+)?region|"
-                    r"region.*(top|best|highest)[-\s]*(spending|spender)?\s*customers?",
+                    r"region.*(top|best|highest)[-\s]*(spending|spender)?\s*customers?|"
+                    r"(?:each|every|per)\s+regions?\b.*\bcustomers?\b.*\bspen[dt]"
+                    r"(?:ing|s)?\b.*\bmost\b|"
+                    r"\bcustomers?\b.*\bspen[dt](?:ing|s)?\b.*\bmost\b.*"
+                    r"(?:in|per|within|for)\s+(?:each|every)\s+regions?\b",
                     re.I,
                 ),
                 """
@@ -2061,6 +2174,18 @@ Rules:
 """
 
 
+def _prompt_fingerprint(prompt: str) -> str:
+    """Return a short, stable digest of a prompt.
+
+    Used to make the prompt part of a cache key without storing the prompt
+    itself in every cache entry. Truncated to 12 hex characters: the digest
+    only has to distinguish successive revisions of one file, not resist an
+    adversary, and a short one keeps ``cache_identity`` readable when it turns
+    up in a cache file someone is inspecting by hand.
+    """
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
+
+
 class LLMBackend:
     """OpenAI-compatible chat backend. Imports the client lazily."""
 
@@ -2072,6 +2197,22 @@ class LLMBackend:
 
         self._client = OpenAI(api_key=api_key)
         self._model = model
+
+    @property
+    def cache_identity(self) -> str:
+        """Everything about this backend's configuration that shapes its SQL.
+
+        The model name and a fingerprint of the system prompt, which together
+        with the question and schema determine ``to_sql``'s output at
+        ``temperature=0``. Satisfies :class:`nl2sql.cache.CacheableBackend`, and
+        exists so that ``cache`` never has to reach into this class to discover
+        how it is configured.
+
+        The *repair* prompt is deliberately excluded: repairs are not cached, so
+        including it would invalidate every stored entry on an edit that cannot
+        change any of them.
+        """
+        return f"{self._model}/{_prompt_fingerprint(_SYSTEM_PROMPT)}"
 
     def to_sql(self, question: str, schema: str) -> str:
         resp = self._client.chat.completions.create(

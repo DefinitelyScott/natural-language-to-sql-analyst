@@ -131,6 +131,42 @@ def test_canonicals_are_gold_questions(
     assert not unknown, f"canonical questions absent from evals/gold.jsonl: {unknown}"
 
 
+def test_every_rule_has_at_least_one_paraphrase(
+    backend: OfflineBackend, records: list[dict], gold_questions: set[str]
+) -> None:
+    """Every rule the gold set reaches must also carry a rephrasing.
+
+    The robustness ratio is only as wide as the set behind it. Before this guard
+    the set covered 31 of the catalog's rules, so "30/30 rephrasings route to the
+    canonical rule" was a clean-looking number that had never touched the other
+    19 -- and a headline that reports 100% over an unstated fraction of the
+    catalog is exactly the kind of figure this repo refuses to print elsewhere.
+
+    Filling the gap once is not enough, because the ratio degrades silently: each
+    new pattern that ships without a rephrasing lowers coverage while the printed
+    number stays at 100%. This asserts the property instead of the snapshot, so a
+    new rule must arrive with a paraphrase or fail here.
+
+    Rules are identified by the gold question that reaches them rather than by
+    index, since indexes shift whenever a pattern is inserted mid-catalog.
+    """
+    covered = {
+        matches[0]
+        for record in records
+        if (matches := backend.matching_rule_indexes(record["canonical"]))
+    }
+    uncovered = sorted(
+        (matches[0], question)
+        for question in gold_questions
+        if (matches := backend.matching_rule_indexes(question)) and matches[0] not in covered
+    )
+    assert not uncovered, (
+        "these rules have no paraphrase, so nothing measures whether they "
+        "survive rephrasing:\n"
+        + "\n".join(f"  rule {index}: {question}" for index, question in uncovered)
+    )
+
+
 def test_no_duplicate_paraphrases(records: list[dict]) -> None:
     """One record per phrasing, so a pair cannot be counted twice."""
     seen = [record["paraphrase"] for record in records]

@@ -28,6 +28,7 @@ nl2sql-analyst/
 │   ├── runner.py        # read-only, guarded SQL execution
 │   ├── output.py        # table / CSV / JSON result formatters
 │   ├── catalog.py       # pairs each offline rule with an example question
+│   ├── cache.py         # on-disk reuse of SQL the LLM backend already wrote
 │   └── cli.py           # `nl2sql ask` / `explain` / `rules` / `schema`
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
@@ -268,6 +269,29 @@ rows is a property of the observation window. And a cohort that signed up before
 the first order in the database carries the gap to that date inside its average,
 which is why the 2023 cohorts show a far larger `avg_days_to_first_order` than
 the 2024 ones. Both are visible per cohort and invisible in a single number.
+
+**Acquisition mix** — which category each customer's *first* order came from,
+reported as the share of the customer base each category brought in. Activation
+above asks whether and how quickly a signup converts; this asks what they
+converted *on*. Its shape is two stacked `ROW_NUMBER()` windows: one picks a
+single first order per customer — over `(order_date, id)` rather than
+`MIN(order_date)`, since two orders can share a date and `MIN` would then match
+both and count that customer twice — and one keeps the highest-spending category
+within that order.
+
+That second window is an attribution choice, and the one thing worth defending
+here: 78 of the 115 customers who have ordered in the sample data have a first
+order spanning more than one category, so "the" acquiring category is not
+something the data contains — it has to be defined. Attributing the customer to
+the category they spent the most in treats the largest line as the reason for the
+visit and partitions the base exactly once, so `customers_acquired` sums to the
+number of customers who have ordered and `pct_of_customers` sums to 100. Counting
+the customer once per category present in the order is equally defensible and
+answers a slightly different question, but it produces a percentage column
+summing to ~196% on this data, which reads as a bug in a report even when it is
+not. The cost of the choice is that a narrowly-lost second category leaves no
+trace; that is a basket question, and the market-basket pattern above already
+covers what rides along in an order.
 
 Every pattern in this catalog has a matching row in `evals/gold.jsonl`, so each
 one is measured by the evaluation harness rather than merely asserted here.
@@ -536,6 +560,55 @@ Details that matter:
 retry, the budget and the guardrail-on-rewrite property are all covered offline,
 with no API key.
 
+## Caching generated SQL
+
+At `temperature=0`, asking a model the same question against the same schema
+returns the same query — so `ask --llm` and `explain --llm` write what they
+generate to `data/sql_cache.json` and replay it next time. Repeating a question
+then costs nothing and returns instantly, and iterating on a rule or a report
+stops being metered by the API.
+
+```bash
+python -m nl2sql.cli ask "Which 5 customers spent the most?" --llm   # calls the model
+python -m nl2sql.cli ask "Which 5 customers spent the most?" --llm   # replays, no call
+python -m nl2sql.cli ask "Which 5 customers spent the most?" --llm --no-cache
+```
+
+A cache is only as good as its key, and this one covers **every input that
+decides the answer**:
+
+- **the question, verbatim** — not lowercased or whitespace-collapsed, because
+  the model gets the exact string and normalizing would assert an equivalence
+  the cache is in no position to verify;
+- **the rendered schema**, so rebuilding the database makes answers written
+  against the old shape unreachable rather than wrong;
+- **the model name**, so switching models does not replay the old one;
+- **a fingerprint of the system prompt**, so editing the prompt invalidates
+  everything written under it. This is the one people forget, and it is the one
+  that bites: a cache blind to the prompt hides the exact change you edited the
+  prompt to see.
+
+Some deliberate limits:
+
+- **Only the SQL is cached, never the rows.** The data can change under a
+  cached query; the query text the model writes for fixed inputs cannot.
+- **Repairs are not cached.** A repair is keyed on the SQL that failed and the
+  error it raised, which only exist after an execution.
+- **Failures are not cached.** A generation that raises is retried for real
+  next time, not replayed as a permanent failure.
+- **The offline backend is never cached.** It resolves a question with a regex
+  scan, so a cache would only add a file read to the cheapest path there is.
+- **The eval harness does not use the cache.** Scoring replayed answers would
+  measure the cache, not the backend.
+- **A cached answer is disclosed, not hidden.** `ask` notes the replay on
+  stderr and `explain` prints a `Source: local cache` line, for the same reason
+  a repair is reported: you should never mistake a reproduction for a fresh run.
+
+The cache file is plain JSON, capped at 500 entries, gitignored, and safe to
+delete at any time. A corrupt or unreadable one reads as a miss and is rewritten
+on the next successful generation — an optimization must never be able to break
+an answer.
+
 ## Evaluating quality
 
 `evals/evaluate.py` loads `gold.jsonl`, generates SQL for each question, executes
@@ -545,7 +618,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 50 questions  |  execution accuracy: 50/50 (100%)  [offline backend]
+Evaluated 51 questions  |  execution accuracy: 51/51 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -587,8 +660,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 50,
-  "passed": 50,
+  "total": 51,
+  "passed": 51,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -676,13 +749,21 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **30 gating pairs and
-5 known gaps**:
+can never improve the headline. The set currently holds **46 gating pairs and
+9 known gaps**:
 
 ```
-Paraphrase robustness: 30/30 rephrasings route to the canonical rule
-  Known gaps (not gating): 5
+Paraphrase robustness: 46/46 rephrasings route to the canonical rule
+  Known gaps (not gating): 9
 ```
+
+Every rule the gold set reaches carries at least one rephrasing, and
+`tests/test_paraphrase_guard.py` asserts it: a ratio is only as wide as the set
+behind it, and an earlier version of this set covered 31 of the catalog's rules
+while still printing 100%. Widening it to the whole catalog immediately found a
+real defect — *"for every region, which customer spent the most?"* was falling
+through to the global top-spenders rule, which answered it with one overall
+ranking and silently dropped the per-region grouping.
 
 The check gates the exit code for the same reason the precision guard does: a
 paraphrase that drifts onto another rule still returns a well-formed, correctly
@@ -691,6 +772,69 @@ starts routing correctly is flagged as `[NOW ROUTING]` — the fix is to drop it
 `known_gap` and let it join the gating set, so a later regression cannot undo it
 silently. `tests/test_paraphrase_guard.py` fails on a stale one, and on the two
 counts quoted above.
+
+### Gold independence
+
+Execution accuracy compares a generated query against a gold query, and that
+comparison only carries information when the two were **written separately**. If
+the gold SQL for a question is the offline rule's own SQL, the harness runs one
+query twice and compares it to itself. The match is then guaranteed by
+construction — it would still hold if the rule computed revenue by *region* for a
+question asking about categories — so the row proves the SQL parses and executes,
+and nothing about whether it answers what was asked.
+
+That is not a hypothetical here. The harness measures it and prints it under the
+other two checks:
+
+```
+Gold independence: 43/51 gold queries are written independently of the rule they test
+  Self-comparing (not gating): 8 — these prove the SQL runs, not that it answers the question
+    [COPY] rule #25: How many customers do we have?
+    [COPY] rule #43: Show revenue by day of week.
+    ...
+```
+
+So eight rows of the 100% above are still self-referential, and the honest
+reading of the headline is "51/51, of which 43 are real comparisons". Publishing
+that number is the point: an eval set is a claim about a system, and a claim
+nobody has audited for tautologies is worth less than a smaller one that has
+been.
+
+The fix is per-question — rewrite the gold query a different way that computes
+the same answer (a different join order, a subquery where the rule uses a CTE, a
+window function where the rule uses `ORDER BY ... LIMIT`) — so the backlog is
+worked down rather than cleared at once. A rewrite only counts if it reaches the
+answer by a different route: restating `COUNT(*) FROM products` as
+`COUNT(DISTINCT id) FROM products` clears the text comparison without adding a
+second opinion, which raises the ratio while proving nothing. The whole-table
+counts still on the list are there for that reason, and may never come off it.
+Until the backlog is worked down it is a **ratchet**, not a gate:
+`tests/test_gold_independence.py` records the 8 remaining copies by name and
+fails if a new one appears, so a pattern added with copy-pasted gold SQL is
+caught immediately, while the existing backlog stays visible instead of turning
+every run red. It also fails if a rewritten query is left on the list, so the
+backlog can only shrink. The harness measures and reports; the test decides what
+is allowed to change.
+
+Six rows have been rewritten so far, each taking a different route to the same
+answer: per-order subtotals instead of one flat sum over the join fan-out
+(monthly sales), a correlated subquery instead of `JOIN` plus `GROUP BY` (top
+customers), aggregation before the customer join instead of after (largest
+orders), `DISTINCT` in a subquery instead of `COUNT(DISTINCT ...)` (monthly
+active customers), `julianday` arithmetic instead of a `date(..., '-30 day')`
+string comparison (orders in the last 30 days), and the join order reversed
+(revenue by region and category). Because `gold.jsonl` cannot carry comments,
+the disagreement each rewrite is now capable of producing is recorded in
+`REWRITE_RATIONALE` in `tests/test_gold_independence.py`, and a test keeps that
+list from outliving the rows it describes.
+
+Two limits worth stating. The comparison normalizes whitespace, trailing
+semicolons and case, and stops there — it is not a SQL parser, so a gold query
+that is a copy with one column renamed reads as independent. The count is
+therefore a **lower bound**: the true number of tautological rows can only be
+higher than the one printed. And independence is a property of the *offline*
+run only; under `--llm` the model writes its own SQL and cannot copy a gold query
+it never saw, so the check is skipped rather than reported as vacuously perfect.
 
 ### What counts as a matching result
 
@@ -703,7 +847,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 35 of the 50 gold questions
+  `"ordered": true` and are compared as returned. 36 of the 51 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

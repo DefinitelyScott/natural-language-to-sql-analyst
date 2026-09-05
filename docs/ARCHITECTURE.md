@@ -88,6 +88,39 @@ identical string, so a retry could only burn time. The distinction is a runtime
 backend be repaired" a property of the backend rather than a flag the caller has
 to remember to set.
 
+### `nl2sql/cache.py`
+
+Reuse of SQL the LLM backend has already written, so a repeated question costs
+no model call. Two pieces: `nl2sql.cache.SqlCache`, a JSON file keyed by
+`nl2sql.cache.cache_key` digests, and `nl2sql.cache.CachedBackend`, a wrapper
+that consults it before delegating.
+
+The design question that matters is *what belongs in the key*, and the answer is
+everything that determines the value: the question verbatim, the rendered
+schema, and — folded into one opaque `cache_identity` string the backend
+supplies — the model name and a fingerprint of the system prompt. The prompt is
+the component most easily forgotten and the most damaging to omit: a cache blind
+to it replays yesterday's answer after the edit made to change that answer.
+
+Two boundaries keep the wrapper from leaking into the rest of the pipeline:
+
+* **Which backends can be cached is a capability, not a class check.**
+  `nl2sql.cache.CacheableBackend` is a `runtime_checkable` protocol satisfied by
+  anything that reports a `cache_identity`. `LLMBackend` does; `OfflineBackend`
+  deliberately does not, so the default path — and therefore the whole test
+  suite and CI — never touches a cache file.
+* **A wrapper must not change what it wraps.** `CachedBackend` defines `repair`,
+  so wrapping a backend that cannot repair would advertise a capability the
+  delegate lacks and break `answer_question`'s protocol check from the inside.
+  It refuses that at construction instead.
+
+A hit and a miss are indistinguishable downstream — same SQL, same validator,
+same execution — so `nl2sql.cache.CachedBackend.lookup` returns the hit flag
+alongside the SQL and the CLI reports it, rather than any of the pipeline
+branching on it. Reads and writes are best-effort throughout: an unreadable or
+foreign-format file is a miss, an unwritable directory costs the caching and
+nothing else. An optimization that can break an answer is not one.
+
 ### `nl2sql/generator.py`
 
 Orchestration, and the only module that knows the full sequence.

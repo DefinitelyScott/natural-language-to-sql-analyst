@@ -2867,3 +2867,111 @@ def test_end_to_end_time_to_first_order():
         else:
             assert avg_days is not None, month
             assert avg_days >= 0, month
+
+
+def test_acquisition_mix_routing():
+    """The acquisition-mix rule owns "category ... first" and nothing else.
+
+    Two directions matter. It has to win its own phrasings against the broad
+    category rules registered behind it, and it must not reclaim theirs -- the
+    word "category" alone is not an acquisition question, and the failure mode
+    of a rule registered this early is that it silently swallows the questions
+    of every rule below it.
+    """
+    backend = OfflineBackend()
+    index = backend.matching_rule_indexes("Which category do customers buy from first?")[0]
+
+    for question in (
+        "Which category do customers buy from first?",
+        "Which category acquires the most customers?",
+        "What is the acquisition category mix?",
+        "Which category do customers purchase from first?",
+    ):
+        assert backend.matching_rule_indexes(question)[0] == index, question
+
+    # Every other category question in the gold set must keep its own rule. A
+    # first-purchase notion is what separates them, and none of these have one.
+    for question in (
+        "Show revenue by category",
+        "What percentage of revenue comes from each category?",
+        "What share of customers bought from each category?",
+        "What is the best-selling product in each category?",
+        "How has revenue by category changed month over month?",
+        "Show revenue by category with a total row.",
+        "Show revenue by region and category.",
+    ):
+        assert index not in backend.matching_rule_indexes(question), question
+
+    # And a question that pairs a duration word with "first order" is still an
+    # activation question, decided by the earlier rule rather than by this one.
+    assert backend.matching_rule_indexes(
+        "How long does it take a new customer to place their first order?"
+    )[0] < index
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_acquisition_mix():
+    """Check the attribution against an independent recomputation.
+
+    The property under test is not the shape of the output but the attribution
+    rule itself: every customer who has ordered is counted exactly once, under
+    the category they spent the most in on their first order. Asserting that by
+    re-deriving it in Python from the raw tables -- rather than by pinning the
+    numbers the SQL happens to produce today -- means the test fails if the
+    window functions are wrong and survives a change to the sample data.
+
+    The partition property is the one that would break silently: counting a
+    customer once per category present in their first order would leave the
+    columns looking entirely reasonable while inflating every figure, and only
+    the sum gives it away.
+    """
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(DB, "Which category do customers buy from first?")
+    assert ans.result.columns == ["category", "customers_acquired", "pct_of_customers"]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert rows, "the acquisition mix should not be empty"
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        first_order = {}
+        for customer_id, order_id, order_date in conn.execute(
+            "SELECT customer_id, id, order_date FROM orders"
+        ):
+            current = first_order.get(customer_id)
+            if current is None or (order_date, order_id) < current:
+                first_order[customer_id] = (order_date, order_id)
+
+        spend: dict[int, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+        for customer_id, (_, order_id) in first_order.items():
+            for category, quantity, unit_price in conn.execute(
+                "SELECT p.category, oi.quantity, oi.unit_price "
+                "FROM order_items oi JOIN products p ON p.id = oi.product_id "
+                "WHERE oi.order_id = ?",
+                (order_id,),
+            ):
+                spend[customer_id][category] += quantity * unit_price
+    finally:
+        conn.close()
+
+    expected: dict[str, int] = defaultdict(int)
+    for categories in spend.values():
+        # Highest spend wins; the category name breaks ties, matching the SQL's
+        # ORDER BY category_total DESC, category.
+        winner = min(categories.items(), key=lambda item: (-item[1], item[0]))[0]
+        expected[winner] += 1
+
+    assert {row[0]: row[1] for row in rows} == dict(expected)
+
+    # Every buyer is attributed, and attributed once.
+    buyers = len(first_order)
+    assert sum(row[1] for row in rows) == buyers
+
+    for category, acquired, pct in rows:
+        assert acquired > 0, category
+        assert_rounds_to(pct, 100.0 * acquired / buyers, 1)
+
+    # Sorted by size, then by name -- the deterministic order the gold row is
+    # compared against.
+    assert rows == sorted(rows, key=lambda row: (-row[1], row[0]))

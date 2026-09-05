@@ -44,6 +44,16 @@ only from phrasings that already work would measure nothing about the matcher's
 reach. They are reported but do not fail the run, and a known gap that starts
 routing correctly is flagged so it can be promoted to a gating pair.
 
+The independence check (:func:`check_independence`) measures a property of the
+*gold set itself* rather than of the backend. Execution accuracy compares a
+generated query against a gold query, which only means something when the two
+were written separately. When a gold query is a copy of the offline rule it is
+meant to test, the harness runs one query twice and compares it to itself: the
+row-for-row match is guaranteed by construction, so the question proves the SQL
+executes but cannot show it answers what was asked. Those rows are reported, not
+hidden, for the same reason a known gap is — a headline of 100% should be read
+next to how much of it is self-referential.
+
 Every question produces a :class:`QuestionResult` rather than just a pass/fail
 tally. A bare accuracy number tells you *that* a backend regressed; the per
 question record — the SQL it generated, whether the run errored or merely
@@ -60,6 +70,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass
 
@@ -232,6 +243,7 @@ def build_report(
     backend_name: str,
     guards: list[GuardResult] | None = None,
     paraphrases: list[ParaphraseResult] | None = None,
+    independence: list[IndependenceResult] | None = None,
 ) -> dict:
     """Assemble a JSON-serializable report from evaluated questions.
 
@@ -251,6 +263,13 @@ def build_report(
     rule. ``gating`` counts only the pairs that can fail the run, so a pair moved
     into ``known_gaps`` leaves the ``routed``/``gating`` ratio rather than
     improving it.
+
+    ``independence`` is offline-only for a different reason than the other two:
+    an LLM writes its own SQL every time, so a gold query cannot be a copy of
+    something it never had. Archiving the count alongside ``execution_accuracy``
+    is the point of carrying it in the report at all — the two are read
+    together, and a consumer that keeps only the accuracy keeps the half of the
+    picture that flatters the run.
     """
     passed = sum(1 for result in results if result.passed)
     total = len(results)
@@ -276,6 +295,12 @@ def build_report(
             "known_gaps": len(gaps),
             "recovered_gaps": sum(1 for item in gaps if item.recovered),
             "paraphrases": [asdict(item) for item in paraphrases],
+        }
+    if independence is not None:
+        report["independence"] = {
+            "checked": len(independence),
+            "independent": sum(1 for item in independence if item.independent),
+            "questions": [asdict(item) for item in independence],
         }
     return report
 
@@ -524,6 +549,102 @@ def format_paraphrases(results: list[ParaphraseResult]) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- #
+# Gold independence: gold SQL must not be a copy of the rule it tests
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class IndependenceResult:
+    """Whether one gold query was written independently of the rule it tests.
+
+    ``rule`` names the rule the question routes to, so a reported copy can be
+    opened without re-deriving the routing by hand. It is ``None`` when no rule
+    matches; such a question has no rule SQL it could have been copied from, so
+    it counts as independent here. That is not a free pass — a question the
+    catalog cannot route is already a hard ``ERROR`` in the accuracy run, and
+    reporting it a second time under a metric about gold-set quality would blame
+    the gold row for a backend gap.
+    """
+
+    question: str
+    rule: int | None
+    independent: bool
+
+
+def normalize_sql(sql: str) -> str:
+    """Reduce a query to a form that ignores purely cosmetic differences.
+
+    Collapses runs of whitespace, drops a trailing semicolon, and lowercases.
+    Two queries equal under this are the same text typed with different layout —
+    which is what a copy-paste into the gold file looks like after someone
+    re-indents it.
+
+    Lowercasing also folds the case of string literals, so in principle two
+    queries differing *only* in a literal's case (``'East'`` vs ``'east'``) would
+    be called identical. That false positive cannot occur in a passing run:
+    SQLite compares string literals case-sensitively, so those two queries return
+    different rows, and the gold row would already be failing execution accuracy
+    before this check ever looked at it.
+
+    Deliberately not a SQL parser. Normalizing aliases, argument order or
+    formatting inside expressions would catch gold queries that are copies with
+    a column renamed, but every rule added would be a rule to defend. The
+    conservative version under-reports, which is the safe direction for a metric
+    whose whole purpose is to be believed: what it flags is a copy beyond
+    argument, and the true count can only be higher than what it prints.
+    """
+    return re.sub(r"\s+", " ", sql).strip().rstrip(";").strip().lower()
+
+
+def check_independence(
+    backend: llm.OfflineBackend, schema_text: str, gold: list[dict]
+) -> list[IndependenceResult]:
+    """Check each gold query against the SQL its question actually generates.
+
+    Compares what ``to_sql`` returns rather than reaching for the rule's stored
+    SQL, so the comparison follows the same path the accuracy run takes: if a
+    question starts routing to a different rule, this check sees the query that
+    would really be scored, not the one the catalog was expected to supply.
+    """
+    results: list[IndependenceResult] = []
+    for record in gold:
+        question, gold_sql = record["question"], record["sql"]
+        matches = backend.matching_rule_indexes(question)
+        if not matches:
+            results.append(IndependenceResult(question, None, independent=True))
+            continue
+        generated = backend.to_sql(question, schema_text)
+        results.append(
+            IndependenceResult(
+                question,
+                matches[0],
+                independent=normalize_sql(generated) != normalize_sql(gold_sql),
+            )
+        )
+    return results
+
+
+def format_independence(results: list[IndependenceResult]) -> str:
+    """Render the independence outcome as a console block.
+
+    Copies are listed rather than summarised to a count, because the fix is
+    per-question — rewrite that gold query a different way that computes the
+    same answer — and a bare number gives no starting point.
+    """
+    copies = [result for result in results if not result.independent]
+    lines = [
+        f"Gold independence: {len(results) - len(copies)}/{len(results)} gold "
+        f"queries are written independently of the rule they test"
+    ]
+    if copies:
+        lines.append(
+            f"  Self-comparing (not gating): {len(copies)} — "
+            f"these prove the SQL runs, not that it answers the question"
+        )
+        for result in copies:
+            lines.append(f"    [COPY] rule #{result.rule}: {result.question}")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class ReportComparison:
     """How the per-question outcomes of two runs differ.
@@ -702,7 +823,20 @@ def main(argv: list[str] | None = None) -> int:
         if offline is None
         else check_paraphrases(offline, load_paraphrase_set(args.paraphrases))
     )
-    report = build_report(results, backend_name, guards, paraphrases)
+    # Offline-only because an LLM writes its own SQL on every run, so its output
+    # cannot be a copy of a gold query it never saw. Re-reads the gold file and
+    # the schema rather than threading them out of ``evaluate``: the offline
+    # backend ignores the schema argument, but relying on that would couple this
+    # check to an implementation detail of the very backend it is measuring, and
+    # both reads are cheap next to executing a pair of queries per question.
+    independence = (
+        None
+        if offline is None
+        else check_independence(
+            offline, schema.schema_context(args.db), load_gold(GOLD_PATH)
+        )
+    )
+    report = build_report(results, backend_name, guards, paraphrases, independence)
 
     total, passed = report["total"], report["passed"]
     pct = round(100 * report["execution_accuracy"])
@@ -724,6 +858,10 @@ def main(argv: list[str] | None = None) -> int:
     if paraphrases is not None:
         print()
         print(format_paraphrases(paraphrases))
+
+    if independence is not None:
+        print()
+        print(format_independence(independence))
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -754,6 +892,15 @@ def main(argv: list[str] | None = None) -> int:
     routing_failed = paraphrases is not None and any(
         not item.passed for item in paraphrases
     )
+    #
+    # Independence deliberately does *not* gate here. Fourteen of the gold
+    # queries are copies today, so a gating check would fail every run from the
+    # moment it was added, and a check that is always red is a check people learn
+    # to scroll past. The ratchet lives in ``tests/test_gold_independence.py``
+    # instead: the current copies are recorded there by name, so a *new* one
+    # fails the suite while the existing backlog stays visible rather than
+    # blocking. That split also puts the two jobs where they belong — the harness
+    # measures and reports, the test decides what is allowed to change.
     return 0 if passed == total and not guard_failed and not routing_failed else 1
 
 

@@ -12,5 +12,8 @@ data/*.db
 data/*.db-journal
 data/*.db-wal
 
+# Local LLM SQL cache (regenerated on demand; safe to delete at any time)
+data/sql_cache.json
+
 # Environment
 .env

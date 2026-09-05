@@ -22,7 +22,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass, field
 
-from . import llm, runner, schema
+from . import cache, llm, runner, schema
 
 #: How many times :func:`answer_question` will ask a backend to rewrite SQL that
 #: failed, before giving up and raising.
@@ -67,6 +67,12 @@ class Answer:
     #: than one that ran first time, and silently hiding that would overstate
     #: how well the backend performed.
     repairs: list[RepairAttempt] = field(default_factory=list)
+    #: True when the SQL was replayed from the local cache instead of generated.
+    #: Recorded for the same reason as ``repairs``: a cached answer is a
+    #: reproduction of an earlier model call, and someone who has just edited a
+    #: prompt and is watching for a change needs to be told that no call was
+    #: made rather than concluding the edit had no effect.
+    cached: bool = False
 
 
 @dataclass
@@ -91,6 +97,11 @@ class Explanation:
     matched_pattern: str | None = None
     shadowed_rules: list[tuple[int, str]] = field(default_factory=list)
     safety_error: str | None = None
+    #: True when the SQL was replayed from the local cache. Worth reporting in a
+    #: dry run in particular: ``explain`` is the command you reach for after
+    #: changing a prompt, and it would otherwise show you yesterday's answer
+    #: with nothing to distinguish it from a fresh one.
+    cached: bool = False
 
     @property
     def is_safe(self) -> bool:
@@ -99,9 +110,9 @@ class Explanation:
 
 
 def _resolve(
-    db_path: str, question: str, *, use_llm: bool
-) -> tuple[llm.Backend, str, str]:
-    """Return the backend, the schema text it was given, and the SQL it produced.
+    db_path: str, question: str, *, use_llm: bool, use_cache: bool = False
+) -> tuple[llm.Backend, str, str, bool]:
+    """Return the backend, the schema text, the SQL, and whether it was cached.
 
     The backend is handed back alongside the SQL so a caller that wants to
     introspect the routing (:func:`explain_question`) does not have to construct
@@ -109,10 +120,28 @@ def _resolve(
     schema text comes back for the same reason: a repair has to re-send it, and
     re-introspecting the database would risk repairing against a different
     schema than the one the failed query was written from.
+
+    Caching is decided here rather than inside ``llm.get_backend`` because it is
+    an orchestration choice, not a property of any backend: the factory's job is
+    to pick one, and this function's job is to run the pipeline around it.
+
+    The wrap is gated on :class:`cache.CacheableBackend` rather than on
+    ``use_llm``, so *which* backends are cacheable is expressed as a capability
+    they either have or lack. ``OfflineBackend`` does not implement it and is
+    therefore never wrapped — its answers are a regex scan away, so a cache
+    would only add a file read to the cheap path.
     """
     schema_text = schema.schema_context(db_path)
     backend = llm.get_backend(use_llm)
-    return backend, schema_text, backend.to_sql(question, schema_text)
+
+    if use_cache and isinstance(backend, cache.CacheableBackend):
+        cached_backend = cache.CachedBackend(
+            backend, cache.SqlCache(), backend.cache_identity
+        )
+        sql, from_cache = cached_backend.lookup(question, schema_text)
+        return cached_backend, schema_text, sql, from_cache
+
+    return backend, schema_text, backend.to_sql(question, schema_text), False
 
 
 def _describe_failure(
@@ -141,9 +170,11 @@ def _describe_failure(
     return "\n".join(lines)
 
 
-def generate_sql(db_path: str, question: str, *, use_llm: bool = False) -> str:
+def generate_sql(
+    db_path: str, question: str, *, use_llm: bool = False, use_cache: bool = False
+) -> str:
     """Generate SQL for ``question`` without executing it."""
-    _, _, sql = _resolve(db_path, question, use_llm=use_llm)
+    _, _, sql, _ = _resolve(db_path, question, use_llm=use_llm, use_cache=use_cache)
     return sql
 
 
@@ -152,6 +183,7 @@ def answer_question(
     question: str,
     *,
     use_llm: bool = False,
+    use_cache: bool = False,
     max_rows: int = 1000,
     timeout_ms: int | None = runner.DEFAULT_TIMEOUT_MS,
 ) -> Answer:
@@ -181,8 +213,17 @@ def answer_question(
     another full ``timeout_ms``. That the exception sits outside the
     ``sqlite3.DatabaseError`` hierarchy is what enforces this, rather than a
     check here that a later edit could forget.
+
+    ``use_cache`` opts the *generation* step into the on-disk cache (see
+    :mod:`nl2sql.cache`); it changes nothing about execution, validation or the
+    repair loop, and the resulting :class:`Answer` records on ``cached`` whether
+    the SQL was replayed. It is off by default because writing to a file the
+    caller never named is a surprising thing for a library function to do — the
+    CLI turns it on, since there the file is the user's own.
     """
-    backend, schema_text, sql = _resolve(db_path, question, use_llm=use_llm)
+    backend, schema_text, sql, cached = _resolve(
+        db_path, question, use_llm=use_llm, use_cache=use_cache
+    )
     repairs: list[RepairAttempt] = []
 
     while True:
@@ -199,24 +240,34 @@ def answer_question(
             sql = backend.repair(question, schema_text, sql, error)
             continue
 
-        return Answer(question=question, sql=sql, result=result, repairs=repairs)
+        return Answer(
+            question=question,
+            sql=sql,
+            result=result,
+            repairs=repairs,
+            cached=cached,
+        )
 
 
 def explain_question(
-    db_path: str, question: str, *, use_llm: bool = False
+    db_path: str, question: str, *, use_llm: bool = False, use_cache: bool = False
 ) -> Explanation:
     """Generate SQL for ``question`` and describe it, without executing it.
 
     No repair happens here, and cannot: a repair is driven by an execution
     error, and a dry run never executes. What ``explain`` shows is therefore
-    always the backend's first attempt.
+    always the backend's first attempt — cached or not, since a cache entry only
+    ever holds a first attempt.
     """
-    backend, _, sql = _resolve(db_path, question, use_llm=use_llm)
+    backend, _, sql, cached = _resolve(
+        db_path, question, use_llm=use_llm, use_cache=use_cache
+    )
 
     explanation = Explanation(
         question=question,
         backend="llm" if use_llm else "offline",
         sql=sql,
+        cached=cached,
     )
 
     if isinstance(backend, llm.OfflineBackend):

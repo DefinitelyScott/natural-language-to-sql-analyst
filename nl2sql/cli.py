@@ -30,6 +30,17 @@ _TABLE_PREVIEW_ROWS = 20
 # catalog, so requiring a built database to list it would be a false dependency.
 _NEEDS_DB = frozenset({"ask", "explain", "schema"})
 
+# Shared help for --no-cache. Caching is on by default here even though the
+# library defaults it off: the cache file belongs to the person running the
+# command, and paying for a model call they have already paid for is not a
+# sensible default for a tool. It is a no-op without --llm, since the offline
+# backend is never cached.
+_NO_CACHE_HELP = (
+    "do not read or write the local SQL cache; regenerate the query even if an "
+    "identical question, schema, model and prompt were answered before "
+    "(--llm only — offline SQL is never cached)"
+)
+
 
 #: How many nearest catalog questions to offer when the offline backend has no
 #: rule for the question asked. Three is enough to cover a near-miss in phrasing
@@ -83,6 +94,11 @@ def _print_explanation(exp: generator.Explanation) -> int:
     """
     print(f"\nQuestion: {exp.question}")
     print(f"Backend:  {exp.backend}")
+    if exp.cached:
+        # Only printed on a hit. A dry run is what you reach for after editing
+        # a prompt, and "the model was never called" is the one fact that would
+        # otherwise make the output impossible to interpret.
+        print("Source:   local cache (pass --no-cache to regenerate)")
 
     if exp.matched_rule is not None:
         print(f"\nMatched offline rule #{exp.matched_rule}: {exp.matched_pattern}")
@@ -144,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
     ask.add_argument("question", help="the question, in plain English")
     ask.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
     ask.add_argument("--llm", action="store_true", help="use the LLM backend")
+    ask.add_argument("--no-cache", action="store_true", help=_NO_CACHE_HELP)
     ask.add_argument("--max-rows", type=int, default=1000)
     ask.add_argument(
         "--timeout-ms",
@@ -185,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
     why.add_argument("question", help="the question, in plain English")
     why.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
     why.add_argument("--llm", action="store_true", help="use the LLM backend")
+    why.add_argument("--no-cache", action="store_true", help=_NO_CACHE_HELP)
 
     rules = sub.add_parser(
         "rules",
@@ -291,7 +309,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "explain":
         try:
-            exp = generator.explain_question(args.db, args.question, use_llm=args.llm)
+            exp = generator.explain_question(
+                args.db,
+                args.question,
+                use_llm=args.llm,
+                use_cache=not args.no_cache,
+            )
         except llm.NoRuleMatchError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             _print_no_rule_help(args.question, _DEFAULT_GOLD)
@@ -306,6 +329,7 @@ def main(argv: list[str] | None = None) -> int:
             args.db,
             args.question,
             use_llm=args.llm,
+            use_cache=not args.no_cache,
             max_rows=args.max_rows,
             # argparse carries "no deadline" as 0, because a flag is easier to
             # write than a second one; the library spells it None and rejects
@@ -336,6 +360,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     columns, rows = ans.result.columns, ans.result.rows
+
+    # Disclosed for the same reason a repair is: the answer is sound either
+    # way, but "no model was called for this" changes how you read it — most
+    # sharply when you have just changed a prompt and are checking the effect.
+    if ans.cached:
+        print(
+            "Note: SQL replayed from the local cache (no model call); "
+            "pass --no-cache to regenerate.",
+            file=sys.stderr,
+        )
 
     # A repaired answer is still an answer, but it is a weaker one: the backend
     # got it wrong once. Reporting each failed attempt on stderr keeps the
