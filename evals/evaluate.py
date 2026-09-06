@@ -73,10 +73,23 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass
+from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from nl2sql import llm, runner, schema  # noqa: E402
+
+#: One decoded JSONL record, or one JSON report body.
+#:
+#: The values really are heterogeneous: a gold record holds two strings and a
+#: bool, a guard record two strings, and a report holds numbers, strings and
+#: nested lists of dicts. ``Any`` is the honest element type here rather than a
+#: union — every consumer already narrows the field it wants with an
+#: ``isinstance`` check or a cast at the point of use, and a union would only
+#: move those checks around without adding a guarantee. The alias exists so
+#: that intent is stated once instead of implied by a bare ``dict`` at fourteen
+#: signatures.
+JsonRecord = dict[str, Any]
 
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db")
 GOLD_PATH = os.path.join(os.path.dirname(__file__), "gold.jsonl")
@@ -180,7 +193,7 @@ def describe_difference(
     raise AssertionError("result keys differ but no differing row was found")
 
 
-def load_gold(path: str) -> list[dict]:
+def load_gold(path: str) -> list[JsonRecord]:
     """Load gold (question, sql, ordered) records from a JSONL file."""
     with open(path, encoding="utf-8") as fh:
         return [json.loads(line) for line in fh if line.strip()]
@@ -190,7 +203,7 @@ def evaluate_question(
     db_path: str,
     backend: llm.Backend,
     schema_text: str,
-    item: dict,
+    item: JsonRecord,
 ) -> QuestionResult:
     """Generate, execute and compare SQL for one gold record."""
     question, gold_sql = item["question"], item["sql"]
@@ -244,7 +257,7 @@ def build_report(
     guards: list[GuardResult] | None = None,
     paraphrases: list[ParaphraseResult] | None = None,
     independence: list[IndependenceResult] | None = None,
-) -> dict:
+) -> JsonRecord:
     """Assemble a JSON-serializable report from evaluated questions.
 
     ``execution_accuracy`` is a fraction rather than a rounded percentage so a
@@ -328,7 +341,7 @@ class GuardResult:
         return self.matched_rule is None
 
 
-def load_guard_set(path: str = PRECISION_PATH) -> list[dict]:
+def load_guard_set(path: str = PRECISION_PATH) -> list[JsonRecord]:
     """Load ``(question, reason)`` guard records from a JSONL file.
 
     Each record must carry both fields. The ``reason`` is not decoration: a
@@ -339,7 +352,7 @@ def load_guard_set(path: str = PRECISION_PATH) -> list[dict]:
     raises: a silently dropped guard is a check that stops running while still
     appearing to.
     """
-    records: list[dict] = []
+    records: list[JsonRecord] = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
             if not line.strip():
@@ -356,7 +369,7 @@ def load_guard_set(path: str = PRECISION_PATH) -> list[dict]:
 
 
 def check_precision(
-    backend: llm.OfflineBackend, guards: list[dict]
+    backend: llm.OfflineBackend, guards: list[JsonRecord]
 ) -> list[GuardResult]:
     """Check that no rule in ``backend`` matches any guard question.
 
@@ -445,7 +458,7 @@ class ParaphraseResult:
         return self.routed_alike or self.known_gap is not None
 
 
-def load_paraphrase_set(path: str = PARAPHRASE_PATH) -> list[dict]:
+def load_paraphrase_set(path: str = PARAPHRASE_PATH) -> list[JsonRecord]:
     """Load ``(canonical, paraphrase[, known_gap])`` records from a JSONL file.
 
     ``canonical`` and ``paraphrase`` are required and must be non-empty;
@@ -454,7 +467,7 @@ def load_paraphrase_set(path: str = PARAPHRASE_PATH) -> list[dict]:
     guard loaders do: a check that silently stops running still reports a clean
     result.
     """
-    records: list[dict] = []
+    records: list[JsonRecord] = []
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, start=1):
             if not line.strip():
@@ -476,7 +489,7 @@ def load_paraphrase_set(path: str = PARAPHRASE_PATH) -> list[dict]:
 
 
 def check_paraphrases(
-    backend: llm.OfflineBackend, records: list[dict]
+    backend: llm.OfflineBackend, records: list[JsonRecord]
 ) -> list[ParaphraseResult]:
     """Route every canonical/paraphrase pair and record where each landed.
 
@@ -596,7 +609,7 @@ def normalize_sql(sql: str) -> str:
 
 
 def check_independence(
-    backend: llm.OfflineBackend, schema_text: str, gold: list[dict]
+    backend: llm.OfflineBackend, schema_text: str, gold: list[JsonRecord]
 ) -> list[IndependenceResult]:
     """Check each gold query against the SQL its question actually generates.
 
@@ -672,7 +685,7 @@ class ReportComparison:
         return bool(self.regressed)
 
 
-def _passed_by_question(report: dict, label: str) -> dict[str, bool]:
+def _passed_by_question(report: JsonRecord, label: str) -> dict[str, bool]:
     """Index a report's questions by text, mapping each to whether it passed.
 
     Raises ``ValueError`` on a duplicate question, because the diff keys on the
@@ -695,7 +708,7 @@ def _passed_by_question(report: dict, label: str) -> dict[str, bool]:
     return passed
 
 
-def compare_reports(baseline: dict, current: dict) -> ReportComparison:
+def compare_reports(baseline: JsonRecord, current: JsonRecord) -> ReportComparison:
     """Diff two ``build_report`` payloads question by question."""
     before = _passed_by_question(baseline, "baseline")
     after = _passed_by_question(current, "current")
@@ -752,10 +765,24 @@ def format_comparison(comparison: ReportComparison) -> str:
     return "\n".join(lines)
 
 
-def load_report(path: str) -> dict:
-    """Load a report previously written by ``--json``."""
+def load_report(path: str) -> JsonRecord:
+    """Load a report previously written by ``--json``.
+
+    The top level is checked to be a JSON object before it is returned.
+    ``json.load`` will happily hand back a list or a bare string, and
+    ``--compare`` would then fail several frames later inside
+    :func:`_passed_by_question` with an error about the wrong thing. Pointing
+    ``--compare`` at the wrong file is the likely mistake here — the reports
+    live next to the gold set, which is also JSON — so it is worth naming.
+    """
     with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
+        report = json.load(fh)
+    if not isinstance(report, dict):
+        raise ValueError(
+            f"{path}: expected a JSON object written by --json, "
+            f"found {type(report).__name__}"
+        )
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:

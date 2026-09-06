@@ -13,7 +13,7 @@ dependencies = []
 
 [project.optional-dependencies]
 llm = ["openai>=1.0"]
-dev = ["pytest>=8.0", "ruff>=0.16"]
+dev = ["pytest>=8.0", "ruff>=0.16", "mypy>=2.3"]
 
 [project.scripts]
 nl2sql = "nl2sql.cli:main"
@@ -49,3 +49,31 @@ select = [
 # Tests legitimately reach into internals (that is what they test) and define
 # stubs/mocks that take a protocol's full signature without consulting it.
 "tests/*" = ["SLF001", "ARG"]
+
+[tool.mypy]
+python_version = "3.10"
+# Strict, and applied to the shipped code only — `nl2sql/`, `evals/` and
+# `scripts/`, which is what CI checks. Two deliberate boundaries:
+#
+# * Strict rather than a subset. The codebase was already almost fully
+#   annotated, so the cost of turning everything on was small and the findings
+#   were real: `RepairingBackend` did not declare the `to_sql` its only holder
+#   calls, and the sample-DB builder's row lists were inferred from their first
+#   append rather than stated. A permissive baseline would have reported
+#   neither.
+# * `tests/` is excluded. Test doubles exist to implement one method of a
+#   protocol and stub the rest, and `--strict` would demand full annotations on
+#   every fixture and mock — noise on code whose contract is the assertion it
+#   makes, not its signature. The suite still type-checks the package
+#   transitively, since it imports and exercises it.
+strict = true
+files = ["nl2sql", "evals", "scripts"]
+
+[[tool.mypy.overrides]]
+# `openai` is an optional extra: the LLM backend imports it lazily inside the
+# constructor so the offline path never needs it, and CI does not install it.
+# Without this the type check would fail on a missing stub for a dependency
+# that is *meant* to be absent. Scoped to this one module so a genuinely
+# missing import anywhere else is still an error.
+module = ["openai"]
+ignore_missing_imports = true

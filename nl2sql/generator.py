@@ -231,8 +231,15 @@ def answer_question(
             result = runner.run(db_path, sql, max_rows=max_rows, timeout_ms=timeout_ms)
         except (sqlite3.DatabaseError, runner.UnsafeQueryError) as exc:
             error = f"{type(exc).__name__}: {exc}"
-            repairable = isinstance(backend, llm.RepairingBackend)
-            if not repairable or len(repairs) >= MAX_REPAIR_ATTEMPTS:
+            # The ``isinstance`` is written inline rather than bound to a name
+            # so the type checker can narrow ``backend`` to a RepairingBackend
+            # on the path that falls through to ``backend.repair`` below. It
+            # reads as a guard clause either way; the narrowing is what makes
+            # the call below checkable rather than taken on trust.
+            if (
+                len(repairs) >= MAX_REPAIR_ATTEMPTS
+                or not isinstance(backend, llm.RepairingBackend)
+            ):
                 raise QueryFailedError(
                     _describe_failure(sql, error, repairs)
                 ) from exc

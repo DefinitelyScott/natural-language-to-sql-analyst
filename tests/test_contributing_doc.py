@@ -64,6 +64,12 @@ _REQUIRES_PYTHON_RE = re.compile(r'requires-python\s*=\s*">=\s*(\d+\.\d+)"')
 # "CI pins **ruff 0.16.2**" / `pip install ruff==0.16.2`.
 _RUFF_VERSION_RE = re.compile(r"ruff (\d+\.\d+\.\d+)\*\*")
 _RUFF_PIN_RE = re.compile(r"ruff==(\d+\.\d+\.\d+)")
+# "clean under **mypy 2.3.1** in `--strict` mode" / `pip install mypy==2.3.1`.
+_MYPY_VERSION_RE = re.compile(r"mypy (\d+\.\d+\.\d+)\*\*")
+_MYPY_PIN_RE = re.compile(r"mypy==(\d+\.\d+\.\d+)")
+# `strict = true` / `files = ["nl2sql", "evals", "scripts"]` in [tool.mypy].
+_MYPY_STRICT_RE = re.compile(r"^strict\s*=\s*true", re.MULTILINE)
+_MYPY_FILES_RE = re.compile(r"^files\s*=\s*\[(.*?)\]", re.MULTILINE | re.DOTALL)
 # "Lines wrap at **100** characters" / `line-length = 100`.
 _LINE_LENGTH_RE = re.compile(r"Lines wrap at \*\*(\d+)\*\* characters")
 _LINE_LENGTH_CONFIG_RE = re.compile(r"^line-length\s*=\s*(\d+)", re.MULTILINE)
@@ -164,6 +170,45 @@ def test_ruff_version_matches_the_ci_pin(doc: str) -> None:
     assert claimed.group(1) == pinned.group(1), (
         f"CONTRIBUTING.md says CI pins ruff {claimed.group(1)}, "
         f"but ci.yml installs ruff=={pinned.group(1)}"
+    )
+
+
+def test_mypy_version_matches_the_ci_pin(doc: str) -> None:
+    claimed = _MYPY_VERSION_RE.search(doc)
+    assert claimed, "CONTRIBUTING.md no longer states the pinned mypy version as 'mypy X.Y.Z**'"
+
+    workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+    pinned = _MYPY_PIN_RE.search(workflow)
+    assert pinned, "ci.yml no longer pins mypy with 'mypy==X.Y.Z'"
+
+    assert claimed.group(1) == pinned.group(1), (
+        f"CONTRIBUTING.md says CI pins mypy {claimed.group(1)}, "
+        f"but ci.yml installs mypy=={pinned.group(1)}"
+    )
+
+
+def test_mypy_strictness_and_scope_match_pyproject(doc: str, pyproject: str) -> None:
+    """The guide promises strict mode over three named directories. Hold it to that.
+
+    Scope is the claim most likely to drift: a fourth top-level package would be
+    unchecked by default and silently outside a guarantee the guide still makes.
+    The directories are read out of the prose as backticked paths so the
+    sentence naming them cannot be rewritten past this test.
+    """
+    assert _MYPY_STRICT_RE.search(pyproject), "pyproject.toml no longer sets strict = true"
+    assert "`--strict`" in doc, "CONTRIBUTING.md no longer claims mypy runs in --strict mode"
+
+    configured = _MYPY_FILES_RE.search(pyproject)
+    assert configured, "pyproject.toml no longer declares mypy's files list"
+    checked = set(re.findall(r'"([^"]+)"', configured.group(1)))
+
+    scope_sentence = re.search(r"The shipped code — (.+?) — type-checks", doc, re.DOTALL)
+    assert scope_sentence, "CONTRIBUTING.md no longer names the type-checked directories"
+    documented = {path.rstrip("/") for path in re.findall(r"`([\w./-]+)`", scope_sentence.group(1))}
+
+    assert documented == checked, (
+        f"CONTRIBUTING.md says mypy checks {sorted(documented)}, "
+        f"but pyproject.toml checks {sorted(checked)}"
     )
 
 

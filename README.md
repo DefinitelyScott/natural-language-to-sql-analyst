@@ -859,12 +859,21 @@ Those counts are not maintained by hand. `tests/test_docs.py` parses them back
 out of this README and compares them to `evals/gold.jsonl`, so adding a question
 without refreshing the numbers fails the suite.
 
-## Tests and linting
+## Tests, linting and types
 
 ```bash
 pytest -q
 ruff check .   # same config CI runs, from pyproject.toml
+mypy           # --strict over nl2sql/, evals/, scripts/; config in pyproject.toml
 ```
+
+The shipped code type-checks clean under `mypy --strict`, enforced by CI as its
+own job against the oldest supported interpreter. That is a gate rather than a
+badge: turning it on surfaced a protocol (`llm.RepairingBackend`) that declared
+only the method it adds and not the one every holder of it also calls, and a
+sample-data builder that reused one variable name for two different row shapes.
+`tests/` is excluded on purpose — a test double stubs most of the protocol it
+stands in for, so strict annotations there would cost noise and buy nothing.
 
 CI runs the lint as its own job alongside the test matrix. The ruff ruleset is
 deliberately curated rather than `ALL` — each enabled family (pyflakes,

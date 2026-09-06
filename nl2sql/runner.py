@@ -32,6 +32,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from typing import Any
 
 _FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|replace|attach|"
@@ -160,7 +161,13 @@ class QueryResult:
     """
 
     columns: list[str]
-    rows: list[tuple]
+    #: Rows as ``sqlite3`` returns them. The cell type is ``Any`` because
+    #: SQLite's storage classes are per *value*, not per column: one column can
+    #: hand back an int, a float, a str, bytes or None, and with no row factory
+    #: configured the driver maps each to whichever Python type fits. Narrowing
+    #: this to a union would be a claim the database does not make, and every
+    #: consumer here (``output``, the eval harness) stringifies cells anyway.
+    rows: list[tuple[Any, ...]]
     truncated: bool = False
 
     def __len__(self) -> int:

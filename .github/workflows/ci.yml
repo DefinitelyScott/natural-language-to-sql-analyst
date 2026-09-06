@@ -20,6 +20,28 @@ jobs:
       - name: Lint
         run: ruff check .
 
+  types:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The oldest interpreter the project supports, matching
+          # `python_version` in the mypy config: checking against the floor is
+          # what catches a syntax or typing feature that only exists on newer
+          # versions.
+          python-version: "3.10"
+      - name: Install mypy
+        # Pinned for the same reason ruff is — a new release adding checks
+        # would otherwise fail CI on a commit that changed nothing.
+        run: pip install mypy==2.3.1
+      - name: Type check
+        # Paths, strictness and the `openai` exemption all live in
+        # pyproject.toml, so this runs the same check a contributor gets from a
+        # bare `mypy`. `openai` is deliberately not installed here: the offline
+        # path must type-check without it.
+        run: mypy
+
   test:
     runs-on: ubuntu-latest
     strategy:

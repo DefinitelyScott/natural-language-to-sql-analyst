@@ -108,6 +108,25 @@ def test_scripted_backend_satisfies_the_protocol():
     assert not isinstance(FixedBackend(GOOD_SQL), llm.RepairingBackend)
 
 
+def test_repair_alone_does_not_satisfy_the_protocol():
+    """``RepairingBackend`` extends ``Backend``, so ``repair`` on its own is not enough.
+
+    Repairing is a capability added to generating, never a substitute for it:
+    every holder of a ``RepairingBackend`` calls ``to_sql`` on it as well —
+    ``cache.CachedBackend`` stores one and immediately generates through it.
+    Before the protocol inherited from ``Backend`` this object passed the
+    ``isinstance`` check and then raised ``AttributeError`` on the first
+    generation, several frames from the mistake. Now it is rejected where the
+    capability is claimed.
+    """
+
+    class RepairOnly:
+        def repair(self, question: str, schema: str, sql: str, error: str) -> str:
+            return sql
+
+    assert not isinstance(RepairOnly(), llm.RepairingBackend)
+
+
 # --------------------------------------------------------------------------- #
 # The loop
 # --------------------------------------------------------------------------- #

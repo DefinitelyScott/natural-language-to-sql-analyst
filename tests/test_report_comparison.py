@@ -127,6 +127,22 @@ def test_compare_flag_reads_a_report_written_by_json_flag(tmp_path):
     assert evaluate.compare_reports(loaded, report).regressed == []
 
 
+def test_a_baseline_that_is_not_a_json_object_is_rejected_by_name(tmp_path):
+    """Pointing ``--compare`` at the wrong JSON file fails where the mistake is.
+
+    ``evals/`` holds several JSON and JSONL files, so the plausible slip is
+    naming one of those instead of a ``--json`` report. ``json.load`` accepts a
+    list or a bare string quite happily, and without this check the run would
+    fail frames later inside ``_passed_by_question`` complaining about a missing
+    key — which reads as a malformed report rather than the wrong file.
+    """
+    path = tmp_path / "not-a-report.json"
+    path.write_text(json.dumps([{"question": "a"}]), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected a JSON object"):
+        evaluate.load_report(str(path))
+
+
 def test_missing_baseline_file_exits_with_a_clear_code(tmp_path, capsys, monkeypatch):
     """A baseline path that does not exist is a usage error, not a crash.
 

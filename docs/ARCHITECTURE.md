@@ -88,6 +88,14 @@ identical string, so a retry could only burn time. The distinction is a runtime
 backend be repaired" a property of the backend rather than a flag the caller has
 to remember to set.
 
+`RepairingBackend` extends `nl2sql.llm.Backend` rather than standing beside it,
+because repairing is a capability added to generating and never a substitute for
+it: everything that holds one calls `to_sql` on it too. Declaring only `repair`
+made `CachedBackend`'s own generation call untypeable, which is how the type
+checker found it. The runtime check tightened with the annotation — `isinstance`
+now requires both methods — so a class offering `repair` alone is refused where
+it claims the capability instead of failing later with an `AttributeError`.
+
 ### `nl2sql/cache.py`
 
 Reuse of SQL the LLM backend has already written, so a repeated question costs
@@ -278,9 +286,15 @@ Tests are grouped by the invariant they defend, not by module:
   a stale figure in a README reads as a metric measured once and never
   re-measured.
 
-CI runs ruff, then the suite on Python 3.10–3.12, then the evaluation harness —
-which exits non-zero unless every gold question passes, so a regression in
-generated SQL fails the build even when every unit test still passes.
+CI runs ruff and `mypy --strict` as separate jobs, then the suite on Python
+3.10–3.12, then the evaluation harness — which exits non-zero unless every gold
+question passes, so a regression in generated SQL fails the build even when
+every unit test still passes. The type job checks `nl2sql/`, `evals/` and
+`scripts/` on the oldest supported interpreter and without the optional `openai`
+extra installed, which is what pins the promise that the offline path carries no
+LLM dependency. `tests/` is outside that scope by design: a test double stubs
+most of the protocol it stands in for, and demanding full annotations there
+would add noise to code whose contract is the assertion it makes.
 
 ## Deliberate non-goals
 

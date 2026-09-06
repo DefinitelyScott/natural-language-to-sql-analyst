@@ -24,7 +24,7 @@ class Backend(Protocol):
 
 
 @runtime_checkable
-class RepairingBackend(Protocol):
+class RepairingBackend(Backend, Protocol):
     """A backend that can revise SQL it wrote, given the error it raised.
 
     Optional: a backend is repairable only if implementing ``repair`` can
@@ -34,8 +34,17 @@ class RepairingBackend(Protocol):
     keyed to a fixed rule, so re-asking the same question returns the same
     string and a retry could only burn time. ``generator.answer_question``
     checks for this protocol at runtime (``isinstance``, which for a
-    ``runtime_checkable`` Protocol tests only that the method exists) and
+    ``runtime_checkable`` Protocol tests only that the methods exist) and
     skips the repair step entirely when a backend does not implement it.
+
+    It extends :class:`Backend` rather than standing alone because repairing is
+    a capability *added to* generating, never a substitute for it: every holder
+    of one of these calls ``to_sql`` on it too — ``cache.CachingBackend`` stores
+    a ``RepairingBackend`` and immediately generates through it. Declaring only
+    ``repair`` made that a type error the checker was right to flag, and the fix
+    is to state the real contract rather than to widen the annotation. The
+    runtime check tightens with it: ``isinstance`` now requires both methods, so
+    a class with ``repair`` but no ``to_sql`` no longer passes as repairable.
     """
 
     def repair(self, question: str, schema: str, sql: str, error: str) -> str: ...

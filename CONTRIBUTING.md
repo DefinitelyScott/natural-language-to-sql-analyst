@@ -173,6 +173,34 @@ than noise. Tests are exempted from `ARG` and `SLF001`: a stub implements a
 protocol's full signature without consulting it, and reaching into internals is
 what a unit test is for.
 
+## Types
+
+The shipped code — `nl2sql/`, `evals/`, `scripts/` — type-checks clean under
+**mypy 2.3.1** in `--strict` mode, which CI enforces as its own job. Run it
+with a bare `mypy`; paths and strictness come from `pyproject.toml`, so there
+are no flags to remember.
+
+Strict was affordable because the code was already annotated, and it earned its
+place immediately: it found that `llm.RepairingBackend` declared only `repair`
+while every holder of one also calls `to_sql` on it (`cache.CachedBackend` does
+exactly that), and that `scripts/build_sample_db.py` bound the name `items` to
+two unrelated row shapes in one scope. Both are now fixed rather than silenced.
+
+Two boundaries worth knowing before you fight the checker:
+
+- **`tests/` is not checked.** A test double implements one method of a
+  protocol and stubs the rest; `--strict` would demand full annotations on
+  every fixture for no gain, since a test's contract is the assertion it makes.
+  The package is still checked transitively, because the suite imports it.
+- **`openai` is exempt from the missing-stub error** and CI does not install
+  it. That is the point: the offline path must type-check without the optional
+  LLM dependency present. The exemption is scoped to that one module, so a
+  genuinely missing import anywhere else still fails.
+
+Prefer fixing the annotation over adding `# type: ignore`. If an ignore really
+is right, give it a code (`# type: ignore[arg-type]`) and a comment saying why,
+the same as the `noqa` codes in this repo.
+
 Two conventions the linter cannot check:
 
 - **Docstrings explain why, not what.** The signature already says what a

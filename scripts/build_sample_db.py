@@ -77,7 +77,7 @@ def build(db_path: str = DB_PATH) -> None:
 
     # customers: 120, signing up across 2023-2024
     start = date(2023, 1, 1)
-    customers = []
+    customers: list[tuple[int, str, str, str]] = []
     for cid in range(1, 121):
         name = f"{rng.choice(FIRST)} {rng.choice(LAST)}"
         region = rng.choice(REGIONS)
@@ -98,10 +98,18 @@ def build(db_path: str = DB_PATH) -> None:
     signups = sorted((date.fromisoformat(row[3]), row[0]) for row in customers)
     signup_days = [day for day, _ in signups]
 
-    # orders + items across 2024
+    # orders + order_items across 2024. Each list is annotated with the row
+    # shape of the table it is bulk-inserted into, so the tuple built in the
+    # loop below can be checked against the INSERT it is destined for rather
+    # than only failing at executemany() with a parameter-count error at
+    # runtime. Naming this one `order_items` after its table also frees the
+    # name `items` from doing double duty: the products loop above binds it to
+    # a category's (name, price) pairs, and reusing it here for order lines
+    # made two unrelated row shapes share one identifier in one scope.
     order_id = 1
     item_id = 1
-    orders, items = [], []
+    orders: list[tuple[int, int, str]] = []
+    order_items: list[tuple[int, int, int, int, float]] = []
     for _ in range(900):
         order_day = date(2024, 1, 1) + timedelta(days=rng.randint(0, 364))
         # bisect_right gives the number of customers signed up on or before
@@ -112,17 +120,17 @@ def build(db_path: str = DB_PATH) -> None:
         for _ in range(rng.randint(1, 4)):
             prod = rng.choice(products)
             qty = rng.randint(1, 3)
-            items.append((item_id, order_id, prod[0], qty, prod[3]))
+            order_items.append((item_id, order_id, prod[0], qty, prod[3]))
             item_id += 1
         order_id += 1
     conn.executemany("INSERT INTO orders VALUES (?,?,?)", orders)
-    conn.executemany("INSERT INTO order_items VALUES (?,?,?,?,?)", items)
+    conn.executemany("INSERT INTO order_items VALUES (?,?,?,?,?)", order_items)
 
     conn.commit()
     conn.close()
     print(
         f"Built {db_path}: {len(customers)} customers, {len(products)} products, "
-        f"{len(orders)} orders, {len(items)} order items."
+        f"{len(orders)} orders, {len(order_items)} order items."
     )
 
 
