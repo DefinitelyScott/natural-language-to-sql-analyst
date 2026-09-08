@@ -17,6 +17,10 @@ the README's numbers falsifiable. Three claims are checked:
   than misleading a reader.
 * **The one number it quotes is current.** The repair budget is stated in prose
   and is also a constant in the code; the two must agree.
+* **Its non-goals do not deny a module that exists.** A non-goal is a claim of
+  *absence*, which is the one kind of claim the two coverage tests structurally
+  cannot check: it names no module and no symbol, so there is nothing for them
+  to fail to resolve.
 
 The regexes are anchored to the document's own conventions (``### `nl2sql/x.py```
 headings, backticked dotted paths). Each test asserts that its pattern matched
@@ -46,6 +50,32 @@ _SECTION_RE = re.compile(r"^### `nl2sql/(\w+)\.py`", re.MULTILINE)
 _SYMBOL_RE = re.compile(r"`nl2sql\.(\w+)\.(\w+)")
 # "a budget of **1 attempt**" — the repair budget, stated in prose.
 _REPAIR_BUDGET_RE = re.compile(r"budget of \*\*(\d+) attempt")
+# The "## Deliberate non-goals" section, up to the next heading or end of file.
+_NON_GOALS_RE = re.compile(r"^## Deliberate non-goals$(.*?)(?=^## |\Z)", re.MULTILINE | re.DOTALL)
+
+# Blanket denials that a module in ``nl2sql/`` would falsify, mapped to the
+# module that falsifies them.
+#
+# This exists because the document really did carry "No caching or persistence
+# layer" for several commits after ``nl2sql/cache.py`` landed. Neither coverage
+# test could see it: ``cache`` had a section and every symbol resolved, so the
+# only false sentence in the file was the one asserting the module was not
+# there.
+#
+# Deliberately a short hand-written map of *unqualified* phrases rather than an
+# attempt to read English. Scoping the claim is the intended fix, not a
+# loophole: "No result cache" is true and stays true, while "No caching" is a
+# statement about the whole repo that a single new module makes false. Add an
+# entry when a module lands whose existence someone might later blanket-deny.
+#
+# Only phrases that have actually appeared are listed. A speculative entry
+# ("no persistence") looks like extra safety but is untested by construction —
+# nothing in the repo's history exercises it, so it may or may not match the
+# wording a future author reaches for, and it makes the map look better covered
+# than it is.
+_BLANKET_DENIALS = {
+    "no caching": "cache",
+}
 
 # `__init__.py` carries only the version string and has no architecture to
 # describe; requiring a section for it would be documentation as bookkeeping.
@@ -111,6 +141,64 @@ def test_every_symbol_named_in_the_doc_exists(doc: str) -> None:
     assert not unresolved, (
         f"ARCHITECTURE.md names symbols that do not exist: {unresolved}"
     )
+
+
+@pytest.fixture(scope="module")
+def non_goals(doc: str) -> str:
+    """Return the body of the 'Deliberate non-goals' section, lowercased.
+
+    Scoped to that one section on purpose. The rest of the document explains how
+    the modules work and uses the same vocabulary while doing it — the
+    ``cache.py`` section has a bullet beginning "Which backends can be cached" —
+    so a search over the whole file would flag prose that is describing a
+    module rather than denying it.
+    """
+    match = _NON_GOALS_RE.search(doc)
+    assert match, "ARCHITECTURE.md no longer has a '## Deliberate non-goals' section"
+    return match.group(1).lower()
+
+
+def contradicted_denials(non_goals: str) -> list[str]:
+    """Return the blanket denials in ``non_goals`` that a real module falsifies.
+
+    Takes the section text rather than reading the file so the detection can be
+    exercised on a string, which is what lets the guard below be proven capable
+    of failing.
+    """
+    return [
+        f"{phrase!r} (contradicted by nl2sql/{module}.py)"
+        for phrase, module in sorted(_BLANKET_DENIALS.items())
+        if phrase in non_goals and (PACKAGE_DIR / f"{module}.py").exists()
+    ]
+
+
+def test_non_goals_do_not_deny_a_module_that_exists(non_goals: str) -> None:
+    """A non-goal may not blanket-deny something ``nl2sql/`` implements.
+
+    The fix when this fails is to narrow the claim to what is still true, not to
+    delete it: the module almost certainly left some genuine limit in place, and
+    naming that limit is more useful than either the false absolute or silence.
+    """
+    contradicted = contradicted_denials(non_goals)
+    assert not contradicted, (
+        "ARCHITECTURE.md's non-goals deny capabilities the package now has: "
+        f"{contradicted}"
+    )
+
+
+def test_the_denial_guard_catches_the_sentence_it_was_written_for() -> None:
+    """Pin the guard against the historical claim, and against current prose.
+
+    A guard whose phrase list has gone stale — or was mistyped — passes on every
+    input and reads exactly like a guard that is working. The first assertion
+    fixes that by replaying the sentence the document actually carried; the
+    second checks the narrowed replacement is accepted, so the guard is shown to
+    discriminate rather than merely to fire.
+    """
+    assert contradicted_denials("no caching or persistence layer.") == [
+        "'no caching' (contradicted by nl2sql/cache.py)",
+    ]
+    assert contradicted_denials("no result cache. nl2sql/cache.py caches sql") == []
 
 
 def test_repair_budget_claim_matches_the_constant(doc: str) -> None:

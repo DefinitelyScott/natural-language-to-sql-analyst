@@ -199,6 +199,28 @@ data's newest order; the new-vs-returning revenue split; the distribution of
 orders per customer (a nested aggregation — a purchase-frequency histogram); and
 market-basket affinity (the product pairs most often bought together, via a
 self-join of `order_items`).
+Also here: the customers who have **never** placed an order — the catalog's only
+*anti-join*. Every other rule asks which rows satisfy a condition; this one asks
+which rows have no match at all, and it is the acquisition-side complement of the
+at-risk rule above. That rule joins customers to orders inline, deliberately —
+"at-risk" implies a relationship that has since gone quiet — so a customer with
+no orders whatsoever cannot appear in it, and before this pattern the catalog
+could only count never-buyers in aggregate (the activation rate below) and never
+name one. `NOT EXISTS` expresses the question directly and lets SQLite stop at a
+customer's first order; the gold query uses the `LEFT JOIN ... WHERE IS NULL`
+form instead, so the eval compares two independent formulations rather than
+running one query twice.
+The load-bearing column is `days_since_signup`. Five names under the heading
+"never ordered" read as five lost customers, but a signup from last week has not
+failed to convert — it has not had the chance. The span is measured to the newest
+order in the data rather than `today()`, the same anchor the at-risk rule uses, so
+the output is reproducible rather than drifting by a day every day. It also
+carries the honest reading of this particular result: on the sample data all five
+never-buyers signed up within 90 days of the last order, so not one of them has
+been dormant long enough to even meet the at-risk rule's own threshold. The
+matcher requires the explicit word "never", which leaves the ambiguous phrasings
+("customers with no orders" — none *ever*, or none *lately*?) with the at-risk
+rule that owns the period-scoped reading.
 Also here: the repeat purchase rate per product — of the customers who ever
 bought a product, the share who came back and bought it again. This is the
 product-level counterpart of the repeat-customer count, and it measures
@@ -321,10 +343,10 @@ python -m nl2sql.cli rules --format json
 4 offline rule(s), in matching order:
 
 rule  example                                           pattern
-6     Who is the top-spending customer in each region?  (top|best|highest)[-\s]*(spending|spender)?\s*custo...
-12    Show revenue by region and category.              (revenue|sales).*(region.*categor|categor.*region)|...
-19    What is the average order value by region?        (average|avg).*order value.*region
-33    Show revenue by region                            (revenue|sales).*by region
+8     Who is the top-spending customer in each region?  (top|best|highest)[-\s]*(spending|spender)?\s*custo...
+14    Show revenue by region and category.              (revenue|sales).*(region.*categor|categor.*region)|...
+21    What is the average order value by region?        (average|avg).*order value.*region
+37    Show revenue by region                            (revenue|sales).*by region
 ```
 
 (Patterns abbreviated here for width; the command prints them in full.)
@@ -411,22 +433,28 @@ complete is worse than one that admits it is partial.
 SQL was produced, without executing anything.
 
 ```bash
-python -m nl2sql.cli explain "How many orders were placed in the last 30 days?"
+python -m nl2sql.cli explain "How many customers have never ordered?"
 ```
 
 ```
-Question: How many orders were placed in the last 30 days?
+Question: How many customers have never ordered?
 Backend:  offline
 
-Matched offline rule #28: orders.*last (30|thirty) days
+Matched offline rule #25: customers?\b[^?]*\bnever\b[^?]*\b(?:order(?:ed)?|bought|buy|purchased?)\b|...
 Also matched (shadowed, in catalog order):
-  #38: how many orders|number of orders|total orders|order count
+  #26: \A(?!...).*how many (?:customers|users)
 
 SQL (not executed):
-  SELECT COUNT(*) AS recent_orders FROM orders WHERE order_date >= date((SELECT MAX(order_date) FROM orders), '-30 day')
+  SELECT c.id AS customer_id, c.name AS name, c.signup_date AS signup_date, ... WHERE NOT EXISTS (...)
 
 Safety: passes the read-only validator.
 ```
+
+(Patterns and SQL abbreviated here for width; the command prints them in full.)
+That shadowed line is the whole point of the command: the never-ordered rule and
+the broad customer counter both match this question, and only their registration
+order decides whether the answer is the five customers who never bought or the
+120 rows in the `customers` table.
 
 Two things it is good for:
 
@@ -618,7 +646,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 51 questions  |  execution accuracy: 51/51 (100%)  [offline backend]
+Evaluated 52 questions  |  execution accuracy: 52/52 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -660,8 +688,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 51,
-  "passed": 51,
+  "total": 52,
+  "passed": 52,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -749,12 +777,12 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **46 gating pairs and
-9 known gaps**:
+can never improve the headline. The set currently holds **47 gating pairs and
+10 known gaps**:
 
 ```
-Paraphrase robustness: 46/46 rephrasings route to the canonical rule
-  Known gaps (not gating): 9
+Paraphrase robustness: 47/47 rephrasings route to the canonical rule
+  Known gaps (not gating): 10
 ```
 
 Every rule the gold set reaches carries at least one rephrasing, and
@@ -787,15 +815,15 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 43/51 gold queries are written independently of the rule they test
+Gold independence: 44/52 gold queries are written independently of the rule they test
   Self-comparing (not gating): 8 — these prove the SQL runs, not that it answers the question
-    [COPY] rule #25: How many customers do we have?
-    [COPY] rule #43: Show revenue by day of week.
+    [COPY] rule #26: How many customers do we have?
+    [COPY] rule #44: Show revenue by day of week.
     ...
 ```
 
 So eight rows of the 100% above are still self-referential, and the honest
-reading of the headline is "51/51, of which 43 are real comparisons". Publishing
+reading of the headline is "52/52, of which 44 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
@@ -847,7 +875,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 36 of the 51 gold questions
+  `"ordered": true` and are compared as returned. 37 of the 52 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

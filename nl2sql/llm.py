@@ -1292,6 +1292,67 @@ class OfflineBackend:
                 )
                 """,
             ),
+            # Customers who have never placed an order -- the acquisition-side
+            # complement of the at-risk (lapsed) rule further down. That rule
+            # joins customers to orders inline, so a customer with no orders at
+            # all cannot appear in it; it was scoped that way deliberately
+            # ("at-risk" implies a relationship that has gone quiet), which
+            # leaves never-buyers as a population the catalog could previously
+            # only count in aggregate -- the activation-rate rule reports them
+            # per signup cohort -- and never name.
+            #
+            # This is the catalog's only *anti-join*. Every other rule asks
+            # which rows satisfy a condition; this one asks which rows have no
+            # match at all. NOT EXISTS states that directly and lets SQLite stop
+            # at a customer's first order rather than counting them; the
+            # equivalent LEFT JOIN ... WHERE IS NULL form builds the joined rows
+            # only to discard them. The gold query in evals/gold.jsonl is
+            # written the other way round on purpose, so the two are independent
+            # formulations of the same question rather than one query run twice.
+            #
+            # ``days_since_signup`` is what keeps the list honest. Five names
+            # under the heading "never ordered" read as five lost customers, but
+            # a signup from last week has not failed to convert -- it has not
+            # had the chance yet. The elapsed span is measured against the newest
+            # order in the data rather than today(), the same anchor the at-risk
+            # rule uses, so the output is reproducible for anyone who clones the
+            # repo instead of drifting by a day every day. On the sample data
+            # every never-buyer signed up within 90 days of the last order, so
+            # not one of them has been dormant long enough to even meet the
+            # at-risk rule's own threshold -- a reading that is available from
+            # the printed rows and invisible without them.
+            #
+            # Registered ahead of the broad "how many customers" counter
+            # directly below for the usual first-rule-wins reason: "how many
+            # customers have never ordered?" would otherwise be answered with
+            # the total customer count, a correct-looking number for a different
+            # question. The matcher requires the explicit word "never", so the
+            # ambiguous phrasings ("customers with no orders") stay with the
+            # at-risk rule, which owns the period-scoped reading of them.
+            (
+                re.compile(
+                    r"customers?\b[^?]*\bnever\b[^?]*"
+                    r"\b(?:order(?:ed)?|bought|buy|purchased?)\b|"
+                    r"\bnever\b[^?]*\b(?:order(?:ed)?|bought|purchased?)\b"
+                    r"[^?]*\bcustomers?\b|"
+                    r"\bwho\b[^?]*\b(?:has|have)\s+never\s+"
+                    r"(?:order(?:ed)?|bought|purchased?)\b|"
+                    r"\bnever[-\s](?:ordered|bought|purchased)\s+(?:customers?|signups?)\b",
+                    re.I,
+                ),
+                """
+                SELECT c.id AS customer_id,
+                       c.name AS name,
+                       c.signup_date AS signup_date,
+                       CAST(julianday((SELECT MAX(order_date) FROM orders))
+                            - julianday(c.signup_date) AS INTEGER) AS days_since_signup
+                FROM customers c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM orders o WHERE o.customer_id = c.id
+                )
+                ORDER BY c.signup_date, c.id
+                """,
+            ),
             (
                 # Guarded by _UNSCOPED_ONLY: this counts every row in
                 # `customers`, so "how many customers churned last month?" is

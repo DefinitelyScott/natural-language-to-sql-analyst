@@ -1125,6 +1125,104 @@ def test_end_to_end_at_risk_customers():
 @pytest.mark.parametrize(
     "question",
     [
+        "Which customers have never placed an order?",
+        "Which customers signed up but never ordered?",
+        "List the customers who have never bought anything.",
+        "Which customers never made a purchase?",
+        "Who has never ordered?",
+        "How many customers have never ordered?",
+    ],
+)
+def test_offline_matches_never_ordered_phrasings(question):
+    # Every phrasing that names the never-buying population reaches the anti-join
+    # rule, including the "how many" one -- see the shadowing test below for why
+    # that phrasing in particular is worth pinning.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "WHERE NOT EXISTS" in sql
+    assert "days_since_signup" in sql
+
+
+def test_never_ordered_does_not_collide_with_customer_count_or_at_risk():
+    # The two neighbours this rule is most likely to be confused with, in both
+    # directions.
+    #
+    # Ahead of the customer-count rule: "how many customers have never ordered?"
+    # matches the broad `.*how many (?:customers|users)` counter as well, and
+    # first-rule-wins is the only thing keeping it from being answered with the
+    # total customer count -- 120 rather than 5, a plausible number for a
+    # question nobody asked.
+    #
+    # Behind the at-risk rule: "never ordered" and "hasn't ordered in the last
+    # 90 days" are different populations (no relationship at all vs. one that
+    # has gone quiet), and the at-risk rule's inner join means it structurally
+    # cannot return a never-buyer. The period-scoped phrasings must therefore
+    # keep reaching it rather than being captured here.
+    backend = OfflineBackend()
+
+    never = backend.to_sql("How many customers have never ordered?", schema="")
+    assert "WHERE NOT EXISTS" in never
+    assert "customer_count" not in never
+
+    count = backend.to_sql("How many customers do we have?", schema="")
+    assert count == "SELECT COUNT(*) AS customer_count FROM customers"
+
+    for question in (
+        "Which customers haven't ordered in the last 90 days?",
+        "Show customers with no orders in the last 90 days.",
+        "List at-risk customers.",
+    ):
+        at_risk = backend.to_sql(question, schema="")
+        assert "last_order_date" in at_risk
+        assert "NOT EXISTS" not in at_risk
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_never_ordered_customers():
+    # The returned set must be exactly the complement of the buying customers,
+    # ordered by signup date then id, with days_since_signup measured against the
+    # newest order in the data -- all cross-checked against direct recomputation
+    # rather than against the rule's own SQL.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "Which customers have never placed an order?")
+    assert ans.result.columns == [
+        "customer_id",
+        "name",
+        "signup_date",
+        "days_since_signup",
+    ]
+
+    keys = [(row[2], row[0]) for row in ans.result.rows]  # (signup_date, id)
+    assert keys == sorted(keys)
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        all_customers = conn.execute("SELECT id, signup_date FROM customers").fetchall()
+        buyers = {
+            row[0] for row in conn.execute("SELECT DISTINCT customer_id FROM orders")
+        }
+        last_order = conn.execute("SELECT MAX(order_date) FROM orders").fetchone()[0]
+    finally:
+        conn.close()
+
+    signup_by_id = dict(all_customers)
+    expected = {cid for cid, _ in all_customers} - buyers
+    assert {row[0] for row in ans.result.rows} == expected
+    assert 0 < len(ans.result.rows) < len(all_customers)  # proper, non-empty subset
+
+    # days_since_signup is whole days from signup to the dataset's newest order,
+    # recomputed here in Python so the assertion does not lean on julianday().
+    from datetime import date
+
+    anchor = date.fromisoformat(last_order)
+    for customer_id, _name, signup_date, days in ans.result.rows:
+        assert signup_date == signup_by_id[customer_id]
+        assert days == (anchor - date.fromisoformat(signup_date)).days
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
         "What is the average order value by month in 2024?",
         "Show average order value per month.",
         "How has monthly average order value trended?",

@@ -920,8 +920,8 @@ def main(argv: list[str] | None = None) -> int:
         not item.passed for item in paraphrases
     )
     #
-    # Independence deliberately does *not* gate here. Fourteen of the gold
-    # queries are copies today, so a gating check would fail every run from the
+    # Independence deliberately does *not* gate here. Some of the gold queries
+    # are still copies today, so a gating check would fail every run from the
     # moment it was added, and a check that is always red is a check people learn
     # to scroll past. The ratchet lives in ``tests/test_gold_independence.py``
     # instead: the current copies are recorded there by name, so a *new* one

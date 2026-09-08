@@ -303,10 +303,14 @@ would add noise to code whose contract is the assertion it makes.
   API key. Growing it into a general NL grammar would trade the property that
   makes it useful — you can read any rule and know exactly what it does — for
   coverage the LLM backend already provides.
-* **No caching or persistence layer.** Every question re-introspects the schema
-  and re-runs the query. At this database size that is imperceptible, and the
-  absence of stale state keeps the whole pipeline reproducible from a clean
-  clone.
+* **No result cache.** `nl2sql/cache.py` caches generated SQL, and only for the
+  LLM backend: every question still re-introspects the schema and re-executes
+  the query against the live database, so a hit saves a model call and never a
+  read. The offline backend reports no `cache_identity`, so the default path —
+  which is what CI and the eval harness run — never opens a cache file at all.
+  Keeping execution out of the cache is what preserves the property this
+  non-goal is really about: an answer always reflects the database as it is now,
+  and the pipeline stays reproducible from a clean clone.
 * **No write path, ever.** Not "writes are discouraged" — the authorizer denies
   them at compile time, so there is no code path through this project that can
   modify the database.

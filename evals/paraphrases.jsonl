@@ -53,3 +53,5 @@
 {"canonical": "What share of revenue comes from the top 20% of customers?", "paraphrase": "How concentrated is revenue among our biggest customers?", "known_gap": "the rule matches the noun 'concentration' but not the adjective 'concentrated'"}
 {"canonical": "What is the best-selling product in each category?", "paraphrase": "Within each category, which product sold the most units?", "known_gap": "the rule needs a top/best word adjacent to 'product'; 'sold the most units' carries the same meaning with none of that vocabulary"}
 {"canonical": "Which category do customers buy from first?", "paraphrase": "Which category acquires the most customers?"}
+{"canonical": "Which customers have never placed an order?", "paraphrase": "Which customers signed up but never ordered?"}
+{"canonical": "Which customers have never placed an order?", "paraphrase": "Show customers with no orders.", "known_gap": "the rule requires the explicit word 'never'; a bare 'no orders' also reads as 'none in the window', which the at-risk rule owns"}
