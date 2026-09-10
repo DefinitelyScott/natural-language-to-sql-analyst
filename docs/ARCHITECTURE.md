@@ -176,6 +176,20 @@ rather than a generic `not authorized`. Opening the connection with `mode=ro`
 protects the target file; only the authorizer covers the whole engine surface
 (`ATTACH`, for instance, reaches *other files on disk*).
 
+A string-level check has one failure mode the authorizer does not: it can refuse
+a query that was never dangerous. `nl2sql.runner._scan` makes one left-to-right
+pass over the SQL and returns it twice — once as written (comments removed) for
+execution, once with the body of every string literal blanked for the checks to
+read. Without that split the checks conflate data with syntax three ways:
+`WHERE name = 'Create'` trips the keyword denylist, `'a; b'` reads as two
+statements, and stripping comments before finding literals truncated
+`SELECT 'x -- y'` to `SELECT 'x` — a syntax error in SQL the caller never wrote.
+Only single-quoted literals are recognized, which is a real limit and a
+deliberate one: nothing here generates `"quoted identifiers"`, so the second
+quoting rule would be a branch with no query behind it. Blanking literals cannot
+weaken the boundary, because the executed text is unchanged and a `DELETE` inside
+a string was never a `DELETE`.
+
 The first two layers answer *may this run*; the third answers *for how long*.
 They are different questions, and the first two cannot reach the second: a
 cross join is read-only, single-statement, and touches nothing outside the

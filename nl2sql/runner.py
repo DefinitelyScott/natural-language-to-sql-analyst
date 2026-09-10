@@ -4,7 +4,10 @@ Generated SQL is untrusted, so it passes through three independent layers:
 
 1. :func:`validate` — a string-level check (single statement, SELECT-only, a
    denylist of write/DDL keywords). It runs first because it produces clear,
-   specific error messages a user can act on.
+   specific error messages a user can act on. Its checks read a copy of the SQL
+   with comments removed and string literals blanked (:func:`_scan`), so text
+   *inside* a literal is never mistaken for syntax — a filter on the value
+   ``'Create'`` is a filter, not a ``CREATE``.
 2. An engine-level *authorizer* — SQLite consults a callback for every
    operation while compiling a statement, and anything outside a small
    read-only allowlist is denied. A denylist can only reject what it thought
@@ -174,23 +177,129 @@ class QueryResult:
         return len(self.rows)
 
 
-def _strip_comments(sql: str) -> str:
-    sql = re.sub(r"--[^\n]*", "", sql)
-    sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
-    return sql.strip()
+#: Stands in for the body of a string literal in the shadow copy of the SQL.
+#:
+#: An empty literal rather than a bare marker, so the shadow stays recognizable
+#: as SQL of the same shape (``WHERE name = ''``) and the head check still sees
+#: the statement it would have seen. It contains no ``;`` and no denylisted
+#: word, which is the whole point: whatever the literal held cannot reach the
+#: checks that read the shadow.
+_LITERAL_PLACEHOLDER = "''"
+
+
+@dataclass(frozen=True)
+class _ScannedSQL:
+    """One query in two forms, produced by a single pass of :func:`_scan`.
+
+    ``sql`` is what will be executed: comments removed, string literals exactly
+    as written. ``shadow`` is the same text with every literal body replaced by
+    :data:`_LITERAL_PLACEHOLDER`, and is what the string-level checks read.
+
+    The split exists because those checks look for syntax, and a literal is
+    data. ``WHERE name = 'Create'`` is an ordinary filter; a denylist reading
+    the raw text sees a ``CREATE`` and refuses a perfectly safe query. Blanking
+    literals cannot weaken the guarantee, either — the executed SQL is
+    unchanged, and a write hidden in a literal is not a write at all.
+    """
+
+    sql: str
+    shadow: str
+
+
+def _closing_quote(sql: str, start: int) -> int:
+    """Return the index of the quote that closes the literal opening at ``start``.
+
+    A doubled quote is SQLite's escape for a quote *inside* a literal, so
+    ``'it''s'`` is a single literal holding ``it's`` and not two adjacent ones —
+    which is why this cannot be a plain :meth:`str.find`.
+
+    Raises:
+        UnsafeQueryError: if the literal is never closed. SQLite would reject
+            the statement anyway, but only after the unterminated tail had
+            hidden anything behind it — including a ``;`` — from the
+            single-statement check, so this fails early and says why.
+    """
+    index = start + 1
+    while index < len(sql):
+        if sql[index] != "'":
+            index += 1
+        elif sql[index + 1 : index + 2] == "'":
+            index += 2  # an escaped quote: still inside the literal
+        else:
+            return index
+    raise UnsafeQueryError("unterminated string literal")
+
+
+def _scan(sql: str) -> _ScannedSQL:
+    """Strip comments and blank literal bodies in one left-to-right pass.
+
+    One pass rather than two regexes, because neither job can be decided without
+    the other: a ``--`` inside a string literal is data, and a quote inside a
+    comment does not open a literal. Stripping comments first is what truncated
+    ``SELECT 'x -- y' AS label`` to ``SELECT 'x``, which then failed at execution
+    with a syntax error about SQL the caller never wrote.
+
+    Both comment forms leave something behind so removal cannot fuse the tokens
+    around them: a line comment keeps its newline, and a block comment collapses
+    to a single space (``SELECT/*c*/1`` must not become ``SELECT1``). An
+    unterminated block comment runs to the end of the input, which is what SQLite
+    itself does with one.
+    """
+    kept: list[str] = []
+    shadow: list[str] = []
+    index = 0
+    length = len(sql)
+    while index < length:
+        pair = sql[index : index + 2]
+        if sql[index] == "'":
+            close = _closing_quote(sql, index)
+            kept.append(sql[index : close + 1])
+            shadow.append(_LITERAL_PLACEHOLDER)
+            index = close + 1
+        elif pair == "--":
+            newline = sql.find("\n", index)
+            # Stop *at* the newline rather than past it, so the else branch
+            # copies it and the comment cannot join two lines into one token.
+            index = length if newline == -1 else newline
+        elif pair == "/*":
+            close = sql.find("*/", index + 2)
+            index = length if close == -1 else close + 2
+            kept.append(" ")
+            shadow.append(" ")
+        else:
+            kept.append(sql[index])
+            shadow.append(sql[index])
+            index += 1
+    return _ScannedSQL(sql="".join(kept).strip(), shadow="".join(shadow).strip())
 
 
 def validate(sql: str) -> str:
-    """Validate SQL is a single read-only SELECT. Return the cleaned SQL."""
-    cleaned = _strip_comments(sql).rstrip(";").strip()
+    """Validate SQL is a single read-only SELECT. Return the cleaned SQL.
+
+    The returned SQL is what :func:`run` executes: comments removed and any
+    trailing semicolon dropped, but otherwise the caller's text verbatim. Every
+    check below reads the *shadow* instead — the same text with string literals
+    blanked — so a value that happens to contain a semicolon or a denylisted
+    word is treated as the data it is. The two forms are stripped of trailing
+    semicolons in step, which is sound because a semicolon inside a literal is
+    not at the end of the shadow to begin with.
+
+    Raises:
+        UnsafeQueryError: if the query is empty, holds more than one statement,
+            does not begin with ``SELECT``/``WITH``, or names a write/DDL
+            keyword outside a string literal.
+    """
+    scanned = _scan(sql)
+    cleaned = scanned.sql.rstrip(";").strip()
+    shadow = scanned.shadow.rstrip(";").strip()
     if not cleaned:
         raise UnsafeQueryError("empty query")
-    if ";" in cleaned:
+    if ";" in shadow:
         raise UnsafeQueryError("multiple statements are not allowed")
-    head = cleaned.lstrip("(").lower()
+    head = shadow.lstrip("(").lower()
     if not (head.startswith("select") or head.startswith("with")):
         raise UnsafeQueryError("only SELECT/WITH queries are allowed")
-    if _FORBIDDEN.search(cleaned):
+    if _FORBIDDEN.search(shadow):
         raise UnsafeQueryError("query contains a forbidden keyword")
     return cleaned
 

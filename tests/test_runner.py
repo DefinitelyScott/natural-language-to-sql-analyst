@@ -42,6 +42,124 @@ def test_validate_allows_select(sql):
     assert runner.validate(sql)
 
 
+# --------------------------------------------------------------------------- #
+# String literals are data, not syntax
+# --------------------------------------------------------------------------- #
+# The string-level checks look for syntax; a value in quotes is not syntax. Read
+# off the raw text they conflated the two, and all three failures below were real
+# before `_scan` gave the checks a copy of the SQL with literal bodies blanked.
+@pytest.mark.parametrize(
+    ("sql", "defect"),
+    [
+        (
+            "SELECT name FROM products WHERE name = 'Create'",
+            "a denylisted word appearing as a filter *value*",
+        ),
+        (
+            "SELECT name FROM products WHERE name = 'a; b'",
+            "a semicolon inside a literal, read as a second statement",
+        ),
+        (
+            "SELECT 'it''s fine; really' AS label",
+            "the same, behind SQLite's doubled-quote escape",
+        ),
+        (
+            "SELECT category FROM products WHERE category = 'Update pending'",
+            "a denylisted word as the first word of a value",
+        ),
+    ],
+)
+def test_validate_allows_a_literal_that_looks_like_syntax(sql, defect):
+    assert runner.validate(sql), defect
+
+
+def test_validate_preserves_a_comment_marker_inside_a_literal():
+    """A `--` inside a literal is part of the value, not the start of a comment.
+
+    This is the sharpest of the three defects, because it failed *silently*
+    rather than loudly: stripping comments before locating literals truncated
+    this query to `SELECT 'x`, which then reached SQLite as unbalanced SQL and
+    raised a syntax error about text the caller never wrote.
+    """
+    sql = "SELECT 'x -- y' AS label"
+    assert runner.validate(sql) == sql
+
+
+def test_validate_still_rejects_a_real_statement_after_a_literal():
+    """Blanking literals must not blind the single-statement check.
+
+    The literal is what previously made this shape interesting: if the scan
+    swallowed the rest of the line along with the literal, the `DELETE` behind
+    it would pass unnoticed. The `;` here is genuine syntax, so it must still be
+    caught.
+    """
+    with pytest.raises(UnsafeQueryError, match="multiple statements"):
+        runner.validate("SELECT 'a' AS x; DELETE FROM customers")
+
+
+def test_validate_rejects_an_unterminated_literal():
+    """An unclosed quote is refused here rather than left to SQLite.
+
+    SQLite would reject it too, but only after everything past the open quote
+    had been treated as literal text — hiding any `;` behind it from the
+    single-statement check above. Failing early keeps that check total, and the
+    message names the actual defect instead of a syntax error further in.
+    """
+    with pytest.raises(UnsafeQueryError, match="unterminated string literal"):
+        runner.validate("SELECT 'abc ; DELETE FROM customers")
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT/*c*/1 AS n",
+        "SELECT 1 AS n --trailing\n",
+        "SELECT 1 AS n /* unterminated",
+    ],
+)
+def test_removing_a_comment_does_not_fuse_the_tokens_around_it(sql):
+    """Comment removal must leave a separator behind.
+
+    `SELECT/*c*/1` collapsing to `SELECT1` is a syntax error produced by the
+    validator itself, which is the worst kind: the caller's SQL was fine. A
+    block comment therefore collapses to a space, and a line comment keeps its
+    newline.
+    """
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    assert runner.run(DB, sql).rows == [(1,)]
+
+
+def test_a_double_quoted_identifier_is_not_scanned():
+    """Pinned limitation: only single-quoted literals are recognized.
+
+    SQLite also accepts `"..."` (an identifier, or a string when no such column
+    exists), and a `;` inside one is still read as a second statement here. That
+    is deliberate rather than overlooked: nothing in this project generates
+    quoted identifiers — the offline catalog writes none and the LLM prompt asks
+    for the schema's exact names — so a second quoting rule would add a branch
+    with no query behind it. Asserting the current behavior means a future fix
+    updates a test instead of surprising someone.
+    """
+    with pytest.raises(UnsafeQueryError, match="multiple statements"):
+        runner.validate('SELECT 1 AS "a;b"')
+
+
+def test_run_executes_a_query_whose_literal_holds_a_denylisted_word():
+    """End to end: the query runs, and returns the honest zero rows.
+
+    `validate` returning the SQL is only half the claim — the point is that the
+    query reaches the database intact and answers. No product is named
+    'Create', so an empty result is the correct answer, and it is distinct from
+    the `UnsafeQueryError` this used to raise.
+    """
+    if not os.path.exists(DB):
+        pytest.skip("sample DB not built")
+    res = runner.run(DB, "SELECT name FROM products WHERE name = 'Create'")
+    assert res.rows == []
+    assert res.columns == ["name"]
+
+
 def test_run_caps_rows():
     if not os.path.exists(DB):
         pytest.skip("sample DB not built")
