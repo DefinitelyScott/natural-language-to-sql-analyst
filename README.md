@@ -815,15 +815,15 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 44/52 gold queries are written independently of the rule they test
-  Self-comparing (not gating): 8 — these prove the SQL runs, not that it answers the question
+Gold independence: 46/52 gold queries are written independently of the rule they test
+  Self-comparing (not gating): 6 — these prove the SQL runs, not that it answers the question
     [COPY] rule #26: How many customers do we have?
-    [COPY] rule #44: Show revenue by day of week.
+    [COPY] rule #30: Which products are most frequently bought together?
     ...
 ```
 
-So eight rows of the 100% above are still self-referential, and the honest
-reading of the headline is "52/52, of which 44 are real comparisons". Publishing
+So six rows of the 100% above are still self-referential, and the honest
+reading of the headline is "52/52, of which 46 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
@@ -837,24 +837,39 @@ answer by a different route: restating `COUNT(*) FROM products` as
 second opinion, which raises the ratio while proving nothing. The whole-table
 counts still on the list are there for that reason, and may never come off it.
 Until the backlog is worked down it is a **ratchet**, not a gate:
-`tests/test_gold_independence.py` records the 8 remaining copies by name and
+`tests/test_gold_independence.py` records the 6 remaining copies by name and
 fails if a new one appears, so a pattern added with copy-pasted gold SQL is
 caught immediately, while the existing backlog stays visible instead of turning
 every run red. It also fails if a rewritten query is left on the list, so the
 backlog can only shrink. The harness measures and reports; the test decides what
 is allowed to change.
 
-Six rows have been rewritten so far, each taking a different route to the same
+Eight rows have been rewritten so far, each taking a different route to the same
 answer: per-order subtotals instead of one flat sum over the join fan-out
 (monthly sales), a correlated subquery instead of `JOIN` plus `GROUP BY` (top
 customers), aggregation before the customer join instead of after (largest
 orders), `DISTINCT` in a subquery instead of `COUNT(DISTINCT ...)` (monthly
 active customers), `julianday` arithmetic instead of a `date(..., '-30 day')`
 string comparison (orders in the last 30 days), and the join order reversed
-(revenue by region and category). Because `gold.jsonl` cannot carry comments,
-the disagreement each rewrite is now capable of producing is recorded in
-`REWRITE_RATIONALE` in `tests/test_gold_independence.py`, and a test keeps that
-list from outliving the rows it describes.
+(revenue by region and category).
+
+The two most recent both replace a hand-written `CASE` ladder with a *relation*,
+which is the shape worth naming because a ladder is exactly where a silently
+wrong label hides. Revenue by day of week: the rule reads the weekday from
+`strftime('%w')` and names it with a seven-branch `CASE`, while the gold query
+derives the weekday arithmetically from `julianday` and names it by joining a
+`VALUES` list of the seven days — so the classic off-by-one in a `%w` mapping,
+which still returns a full and plausible seven-row table, moves one side only.
+Revenue by price tier: the rule bands prices with a `CASE` ladder and orders the
+bands by the `MIN(p.price)` it observes in each, while the gold query states the
+boundaries as data and assigns products by a half-open range join, ordering by
+the declared lower bound. A misplaced comparison in the ladder therefore shifts
+both the rule's tier assignment and its row order, and neither can follow it.
+
+Because `gold.jsonl` cannot carry comments, the disagreement each rewrite is now
+capable of producing is recorded in `REWRITE_RATIONALE` in
+`tests/test_gold_independence.py`, and a test keeps that list from outliving the
+rows it describes.
 
 Two limits worth stating. The comparison normalizes whitespace, trailing
 semicolons and case, and stops there — it is not a SQL parser, so a gold query

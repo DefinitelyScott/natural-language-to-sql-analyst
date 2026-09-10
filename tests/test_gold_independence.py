@@ -8,7 +8,7 @@ construction — it would still hold if the rule computed revenue by *region* fo
 question asking about categories — so the question proves the SQL parses and
 executes, and nothing about whether it answers what was asked.
 
-Eight of the current gold rows are still such copies, so this cannot be a check
+Six of the current gold rows are still such copies, so this cannot be a check
 that simply fails until they are all rewritten: a check that is red on every run
 is one people learn to scroll past, and rewriting the whole backlog is not a
 change anyone should make in one sitting. It is a *ratchet* instead. The copies
@@ -67,8 +67,6 @@ KNOWN_SELF_COMPARING = frozenset(
         "How many new customers signed up by month in 2024?",
         "How many orders do we have?",
         "How many products are in the catalog?",
-        "Show revenue by day of week.",
-        "Show revenue by price tier.",
         "Which category do customers buy from first?",
         "Which products are most frequently bought together?",
     }
@@ -119,6 +117,27 @@ REWRITE_RATIONALE = {
         "outward, the gold query builds a line-level CTE from order_items and "
         "joins customers last -- so a mis-stated join condition would have to "
         "be wrong identically in both directions to go unnoticed."
+    ),
+    "Show revenue by day of week.": (
+        "the rule reads the weekday out of strftime('%w') and names it with a "
+        "CASE ladder; the gold query derives the weekday arithmetically from "
+        "julianday and names it by joining a VALUES relation of the seven days. "
+        "Neither the extraction nor the naming is shared, so a ladder branch "
+        "labelling the wrong day -- the classic off-by-one in a %w mapping, "
+        "which returns a full, plausible seven-row table -- moves the rule and "
+        "not the gold query. The gold query also totals each order in a CTE "
+        "before summing by weekday rather than summing across the orders x "
+        "order_items fan-out."
+    ),
+    "Show revenue by price tier.": (
+        "the rule bands prices with a CASE ladder and orders the bands by "
+        "MIN(p.price) observed in each; the gold query states the boundaries as "
+        "data in a tiers CTE, assigns products by joining on a half-open range, "
+        "and orders by the declared lower bound. A wrong comparison in the "
+        "ladder (a <= where a < belongs, or an ELSE that swallows a band) puts "
+        "products in the wrong tier in the rule alone -- and because the rule "
+        "derives its ordering from the misplaced rows, it can also reorder the "
+        "output while the gold query's fixed bounds do not."
     ),
 }
 
