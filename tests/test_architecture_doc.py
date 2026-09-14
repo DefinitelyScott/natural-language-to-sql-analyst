@@ -31,6 +31,7 @@ check.
 
 from __future__ import annotations
 
+import ast
 import importlib
 import re
 from pathlib import Path
@@ -123,6 +124,31 @@ def test_every_section_names_a_real_module(
     )
 
 
+def _names_defined_in_source(module_name: str) -> set[str] | None:
+    """Return the top-level names ``nl2sql/<module_name>.py`` defines, or ``None``.
+
+    ``None`` means the file is not there at all. Everything else is read out of
+    the source with :mod:`ast` and never executed, which is the whole point: it
+    resolves a symbol in a module that cannot be *imported* here because one of
+    its third-party dependencies is absent.
+    """
+    path = PACKAGE_DIR / f"{module_name}.py"
+    if not path.exists():
+        return None
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(
+                target.id for target in node.targets if isinstance(target, ast.Name)
+            )
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
 def test_every_symbol_named_in_the_doc_exists(doc: str) -> None:
     """Resolve every ``nl2sql.<module>.<name>`` the document mentions."""
     references = sorted(set(_SYMBOL_RE.findall(doc)))
@@ -132,6 +158,31 @@ def test_every_symbol_named_in_the_doc_exists(doc: str) -> None:
     for module_name, attribute in references:
         try:
             module = importlib.import_module(f"nl2sql.{module_name}")
+        except ModuleNotFoundError as exc:
+            # An optional dependency is missing, not a documentation defect.
+            # ``nl2sql/api.py`` imports fastapi at module scope, and fastapi is
+            # an extra: requirements.txt states the core runs on the standard
+            # library alone, and tests/test_api.py honours that with
+            # ``importorskip``. This test did not, so a stdlib-only checkout
+            # failed here reporting a *documentation* error for a document that
+            # was entirely correct.
+            #
+            # The answer is to weaken the mechanism, not the claim. Resolving
+            # the symbol from source keeps the assertion exactly as strong --
+            # a renamed or deleted symbol still fails -- without making the
+            # architecture document unverifiable unless the extras are
+            # installed. Only a missing *third-party* module qualifies: if the
+            # import that failed was itself under ``nl2sql``, the package is
+            # genuinely broken and must fail here.
+            if exc.name is not None and not exc.name.startswith("nl2sql"):
+                defined = _names_defined_in_source(module_name)
+                if defined is None:
+                    unresolved.append(f"nl2sql.{module_name} (no such module)")
+                elif attribute not in defined:
+                    unresolved.append(f"nl2sql.{module_name}.{attribute}")
+                continue
+            unresolved.append(f"nl2sql.{module_name} (module not importable)")
+            continue
         except ImportError:
             unresolved.append(f"nl2sql.{module_name} (module not importable)")
             continue
@@ -210,3 +261,31 @@ def test_repair_budget_claim_matches_the_constant(doc: str) -> None:
         f"ARCHITECTURE.md claims a repair budget of {match.group(1)}, "
         f"but generator.MAX_REPAIR_ATTEMPTS is {generator.MAX_REPAIR_ATTEMPTS}"
     )
+
+
+def test_source_fallback_reads_names_without_importing() -> None:
+    """The fallback resolves real names in a module it never executes.
+
+    ``api`` is the case the fallback exists for: it imports fastapi at module
+    scope, so on a stdlib-only checkout it cannot be imported at all, yet the
+    architecture document names its symbols and those names are correct.
+    """
+    defined = _names_defined_in_source("api")
+    assert defined is not None
+    assert {"create_app", "app"} <= defined
+
+
+def test_source_fallback_still_rejects_a_name_that_does_not_exist() -> None:
+    """Reading from source must not become a way to pass by not looking.
+
+    The guard's whole value is catching a document that names a symbol the code
+    no longer has, so the fallback has to keep failing that case.
+    """
+    defined = _names_defined_in_source("api")
+    assert defined is not None
+    assert "create_app_renamed_away" not in defined
+
+
+def test_source_fallback_reports_a_module_that_is_absent() -> None:
+    """A module that is not on disk is a stale document, not a missing extra."""
+    assert _names_defined_in_source("no_such_module") is None

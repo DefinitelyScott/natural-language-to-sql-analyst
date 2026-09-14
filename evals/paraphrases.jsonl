@@ -55,3 +55,5 @@
 {"canonical": "Which category do customers buy from first?", "paraphrase": "Which category acquires the most customers?"}
 {"canonical": "Which customers have never placed an order?", "paraphrase": "Which customers signed up but never ordered?"}
 {"canonical": "Which customers have never placed an order?", "paraphrase": "Show customers with no orders.", "known_gap": "the rule requires the explicit word 'never'; a bare 'no orders' also reads as 'none in the window', which the at-risk rule owns"}
+{"canonical": "How many customers are in each region?", "paraphrase": "Show the number of customers by region."}
+{"canonical": "How many customers are in each region?", "paraphrase": "Which region has the most customers?"}

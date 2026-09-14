@@ -29,7 +29,8 @@ nl2sql-analyst/
 │   ├── output.py        # table / CSV / JSON result formatters
 │   ├── catalog.py       # pairs each offline rule with an example question
 │   ├── cache.py         # on-disk reuse of SQL the LLM backend already wrote
-│   └── cli.py           # `nl2sql ask` / `explain` / `rules` / `schema`
+│   ├── cli.py           # `nl2sql ask` / `explain` / `rules` / `schema`
+│   └── api.py           # optional read-only HTTP front end (FastAPI)
 ├── scripts/build_sample_db.py   # generates a synthetic retail database
 ├── evals/
 │   ├── gold.jsonl       # question / gold-SQL pairs (+ order-sensitivity flag)
@@ -112,7 +113,29 @@ broad ones — "orders in the last 30 days" must not be swallowed by "how many
 orders". The catalog currently covers:
 
 **Counts and totals** — customer count, order count, product count, total
-revenue.
+revenue, and customer headcount by region.
+
+That last one is the grouped counterpart of the first, and it exists because of
+how the ungrouped rules fail. Each of the four totals collapses a whole table to
+one row, and each is registered last and phrased broadly ("how many customers"),
+which is exactly what made *"how many customers are in each region?"* fall
+through to the customer counter and come back as the single number 120 — a
+plausible, correctly labelled figure that silently dropped the grouping the
+question was entirely about. So the four now carry a `_UNGROUPED_ONLY` guard, a
+negative lookahead for breakdown phrasing ("by region", "per category", "in each
+month") that is the sibling of the `_UNSCOPED_ONLY` period guard beside it: a
+breakdown the catalog cannot compute is declined and gets the CLI's nearest-
+question suggestions, rather than answered with a total. Groupings the catalog
+*does* implement are untouched, because their rules are registered earlier and
+first-match resolution reaches them first. The region headcount is the one
+grouping of a count the catalog implements, so it is registered immediately
+ahead of the customer counter — adjacent on purpose, since the guard on one and
+the existence of the other are a single decision. It carries each region's share
+of the customer base beside the count, because a headcount split four ways is
+read as a distribution and the alternative is doing that division by eye.
+`evals/precision.jsonl` pins the other half of the fix: "how many orders did
+each region place?" and "how many products are in each category?" are recorded
+as questions the catalog must *decline*.
 
 **Group-by breakdowns** — revenue by category, by region, and by region ×
 category; top products by revenue; best-selling product by units, both overall
@@ -506,6 +529,72 @@ out: listing them would bloat every prompt and copy row data into it for no
 gain. Keys are skipped by kind for the same reason. Pass `--no-values` (or
 `schema_context(..., max_distinct=0)`) for structure only.
 
+## Serving it over HTTP
+
+The CLI answers one question per process, which is the right shape for a
+terminal and the wrong one for a notebook, a dashboard, or a teammate without
+the repo checked out. `nl2sql/api.py` serves the same operations over HTTP:
+
+```bash
+pip install -e ".[api]"
+uvicorn nl2sql.api:app
+
+curl 'localhost:8000/ask?q=Show+revenue+by+category'
+curl 'localhost:8000/explain?q=How+many+customers+do+we+have%3F'
+curl 'localhost:8000/rules?search=revenue'
+curl localhost:8000/health
+```
+
+Four endpoints, all `GET`: every operation is a side-effect-free read, so `GET`
+is the honest verb — cacheable, pasteable into a browser, and reachable with
+nothing but `curl`. Interactive OpenAPI docs are generated at `/docs`.
+
+```json
+$ curl -s 'localhost:8000/ask?q=Show+revenue+by+category'
+{
+  "question": "Show revenue by category",
+  "sql": "SELECT p.category, ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue FROM products p JOIN order_items oi ON oi.product_id = p.id GROUP BY p.category ORDER BY revenue DESC",
+  "columns": ["category", "revenue"],
+  "rows": [
+    ["Electronics", 67877.7],
+    ["Office", 32890.29],
+    ["Home", 31905.86],
+    ["Fitness", 24184.46]
+  ],
+  "row_count": 4,
+  "truncated": false
+}
+```
+
+It is a thin layer — every endpoint calls the same `generator` and `catalog`
+functions the CLI does, so the two front ends cannot drift apart and a new
+question pattern reaches both without either being edited. Where they *do*
+differ, it is because over HTTP the caller is no longer the operator:
+
+| | CLI | HTTP |
+|---|---|---|
+| Database | `--db <path>` | fixed at startup (`NL2SQL_DB`); **not** a parameter |
+| LLM backend | `--llm` | absent |
+| Row cap | `--max-rows`, unbounded | `max_rows`, capped at 10,000 |
+| Deadline | `--timeout-ms`, `0` disables | `timeout_ms`, capped at 30,000 ms, never disabled |
+
+Each row is the same reasoning: a flag is safe when the person typing it owns
+the machine and pays the bill. A `?db=` parameter would turn a read-only
+analytics endpoint into an arbitrary-SQLite-file reader for anyone who can
+reach the port; an `llm=true` would let an unauthenticated query string spend
+the operator's money; and an uncapped row count or deadline is a denial of
+service whether or not anyone meant it that way.
+
+Failures are translated rather than leaked: **422** for a question no rule
+answers — carrying the same "did you mean" suggestions the CLI prints, which is
+also what tells it apart from FastAPI's own validation 422 — **504** for a
+missed deadline, **503** when the sample database has not been built, and
+**500** for SQL the project's own validator rejects, because that one is a
+defect here rather than anything the caller did.
+
+The API is an optional extra, not a dependency. The CLI, the library and the
+eval harness still run on the standard library alone.
+
 ## Safety guardrails
 
 Generated SQL is never trusted blindly. `runner.py` enforces:
@@ -646,7 +735,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 52 questions  |  execution accuracy: 52/52 (100%)  [offline backend]
+Evaluated 53 questions  |  execution accuracy: 53/53 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -688,8 +777,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 52,
-  "passed": 52,
+  "total": 53,
+  "passed": 53,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -777,11 +866,11 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **47 gating pairs and
+can never improve the headline. The set currently holds **49 gating pairs and
 10 known gaps**:
 
 ```
-Paraphrase robustness: 47/47 rephrasings route to the canonical rule
+Paraphrase robustness: 49/49 rephrasings route to the canonical rule
   Known gaps (not gating): 10
 ```
 
@@ -815,43 +904,59 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 46/52 gold queries are written independently of the rule they test
-  Self-comparing (not gating): 6 — these prove the SQL runs, not that it answers the question
-    [COPY] rule #26: How many customers do we have?
-    [COPY] rule #30: Which products are most frequently bought together?
-    ...
+Gold independence: 50/53 gold queries are written independently of the rule they test
+  Self-comparing (not gating): 3 — these prove the SQL runs, not that it answers the question
+    [COPY] rule #27: How many customers do we have?
+    [COPY] rule #51: How many orders do we have?
+    [COPY] rule #52: How many products are in the catalog?
 ```
 
-So six rows of the 100% above are still self-referential, and the honest
-reading of the headline is "52/52, of which 46 are real comparisons". Publishing
+So three rows of the 100% above are still self-referential, and the honest
+reading of the headline is "53/53, of which 50 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
 
 The fix is per-question — rewrite the gold query a different way that computes
 the same answer (a different join order, a subquery where the rule uses a CTE, a
-window function where the rule uses `ORDER BY ... LIMIT`) — so the backlog is
+window function where the rule uses `ORDER BY ... LIMIT`) — so the backlog was
 worked down rather than cleared at once. A rewrite only counts if it reaches the
 answer by a different route: restating `COUNT(*) FROM products` as
 `COUNT(DISTINCT id) FROM products` clears the text comparison without adding a
-second opinion, which raises the ratio while proving nothing. The whole-table
-counts still on the list are there for that reason, and may never come off it.
-Until the backlog is worked down it is a **ratchet**, not a gate:
-`tests/test_gold_independence.py` records the 6 remaining copies by name and
-fails if a new one appears, so a pattern added with copy-pasted gold SQL is
-caught immediately, while the existing backlog stays visible instead of turning
-every run red. It also fails if a rewritten query is left on the list, so the
-backlog can only shrink. The harness measures and reports; the test decides what
-is allowed to change.
+second opinion, which raises the ratio while proving nothing.
 
-Eight rows have been rewritten so far, each taking a different route to the same
-answer: per-order subtotals instead of one flat sum over the join fan-out
-(monthly sales), a correlated subquery instead of `JOIN` plus `GROUP BY` (top
-customers), aggregation before the customer join instead of after (largest
+That is exactly what the three remaining rows are, and it is why this number
+stops at 50/53 rather than climbing to 53/53. "How many rows are in this table"
+has one honest formulation; the second one needed to clear the comparison would
+be the same query wearing a different function name, and the two could not
+disagree about a primary key however wrong the rule became. The backlog is at
+its floor, not partway down it — so a future run reporting 51 or 52 would be
+evidence of a metric being gamed, not of the eval set improving.
+
+It is a **ratchet**, not a gate: `tests/test_gold_independence.py` records the 3
+remaining copies by name and fails if a new one appears, so a pattern added with
+copy-pasted gold SQL is caught immediately, while the irreducible rows stay
+visible instead of turning every run red. It also fails if a rewritten query is
+left on the list, so the list can only shrink. The harness measures and reports;
+the test decides what is allowed to change.
+
+Every rewritable row has now been rewritten, each taking a different route to
+the same answer: per-order subtotals instead of one flat sum over the join
+fan-out (monthly sales), a correlated subquery instead of `JOIN` plus `GROUP BY`
+(top customers), aggregation before the customer join instead of after (largest
 orders), `DISTINCT` in a subquery instead of `COUNT(DISTINCT ...)` (monthly
 active customers), `julianday` arithmetic instead of a `date(..., '-30 day')`
-string comparison (orders in the last 30 days), and the join order reversed
-(revenue by region and category).
+string comparison (orders in the last 30 days), the join order reversed (revenue
+by region and category), `substr` on the ISO date instead of `strftime('%Y-%m')`
+(new customers by month), an explicit de-duplicating CTE instead of
+`COUNT(DISTINCT order_id)` (products bought together), and a correlated
+`ORDER BY ... LIMIT 1` instead of two stacked `ROW_NUMBER()` windows (first
+category bought).
+
+Each rewrite names, in `REWRITE_RATIONALE`, the specific way the rule could
+break that the gold query would now catch — the claim "this is genuinely a
+second opinion" is the one thing in the check a reader has to take on trust, so
+it is written down per row rather than asserted once.
 
 The two most recent both replace a hand-written `CASE` ladder with a *relation*,
 which is the shape worth naming because a ladder is exactly where a silently
@@ -890,7 +995,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 37 of the 52 gold questions
+  `"ordered": true` and are compared as returned. 38 of the 53 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

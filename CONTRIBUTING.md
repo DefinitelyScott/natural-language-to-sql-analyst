@@ -76,6 +76,15 @@ Then:
    negative lookahead makes the rule decline instead, which routes the question
    to `NoRuleMatchError` and the "Did you mean" suggestions.
 
+   **If the SQL also returns a single row for the whole table** (`SELECT
+   COUNT(*) FROM orders`), add `_UNGROUPED_ONLY` beside it. Same failure in the
+   other dimension: "how many customers are in each region?" used to reach the
+   customer counter and come back as one number, silently dropping the grouping
+   the question was about. Both guards are lookaheads, so they compose by
+   concatenation — `_UNSCOPED_ONLY + _UNGROUPED_ONLY + r".*how many orders"`.
+   Neither guard touches a rule that *does* group or filter: those are
+   registered earlier and win before the catch-alls are consulted.
+
 4. **Add exactly one row** to `evals/gold.jsonl`:
    `{"question": ..., "sql": ..., "ordered": ...}`. Set `ordered` to `true` when
    the row order is part of the answer — a ranking ("top 5 customers") or a

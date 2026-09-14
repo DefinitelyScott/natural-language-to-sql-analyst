@@ -33,8 +33,12 @@ jobs:
           python-version: "3.10"
       - name: Install mypy
         # Pinned for the same reason ruff is — a new release adding checks
-        # would otherwise fail CI on a commit that changed nothing.
-        run: pip install mypy==2.3.1
+        # would otherwise fail CI on a commit that changed nothing. fastapi and
+        # pydantic ship inline types, so installing them is what lets
+        # `nl2sql/api.py` be checked for real rather than exempted the way
+        # `openai` is; an exemption would reduce every decorated endpoint to
+        # `Any` and check nothing.
+        run: pip install mypy==2.3.1 "fastapi>=0.110"
       - name: Type check
         # Paths, strictness and the `openai` exemption all live in
         # pyproject.toml, so this runs the same check a contributor gets from a
@@ -53,7 +57,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install pytest
+        # The API extra is installed here so `tests/test_api.py` actually runs.
+        # It guards itself with `importorskip`, which means the alternative is
+        # not a failing job but a silently skipped one — an HTTP surface nobody
+        # tests, reported as green.
+        run: pip install pytest "fastapi>=0.110" "httpx>=0.27"
       - name: Build sample database
         run: python scripts/build_sample_db.py
       - name: Run tests

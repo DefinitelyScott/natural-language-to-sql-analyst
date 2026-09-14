@@ -8,7 +8,7 @@ construction — it would still hold if the rule computed revenue by *region* fo
 question asking about categories — so the question proves the SQL parses and
 executes, and nothing about whether it answers what was asked.
 
-Six of the current gold rows are still such copies, so this cannot be a check
+Three of the current gold rows are still such copies, so this cannot be a check
 that simply fails until they are all rewritten: a check that is red on every run
 is one people learn to scroll past, and rewriting the whole backlog is not a
 change anyone should make in one sitting. It is a *ratchet* instead. The copies
@@ -16,6 +16,12 @@ are recorded in :data:`KNOWN_SELF_COMPARING` by name, and the tests below assert
 two things about that list: nothing outside it may be a copy (so a rule added with
 copy-pasted gold SQL fails immediately), and nothing on it may still be listed
 once it has been rewritten (so the backlog can only shrink, and shrinks visibly).
+
+Those three are the whole-table counts, and they are where the ratchet stops.
+``SELECT COUNT(*) FROM products`` has one honest formulation; a second one
+written to clear the text comparison would raise the printed ratio without
+adding a second opinion. So the remaining three are not a backlog anyone should
+work off — see :data:`KNOWN_SELF_COMPARING`.
 
 The harness reports the same measurement without gating on it — ``evaluate.py``
 measures and prints, this file decides what is allowed to change. That split is
@@ -61,14 +67,15 @@ _INDEPENDENCE_RE = re.compile(r"Gold independence: (\d+)/(\d+) gold\s+queries")
 #: than before. The whole-table counts left on this list are here for that reason
 #: and may outlast the rest of the backlog: for "how many rows are in this table"
 #: there is no genuinely independent second formulation to write.
+#: What remains is exactly that residue: three whole-table counts. The backlog
+#: is now at its floor rather than partway down it, which is a different claim
+#: and a stronger one — the printed ratio will not improve again, and should not
+#: be expected to.
 KNOWN_SELF_COMPARING = frozenset(
     {
         "How many customers do we have?",
-        "How many new customers signed up by month in 2024?",
         "How many orders do we have?",
         "How many products are in the catalog?",
-        "Which category do customers buy from first?",
-        "Which products are most frequently bought together?",
     }
 )
 
@@ -138,6 +145,42 @@ REWRITE_RATIONALE = {
         "products in the wrong tier in the rule alone -- and because the rule "
         "derives its ordering from the misplaced rows, it can also reorder the "
         "output while the gold query's fixed bounds do not."
+    ),
+    "How many customers are in each region?": (
+        "the rule groups the customer table and counts each group; the gold "
+        "query drives off a SELECT DISTINCT region relation and counts each "
+        "region with a correlated subquery instead, so the two disagree if the "
+        "GROUP BY key is ever changed to a column that splits or merges "
+        "regions. The share column is recomputed from its own subquery rather "
+        "than reusing the count, so a denominator narrowed to the grouped rows "
+        "-- the usual way a percent-of-total silently becomes 100% per row -- "
+        "moves the rule and not the gold query."
+    ),
+    "How many new customers signed up by month in 2024?": (
+        "the rule buckets the month with strftime('%Y-%m') and bounds the year "
+        "with a half-open date range; the gold query slices the month out of "
+        "the ISO string with substr and selects the year by strftime('%Y') "
+        "equality. Neither the bucketing nor the filtering is shared, so a "
+        "range whose upper bound was inclusive -- which would pull 2025-01-01 "
+        "signups into a 2024 report as a twelfth row -- moves the rule alone."
+    ),
+    "Which products are most frequently bought together?": (
+        "the rule pairs raw order_items rows and leans on COUNT(DISTINCT "
+        "order_id) to absorb an order that lists the same product on two lines; "
+        "the gold query removes those duplicates first in a SELECT DISTINCT "
+        "basket CTE and then counts pairs with a plain COUNT(*). 198 orders in "
+        "the sample database repeat a product, so the de-duplication is doing "
+        "real work: were the rule's DISTINCT ever dropped, it would "
+        "double-count those baskets and the two queries would disagree."
+    ),
+    "Which category do customers buy from first?": (
+        "both pick a first order per customer and then that order's largest "
+        "category, but by different mechanisms throughout -- the rule ranks "
+        "with ROW_NUMBER() in two stacked window subqueries, the gold query "
+        "selects each winner with a correlated ORDER BY ... LIMIT 1. A "
+        "PARTITION BY dropped from either window is the classic failure here, "
+        "and it would rank across all customers at once rather than within "
+        "each; the correlated subqueries have no partition to lose."
     ),
 }
 

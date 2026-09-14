@@ -4,3 +4,10 @@ pytest>=8.0
 ruff>=0.16    # lint; configured in pyproject.toml, run with `ruff check .`
 mypy>=2.3     # static types; configured in pyproject.toml, run with `mypy`
 openai>=1.0   # optional: only needed for the --llm backend
+
+# Optional: only needed for the HTTP front end (`uvicorn nl2sql.api:app`).
+# httpx is what fastapi.testclient runs on, so it is needed to *test* the API
+# as well as to call it.
+fastapi>=0.110
+uvicorn>=0.27
+httpx>=0.27

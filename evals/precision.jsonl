@@ -13,3 +13,5 @@
 {"question": "Forecast revenue for next quarter.", "reason": "prediction, not a query over recorded facts"}
 {"question": "Delete every order placed before June.", "reason": "an instruction to write; the catalog answers questions and the runner denies writes outright"}
 {"question": "Which products have never been sold?", "reason": "the never-ordered rule is scoped to customers; no rule covers unsold products, and every product in the sample data has sales"}
+{"question": "How many orders did each region place?", "reason": "grouped; the order-count rule returns one all-time total and no rule breaks orders down by region, so it must not answer with the ungrouped count"}
+{"question": "How many products are in each category?", "reason": "grouped; the product-count rule returns one catalog-wide total and no rule counts products per category"}

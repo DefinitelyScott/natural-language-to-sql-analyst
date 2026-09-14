@@ -63,9 +63,12 @@ against a schema the first attempt never saw.
 
 ### `nl2sql/llm.py`
 
-Holds the `nl2sql.llm.Backend` protocol and its two implementations.
+Holds the `nl2sql.llm.Backend` protocol and its two implementations. It owns how
+a question is *routed*; the catalog it routes against lives next door in
+`nl2sql/rules.py`.
 
-`nl2sql.llm.OfflineBackend` is an ordered list of `(regex, SQL)` rules, matched
+`nl2sql.llm.OfflineBackend` scans an ordered list of `(regex, SQL)` rules —
+loaded once per instance via `nl2sql.rules.build_catalog` — and matches
 **first-rule-wins**. That single choice drives most of the offline design:
 
 * Ordering is semantic, not cosmetic. A narrow pattern must be registered ahead
@@ -95,6 +98,39 @@ made `CachedBackend`'s own generation call untypeable, which is how the type
 checker found it. The runtime check tightened with the annotation — `isinstance`
 now requires both methods — so a class offering `repair` alone is refused where
 it claims the capability instead of failing later with an `AttributeError`.
+
+### `nl2sql/rules.py`
+
+The offline catalog itself: every `(compiled regex, SQL)` pair the offline
+backend can answer, in priority order, each with the reasoning for its SQL and
+for its position in the list.
+
+It is a separate module from `llm.py` on a data-versus-logic line. The matching
+logic is about seventy lines; the table it consults is two thousand, most of
+them comments justifying a particular window function or a particular `LEFT
+JOIN`. Interleaved, the four methods that actually decide anything were unfindable
+inside the table, and `OfflineBackend` read as though it were enormously more
+complex than it is. Split, each file changes for one reason: adding a question
+pattern touches only this module, and changing how questions are resolved touches
+only `llm.py`.
+
+`nl2sql.rules.build_catalog` is a function returning a fresh list rather than a
+module-level constant, so no caller can mutate a list every backend instance
+shares. Compiling the patterns is a per-instance cost measured in microseconds,
+not a per-question one.
+
+The two module-level lookahead guards live here rather than in `llm.py` because
+only the rules use them. Each is a negative lookahead prepended to a catch-all
+pattern: one keeps a period-scoped question ("revenue in 2023") away from the
+rules that compute an all-time total, and the other keeps a grouped question
+("revenue by region") away from the rules that return a single number. Both
+exist so an unanswerable question raises `nl2sql.llm.NoRuleMatchError` and gets
+the CLI's nearest-question suggestions, instead of returning a total wearing a
+breakdown's label.
+
+Ordering is load-bearing, not cosmetic, and the split preserves it exactly — see
+the `llm.py` section above for why first-rule-wins makes position semantic, and
+`tests/test_rule_catalog.py` for the assertion that no rule became unreachable.
 
 ### `nl2sql/cache.py`
 
@@ -258,6 +294,43 @@ to stderr in `csv`/`json` mode, which is what makes
 follow the same intent: `explain` exits 1 on SQL the validator would reject and
 `rules --search` exits 1 on no matches, so both can gate a shell script without
 anyone parsing prose.
+
+### `nl2sql/api.py`
+
+A second presentation layer, over HTTP instead of a terminal. Optional: it is
+the only module that imports a third-party package for the non-LLM path, so it
+lives behind the `api` extra and nothing else imports it.
+
+It is the same shape as `cli.py` — parse a request, call `generator`, render
+the result — and it holds no analytical logic either. That symmetry is the
+design: both front ends call the same functions, so the HTTP surface cannot
+answer a question differently from the command line, and a new question pattern
+reaches both without either being touched.
+
+Where the two front ends diverge, they diverge because **the caller is no longer
+the operator**, and each difference follows from that one fact:
+
+* The database path is bound once by `nl2sql.api.create_app` (or `NL2SQL_DB`)
+  and is not a request parameter. `ask --db` is fine when the person typing it
+  owns the machine; a `?db=` would make the service an arbitrary-SQLite-file
+  reader for anyone who can reach the port.
+* There is no `llm` parameter. `--llm` spends the money of the person who typed
+  it; over an unauthenticated HTTP endpoint it would spend the operator's, so
+  the switch is absent rather than defaulted off.
+* The row cap and the execution deadline are bounded above
+  (`nl2sql.api.MAX_ROWS_LIMIT`, `nl2sql.api.TIMEOUT_LIMIT_MS`), and there is no
+  "no deadline" option at all. The CLI lets both go as high as the user likes,
+  because the cost lands on the user.
+
+Failures are translated rather than passed through, and the mapping is the part
+worth arguing with: a question no rule answers is **422** with the same
+suggestions the CLI prints (well-formed request, unprocessable instructions —
+and the body carries `suggestions`, which is what distinguishes it from
+FastAPI's own validation 422 on the same endpoint); a missed deadline is **504**,
+since the deadline is the service's own; a missing database file is **503** with
+the build command in the message; and SQL that the project's own validator
+rejects is **500**, because the caller did nothing wrong and can do nothing
+about it.
 
 ## Evaluation
 

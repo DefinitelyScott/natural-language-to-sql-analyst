@@ -5,7 +5,7 @@ import os
 import pytest
 
 from nl2sql import generator
-from nl2sql.llm import OfflineBackend
+from nl2sql.llm import NoRuleMatchError, OfflineBackend
 
 DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "store.db")
 
@@ -3072,4 +3072,95 @@ def test_end_to_end_acquisition_mix():
 
     # Sorted by size, then by name -- the deterministic order the gold row is
     # compared against.
+    assert rows == sorted(rows, key=lambda row: (-row[1], row[0]))
+
+
+def test_grouped_count_questions_do_not_fall_through_to_the_totals():
+    # The failure this guards is not a crash but a plausible wrong answer: the
+    # whole-table counters are registered last and phrased broadly ("how many
+    # customers"), so before _UNGROUPED_ONLY a question asking for a per-group
+    # breakdown reached them and was answered with a single, correctly labelled
+    # number that dropped the grouping entirely.
+    #
+    # Region customer counts are the one grouped count the catalog implements,
+    # so that phrasing must be *answered*; the rest must be declined, because
+    # NoRuleMatchError sends the CLI's nearest-question suggestions back instead
+    # of a total wearing a breakdown's label.
+    backend = OfflineBackend()
+
+    for question in (
+        "How many customers are in each region?",
+        "How many customers do we have in each region?",
+        "How many customers per region?",
+        "Show the number of customers by region.",
+        "Which region has the most customers?",
+    ):
+        sql = backend.to_sql(question, schema="")
+        assert "GROUP BY c.region" in sql, question
+        assert sql != "SELECT COUNT(*) AS customer_count FROM customers"
+
+    for question in (
+        "How many orders did each region place?",
+        "How many products are in each category?",
+        "How many customers are in each category?",
+    ):
+        with pytest.raises(NoRuleMatchError):
+            backend.to_sql(question, schema="")
+
+    # The guard is a lookahead for breakdown phrasing only: the ungrouped
+    # questions the counters exist for still reach them unchanged.
+    assert (
+        backend.to_sql("How many customers do we have?", schema="")
+        == "SELECT COUNT(*) AS customer_count FROM customers"
+    )
+    assert (
+        backend.to_sql("How many orders do we have?", schema="")
+        == "SELECT COUNT(*) AS order_count FROM orders"
+    )
+    assert (
+        backend.to_sql("How many products are in the catalog?", schema="")
+        == "SELECT COUNT(*) AS product_count FROM products"
+    )
+    assert "total_revenue" in backend.to_sql("What is the total revenue?", schema="")
+
+    # Groupings the catalog does implement are registered earlier, so the guard
+    # on the catch-alls never gets the chance to decline them -- including the
+    # phrasings that carry both a total word and a grouping ("revenue per
+    # category"), which are the ones a guard applied too eagerly would break.
+    assert "GROUP BY p.category" in backend.to_sql("Show revenue by category", schema="")
+    assert "GROUP BY p.category" in backend.to_sql(
+        "How much revenue did we make per category?", schema=""
+    )
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_customer_count_by_region():
+    # Counts and shares are recomputed from the customer table in Python rather
+    # than checked against the rule's own SQL, so a GROUP BY on the wrong column
+    # or a denominator narrowed to the grouped rows would show up here.
+    import sqlite3
+    from collections import Counter
+
+    ans = generator.answer_question(DB, "How many customers are in each region?")
+    assert ans.result.columns == ["region", "customer_count", "pct_of_customers"]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        regions = [row[0] for row in conn.execute("SELECT region FROM customers")]
+    finally:
+        conn.close()
+
+    expected = Counter(regions)
+    rows = ans.result.rows
+    assert {row[0]: row[1] for row in rows} == dict(expected)
+
+    # Every customer is counted exactly once -- the property a percent-of-total
+    # is only meaningful against.
+    assert sum(row[1] for row in rows) == len(regions)
+
+    for _, count, pct in rows:
+        assert_rounds_to(pct, 100.0 * count / len(regions), 1)
+
+    # Largest region first, ties broken by name: four regions over one customer
+    # table make an exact tie ordinary, and the gold row is compared row for row.
     assert rows == sorted(rows, key=lambda row: (-row[1], row[0]))
