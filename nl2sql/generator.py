@@ -20,9 +20,11 @@ rewrite the query. See :data:`MAX_REPAIR_ATTEMPTS` for why the budget is one.
 from __future__ import annotations
 
 import sqlite3
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from . import cache, llm, runner, schema
+from .examples import Example
 
 #: How many times :func:`answer_question` will ask a backend to rewrite SQL that
 #: failed, before giving up and raising.
@@ -110,7 +112,12 @@ class Explanation:
 
 
 def _resolve(
-    db_path: str, question: str, *, use_llm: bool, use_cache: bool = False
+    db_path: str,
+    question: str,
+    *,
+    use_llm: bool,
+    use_cache: bool = False,
+    examples: Sequence[Example] = (),
 ) -> tuple[llm.Backend, str, str, bool]:
     """Return the backend, the schema text, the SQL, and whether it was cached.
 
@@ -130,9 +137,13 @@ def _resolve(
     they either have or lack. ``OfflineBackend`` does not implement it and is
     therefore never wrapped — its answers are a regex scan away, so a cache
     would only add a file read to the cheap path.
+
+    ``examples`` is passed straight to the factory. Caching stays correct across
+    it without any work here, because the pool is folded into the backend's
+    ``cache_identity`` and the identity is part of the key.
     """
     schema_text = schema.schema_context(db_path)
-    backend = llm.get_backend(use_llm)
+    backend = llm.get_backend(use_llm, examples)
 
     if use_cache and isinstance(backend, cache.CacheableBackend):
         cached_backend = cache.CachedBackend(
@@ -171,10 +182,17 @@ def _describe_failure(
 
 
 def generate_sql(
-    db_path: str, question: str, *, use_llm: bool = False, use_cache: bool = False
+    db_path: str,
+    question: str,
+    *,
+    use_llm: bool = False,
+    use_cache: bool = False,
+    examples: Sequence[Example] = (),
 ) -> str:
     """Generate SQL for ``question`` without executing it."""
-    _, _, sql, _ = _resolve(db_path, question, use_llm=use_llm, use_cache=use_cache)
+    _, _, sql, _ = _resolve(
+        db_path, question, use_llm=use_llm, use_cache=use_cache, examples=examples
+    )
     return sql
 
 
@@ -186,6 +204,7 @@ def answer_question(
     use_cache: bool = False,
     max_rows: int = 1000,
     timeout_ms: int | None = runner.DEFAULT_TIMEOUT_MS,
+    examples: Sequence[Example] = (),
 ) -> Answer:
     """Generate SQL for ``question``, execute it, and repair it if it fails.
 
@@ -220,9 +239,14 @@ def answer_question(
     the SQL was replayed. It is off by default because writing to a file the
     caller never named is a surprising thing for a library function to do — the
     CLI turns it on, since there the file is the user's own.
+
+    ``examples`` is a few-shot pool for the LLM prompt (see
+    :mod:`nl2sql.examples`); it is ignored by the offline backend, and it
+    affects only the first generation — the repair loop below deliberately
+    prompts without examples.
     """
     backend, schema_text, sql, cached = _resolve(
-        db_path, question, use_llm=use_llm, use_cache=use_cache
+        db_path, question, use_llm=use_llm, use_cache=use_cache, examples=examples
     )
     repairs: list[RepairAttempt] = []
 
@@ -257,7 +281,12 @@ def answer_question(
 
 
 def explain_question(
-    db_path: str, question: str, *, use_llm: bool = False, use_cache: bool = False
+    db_path: str,
+    question: str,
+    *,
+    use_llm: bool = False,
+    use_cache: bool = False,
+    examples: Sequence[Example] = (),
 ) -> Explanation:
     """Generate SQL for ``question`` and describe it, without executing it.
 
@@ -265,9 +294,13 @@ def explain_question(
     error, and a dry run never executes. What ``explain`` shows is therefore
     always the backend's first attempt — cached or not, since a cache entry only
     ever holds a first attempt.
+
+    ``examples`` is accepted here as well as on :func:`answer_question` so a dry
+    run can inspect the SQL a given few-shot pool produces *before* that SQL is
+    executed, which is the whole point of having a dry run.
     """
     backend, _, sql, cached = _resolve(
-        db_path, question, use_llm=use_llm, use_cache=use_cache
+        db_path, question, use_llm=use_llm, use_cache=use_cache, examples=examples
     )
 
     explanation = Explanation(

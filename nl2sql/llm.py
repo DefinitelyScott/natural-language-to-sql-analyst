@@ -7,6 +7,8 @@ Two backends:
   test suite and CI use it. It is intentionally small and transparent.
 * ``LLMBackend`` — sends the schema + question to an OpenAI-compatible chat
   model and returns the SQL it produces. Used when ``OPENAI_API_KEY`` is set.
+  Optionally shows the model a few solved questions drawn from a pool the
+  caller supplies; see :mod:`nl2sql.examples`.
 
 Both return a raw SQL string; validation and execution happen in ``runner``.
 """
@@ -16,8 +18,10 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Sequence
 from typing import Protocol, runtime_checkable
 
+from .examples import Example, pool_fingerprint, render_examples, select_examples
 from .rules import build_catalog
 
 
@@ -161,10 +165,63 @@ def _prompt_fingerprint(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:12]
 
 
-class LLMBackend:
-    """OpenAI-compatible chat backend. Imports the client lazily."""
+def build_user_message(
+    question: str, schema: str, examples: Sequence[Example] = ()
+) -> str:
+    """Assemble the user turn: the schema, any few-shot examples, the question.
 
-    def __init__(self, model: str = "gpt-4o-mini") -> None:
+    The question goes last, nearest to where the model starts writing, with the
+    examples between it and the schema — they are context for the question, not
+    a second schema.
+
+    A module-level function rather than a method so it can be exercised without
+    an API key or the ``openai`` package: the exact bytes of this prompt are
+    what the cache is keyed on, so it is worth being able to assert them in CI.
+    With an empty pool it returns exactly the two-part message this backend sent
+    before few-shot existed, which ``tests/test_examples.py`` pins.
+    """
+    block = render_examples(select_examples(question, examples))
+    parts = [f"Schema:\n{schema}"]
+    if block:
+        parts.append(block)
+    parts.append(f"Question: {question}")
+    return "\n\n".join(parts)
+
+
+def build_cache_identity(model: str, examples: Sequence[Example] = ()) -> str:
+    """Return the cache identity for a model and few-shot pool.
+
+    The model name and a fingerprint of the system prompt, plus — only when
+    there is a pool — a fingerprint of that pool and of the instruction that
+    introduces it (see :func:`nl2sql.examples.pool_fingerprint`, which also
+    states what that digest deliberately does not cover). The few-shot segment
+    is omitted entirely on the zero-shot path, rather than left empty: that is
+    what keeps SQL cached before this backend learned about examples reachable,
+    instead of orphaning it behind a key that grew a constant empty field.
+
+    Module-level for the same reason as :func:`build_user_message`: cache
+    correctness turns on this string, and testing it should not require an API
+    key.
+    """
+    identity = f"{model}/{_prompt_fingerprint(_SYSTEM_PROMPT)}"
+    if examples:
+        identity += f"/fewshot:{pool_fingerprint(examples)}"
+    return identity
+
+
+class LLMBackend:
+    """OpenAI-compatible chat backend. Imports the client lazily.
+
+    ``examples`` is an optional pool of solved ``(question, sql)`` pairs. The
+    nearest few to each question are shown to the model as worked examples; an
+    empty pool (the default) keeps the backend zero-shot. See
+    :mod:`nl2sql.examples` for how the selection works and for the one way
+    supplying a pool can quietly invalidate a measurement.
+    """
+
+    def __init__(
+        self, model: str = "gpt-4o-mini", examples: Sequence[Example] = ()
+    ) -> None:
         api_key = os.environ.get("OPENAI_API_KEY")
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is not set")
@@ -172,22 +229,26 @@ class LLMBackend:
 
         self._client = OpenAI(api_key=api_key)
         self._model = model
+        # Copied into a tuple: a caller that mutates the list it passed must not
+        # be able to change this backend's prompts — still less its cache
+        # identity — part way through a run.
+        self._examples: tuple[Example, ...] = tuple(examples)
 
     @property
     def cache_identity(self) -> str:
         """Everything about this backend's configuration that shapes its SQL.
 
-        The model name and a fingerprint of the system prompt, which together
+        The model name, the system prompt and the few-shot pool, which together
         with the question and schema determine ``to_sql``'s output at
         ``temperature=0``. Satisfies :class:`nl2sql.cache.CacheableBackend`, and
         exists so that ``cache`` never has to reach into this class to discover
-        how it is configured.
+        how it is configured. See :func:`build_cache_identity` for the shape.
 
         The *repair* prompt is deliberately excluded: repairs are not cached, so
         including it would invalidate every stored entry on an edit that cannot
         change any of them.
         """
-        return f"{self._model}/{_prompt_fingerprint(_SYSTEM_PROMPT)}"
+        return build_cache_identity(self._model, self._examples)
 
     def to_sql(self, question: str, schema: str) -> str:
         resp = self._client.chat.completions.create(
@@ -195,7 +256,10 @@ class LLMBackend:
             temperature=0,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": f"Schema:\n{schema}\n\nQuestion: {question}"},
+                {
+                    "role": "user",
+                    "content": build_user_message(question, schema, self._examples),
+                },
             ],
         )
         sql = resp.choices[0].message.content or ""
@@ -215,6 +279,12 @@ class LLMBackend:
         conversation history so this call is stateless: one repair is
         independent of any other, which keeps it cheap to reason about and
         makes the backend safe to reuse across questions.
+
+        Few-shot examples are deliberately left out of this prompt. A repair is
+        driven by an error naming something specific — a column that does not
+        exist, a function SQLite does not have — and a neighbouring example is a
+        far vaguer signal than that; spending the context on examples would
+        dilute the one input that makes the rewrite work.
 
         This method has no authority of its own. Whatever it returns goes back
         through the same validator and read-only connection as the first
@@ -245,8 +315,15 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def get_backend(use_llm: bool) -> Backend:
-    """Factory: pick the LLM backend when requested, else offline."""
+def get_backend(use_llm: bool, examples: Sequence[Example] = ()) -> Backend:
+    """Factory: pick the LLM backend when requested, else offline.
+
+    ``examples`` is a few-shot pool for the LLM prompt. The offline backend has
+    no prompt — it matches regexes against a fixed catalog — so it ignores the
+    pool rather than failing on it. The CLI rejects ``--examples`` without
+    ``--llm`` up front, which is where the combination can be explained instead
+    of merely refused.
+    """
     if use_llm:
-        return LLMBackend()
+        return LLMBackend(examples=examples)
     return OfflineBackend()

@@ -106,6 +106,45 @@ export OPENAI_API_KEY=sk-...
 python -m nl2sql.cli ask "Which 5 customers spent the most last year?" --llm
 ```
 
+### Few-shot examples for the LLM prompt
+
+LLM mode is zero-shot by default: the model gets the rendered schema and the
+question, and nothing else. `--examples` points it at a JSONL file of solved
+`{"question": ..., "sql": ...}` pairs, and the three nearest to your question
+are included in the prompt as worked examples.
+
+```bash
+python -m nl2sql.cli ask "Revenue by category last quarter" --llm \
+  --examples my_solved_queries.jsonl
+```
+
+Examples are picked **per question**, using the same content-word similarity
+that powers the "Did you mean" suggestions, so a question about categories is
+shown category queries rather than whatever sits at the top of the file. What
+they buy you is the conventions the schema text cannot state — that revenue is
+`quantity * unit_price` off `order_items`, that a month is
+`strftime('%Y-%m', o.order_date)`, that totals are rounded to two places.
+
+Two things are worth knowing before you use it:
+
+- **Your question is never shown as its own example.** If the file contains the
+  question you just asked, that row is dropped, so a pool cannot quietly turn a
+  generation into a lookup.
+- **Do not point `--examples` at `evals/gold.jsonl` and then score the LLM
+  backend.** The self-exclusion above removes the exact row; it cannot remove
+  the near-neighbour rows, and those are what make few-shot work. The score
+  would go up and would mean nothing — it would be measuring recall of the
+  examples, not text-to-SQL. The harness itself passes no pool, so a plain
+  `python evals/evaluate.py --llm` is uncontaminated.
+
+The SQL cache follows your examples: the pool is folded into the cache key, so
+swapping example files regenerates the SQL instead of replaying an answer
+written from different examples. A run with no `--examples` is keyed exactly as
+it was before the flag existed, so nothing already cached is orphaned. The key
+covers the pool you pass and the wording of the prompt, not the code that ranks
+examples — retuning that ranking is a code change, and like any code change it
+wants `--no-cache` or a deleted `data/sql_cache.json`.
+
 ### The offline question catalog
 
 Matching is **first-rule-wins**, so specific patterns are registered ahead of

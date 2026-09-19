@@ -176,13 +176,15 @@ def test_ask_returns_504_when_the_query_outruns_its_deadline(client):
 
 @needs_db
 def test_ask_ignores_unknown_parameters_rather_than_honouring_them(client):
-    """`db` and `llm` must not be wired up by a later edit.
+    """`db`, `llm` and `examples` must not be wired up by a later edit.
 
-    Both are deliberate omissions: `db` would make this an arbitrary-file
-    reader for anyone who can reach the port, and `llm` would let an
-    unauthenticated query string spend money. FastAPI drops query parameters
-    the signature does not declare, so passing them is inert today — this test
-    is what fails if someone declares them.
+    All three are deliberate omissions: `db` would make this an arbitrary-file
+    reader for anyone who can reach the port, `llm` would let an
+    unauthenticated query string spend money, and `examples` would be `db`
+    again with a different extension — a caller-supplied path to any JSONL the
+    server process can open. FastAPI drops query parameters the signature does
+    not declare, so passing them is inert today — this test is what fails if
+    someone declares them.
     """
     body = client.get(
         "/ask",
@@ -190,6 +192,7 @@ def test_ask_ignores_unknown_parameters_rather_than_honouring_them(client):
             "q": "How many customers do we have?",
             "db": "/etc/passwd",
             "llm": "true",
+            "examples": "/etc/passwd",
         },
     ).json()
     assert body["rows"] == [[120]]
@@ -291,3 +294,26 @@ def test_openapi_schema_documents_every_route(client):
     """The generated schema is the contract this service publishes."""
     paths = client.get("/openapi.json").json()["paths"]
     assert {"/health", "/ask", "/explain", "/rules"} <= set(paths)
+
+
+def test_no_route_declares_a_withheld_parameter(client):
+    """The withheld parameters stay withheld on *every* route, not just /ask.
+
+    The inert-parameter test above can only speak for the endpoint it calls,
+    and `/explain` is the one most likely to drift: unlike `/ask` it has a
+    CLI counterpart that does take `--examples`, so wiring it up here would
+    feel like closing a gap rather than opening one. Reading the published
+    schema catches that on whichever route it appears, and catches a path
+    parameter or request body as readily as a query string.
+    """
+    paths = client.get("/openapi.json").json()["paths"]
+    declared = {
+        (path, param["name"])
+        for path, operations in paths.items()
+        for operation in operations.values()
+        for param in operation.get("parameters", [])
+    }
+    withheld = {
+        name for _, name in declared if name in {"db", "llm", "examples"}
+    }
+    assert not withheld, f"withheld parameters are now declared: {sorted(withheld)}"

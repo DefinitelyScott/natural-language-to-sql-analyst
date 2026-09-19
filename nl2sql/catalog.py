@@ -36,11 +36,10 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 
+from .examples import similarity
 from .llm import OfflineBackend
 
 
@@ -129,65 +128,6 @@ def answerable_questions(entries: Iterable[CatalogEntry]) -> list[str]:
     return [entry.example for entry in entries if entry.example is not None]
 
 
-#: Words dropped before comparing a question against the catalog. Deliberately
-#: only closed-class filler — question words, articles, auxiliaries and the
-#: imperatives the catalog phrases examples with. Nothing that carries analytical
-#: meaning is listed, so "revenue", "month" and "customers" always count.
-_STOPWORDS = frozenset(
-    """
-    a an and are as at be by can do does for from get give had has have how i in
-    into is it list many me much of on or our please show that the there to us
-    was we were what whats when which who whom whose will with
-    """.split()
-)
-
-_WORD = re.compile(r"[a-z0-9]+")
-
-
-def _content_tokens(text: str) -> frozenset[str]:
-    """Lowercase ``text`` and return its meaning-carrying word tokens.
-
-    Punctuation is discarded rather than split on, so "month-over-month" and
-    "month over month" tokenize identically — the catalog's examples and a
-    user's phrasing differ that way often enough to matter.
-
-    A one-letter alphabetic token is dropped as well. Those are not words: they
-    are the fragments splitting on punctuation leaves behind ("haven't" ->
-    "haven", "t"), and matching two questions on a shared "t" would be noise.
-    A one-character *digit* is kept, because "top 5 products" means something by
-    the 5.
-    """
-    tokens = {
-        token
-        for token in _WORD.findall(text.lower())
-        if len(token) > 1 or token.isdigit()
-    }
-    return frozenset(tokens) - _STOPWORDS
-
-
-def _similarity(question: str, candidate: str) -> tuple[float, float]:
-    """Score ``candidate`` against ``question``: (token overlap, character ratio).
-
-    The primary score is Jaccard overlap of content words, which is what makes
-    the ranking readable — a suggestion is offered because it talks about the
-    same *things*, and anyone can verify that by eye. Word order is ignored
-    because "revenue by region" and "region revenue" are the same request.
-
-    The character-level ratio is a tiebreaker only. Token overlap is coarse and
-    ties are common once the catalog has forty-odd entries phrased from the same
-    small vocabulary; without a second key the winner would come down to
-    alphabetical order, which carries no information. It is not used as the
-    primary score because it rewards incidental shared characters — a long
-    candidate can beat a short exact-topic match on raw string similarity.
-    """
-    question_tokens = _content_tokens(question)
-    candidate_tokens = _content_tokens(candidate)
-    union = question_tokens | candidate_tokens
-    overlap = len(question_tokens & candidate_tokens) / len(union) if union else 0.0
-    ratio = SequenceMatcher(None, question.lower(), candidate.lower()).ratio()
-    return overlap, ratio
-
-
 def suggest_questions(
     question: str, candidates: Iterable[str], *, limit: int = 3
 ) -> list[str]:
@@ -202,6 +142,10 @@ def suggest_questions(
 
     Duplicate candidates are collapsed, keeping first occurrence. Ordering is
     fully deterministic: score, then tiebreak ratio, then the question text.
+
+    Scoring is :func:`nl2sql.examples.similarity`, shared with the few-shot
+    selector so the two rankings cannot drift apart — what this offers a user as
+    the nearest question is what that offers a model as the nearest example.
     """
     seen: set[str] = set()
     scored: list[tuple[float, float, str]] = []
@@ -209,7 +153,7 @@ def suggest_questions(
         if candidate in seen:
             continue
         seen.add(candidate)
-        overlap, ratio = _similarity(question, candidate)
+        overlap, ratio = similarity(question, candidate)
         if overlap > 0.0:
             scored.append((overlap, ratio, candidate))
 

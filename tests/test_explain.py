@@ -98,7 +98,9 @@ def test_explain_reports_unsafe_sql_instead_of_raising(
         def to_sql(self, question: str, schema: str) -> str:
             return "DELETE FROM orders"
 
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: WritingBackend())
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): WritingBackend()
+    )
     exp = generator.explain_question(DB, "delete everything")
 
     assert not exp.is_safe
@@ -129,7 +131,9 @@ def test_explain_command_exits_nonzero_on_unsafe_sql(
         def to_sql(self, question: str, schema: str) -> str:
             return "DROP TABLE orders"
 
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: WritingBackend())
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): WritingBackend()
+    )
     assert cli.main(["explain", "drop the orders table", "--db", DB]) == 1
 
     captured = capsys.readouterr()

@@ -84,7 +84,9 @@ def use_backend(monkeypatch):
     """Return a helper that installs a stub as the backend ``_resolve`` builds."""
 
     def install(backend):
-        monkeypatch.setattr(llm, "get_backend", lambda use_llm: backend)  # noqa: ARG005
+        monkeypatch.setattr(
+            llm, "get_backend", lambda use_llm, examples=(): backend  # noqa: ARG005
+        )
         return backend
 
     return install

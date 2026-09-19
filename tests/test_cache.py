@@ -376,21 +376,32 @@ def test_llm_backend_identity_covers_model_and_system_prompt(
 ) -> None:
     """Editing the system prompt must invalidate everything cached under it.
 
-    ``LLMBackend.__init__`` builds an OpenAI client, so the identity property is
-    read off an uninitialised instance with the one field it actually depends on
-    set by hand — the alternative is a network dependency in a unit test.
+    Exercised through ``llm.build_cache_identity`` rather than the property, so
+    no client is constructed and the test needs neither an API key nor the
+    ``openai`` package. The property is a one-line delegation to it;
+    ``tests/test_examples.py`` covers the few-shot half of the same string.
     """
-    backend = llm.LLMBackend.__new__(llm.LLMBackend)
-    backend._model = "gpt-4o-mini"
-
-    before = backend.cache_identity
+    before = llm.build_cache_identity("gpt-4o-mini")
     assert before.startswith("gpt-4o-mini/")
 
     monkeypatch.setattr(llm, "_SYSTEM_PROMPT", "a different system prompt")
-    assert backend.cache_identity != before
+    assert llm.build_cache_identity("gpt-4o-mini") != before
 
-    backend._model = "some-other-model"
-    assert not backend.cache_identity.startswith("gpt-4o-mini/")
+    assert not llm.build_cache_identity("some-other-model").startswith("gpt-4o-mini/")
+
+
+def test_llm_backend_identity_property_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The property really is the module function, not a second implementation.
+
+    ``LLMBackend.__init__`` builds an OpenAI client, so the property is read off
+    an uninitialised instance with the two fields it depends on set by hand —
+    the alternative is a network dependency in a unit test.
+    """
+    backend = llm.LLMBackend.__new__(llm.LLMBackend)
+    backend._model = "gpt-4o-mini"
+    backend._examples = ()
+
+    assert backend.cache_identity == llm.build_cache_identity("gpt-4o-mini")
 
 
 # --------------------------------------------------------------------------
@@ -417,7 +428,9 @@ def test_generator_reports_a_cache_hit_on_the_explanation(
     monkeypatch: pytest.MonkeyPatch, redirected_cache: None
 ) -> None:
     backend = IdentifiedBackend("SELECT 1")
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: backend)  # noqa: ARG005
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): backend  # noqa: ARG005
+    )
 
     first = generator.explain_question(DB, "q", use_llm=True, use_cache=True)
     second = generator.explain_question(DB, "q", use_llm=True, use_cache=True)
@@ -437,7 +450,9 @@ def test_no_cache_bypasses_both_the_read_and_the_write(
     user disabling the cache is asking for.
     """
     backend = IdentifiedBackend("SELECT 1")
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: backend)  # noqa: ARG005
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): backend  # noqa: ARG005
+    )
 
     generator.explain_question(DB, "q", use_llm=True, use_cache=False)
     assert not os.path.exists(cache.DEFAULT_CACHE_PATH)
@@ -473,7 +488,9 @@ def test_ask_discloses_a_replay_on_stderr(
     ``--format csv`` file.
     """
     backend = IdentifiedBackend("SELECT COUNT(*) AS n FROM orders")
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: backend)  # noqa: ARG005
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): backend  # noqa: ARG005
+    )
     command = ["ask", "how many orders", "--db", DB, "--llm"]
 
     assert cli.main(command) == 0
@@ -496,7 +513,9 @@ def test_explain_names_the_cache_as_the_source(
     redirected_cache: None,
 ) -> None:
     backend = IdentifiedBackend("SELECT COUNT(*) AS n FROM orders")
-    monkeypatch.setattr(llm, "get_backend", lambda use_llm: backend)  # noqa: ARG005
+    monkeypatch.setattr(
+        llm, "get_backend", lambda use_llm, examples=(): backend  # noqa: ARG005
+    )
     command = ["explain", "how many orders", "--db", DB, "--llm"]
 
     assert cli.main(command) == 0

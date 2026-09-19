@@ -12,12 +12,21 @@ It is deliberately thin. Every endpoint delegates to the same
 the HTTP surface cannot drift from the command-line one, and nothing here knows
 how to build or execute SQL.
 
-Five decisions worth stating, because they are the ones the design turns on:
+Six decisions worth stating, because they are the ones the design turns on:
 
 * **Offline backend only.** There is no ``llm=true`` parameter. Adding one
   would let an unauthenticated query string spend money on model calls, and
   this service has no authentication to gate that behind. The CLI keeps
   ``--llm`` because the person typing it is the person paying.
+
+* **No few-shot pool either.** The CLI's ``--examples`` (see
+  :mod:`nl2sql.examples`) has no counterpart here, for two independent
+  reasons. It would be inert: examples shape the *model* prompt, and the
+  decision above means no model is ever called. And the obvious way to expose
+  it — a path in the query string — is the ``?db=`` mistake below wearing a
+  different extension, letting anyone who can reach the port read any JSONL
+  file the server process can open. If this surface ever grows an LLM mode, the
+  pool belongs to :func:`create_app` alongside the database, not to the caller.
 
 * **The database is fixed at startup** — by :func:`create_app` or the
   ``NL2SQL_DB`` environment variable, never by the request. A ``?db=``

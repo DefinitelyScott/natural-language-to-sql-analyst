@@ -283,6 +283,53 @@ same way the user's just did would be worse than suggesting nothing. When
 nothing overlaps, nothing is offered — a list padded to a fixed length reads as
 a guess and costs the reader a check per entry.
 
+The scoring itself lives in `nl2sql/examples.py`, shared with the few-shot
+selector.
+
+### `nl2sql/examples.py`
+
+Example questions: loading them, and ranking them against a question.
+
+Two callers want the same operation. `nl2sql.catalog.suggest_questions` ranks
+the offline catalog's examples to build the "Did you mean" line; the LLM backend
+ranks a pool of solved `(question, sql)` pairs to pick the few-shot examples it
+shows the model. `nl2sql.examples.similarity` is the one implementation, so a
+phrasing the suggester treats as close is the same phrasing the prompt builder
+treats as close.
+
+Few-shot selection is **per question**, not a fixed header:
+`nl2sql.examples.select_examples` returns the nearest
+`nl2sql.examples.DEFAULT_LIMIT` pool entries, so a question about categories is
+shown category queries. Examples communicate what the rendered schema cannot —
+that revenue is `quantity * unit_price`, that a month is `strftime('%Y-%m', …)`
+— which is why a pool is worth its tokens at all.
+
+Two constraints shape the rest of the module:
+
+* **The asked question is excluded from its own prompt.** A pool that happens to
+  contain the question would otherwise turn a generation into a lookup with
+  nothing in the output to say so. This is a last-line defence, not a licence: a
+  pool drawn from an evaluation gold set still leaks its *neighbours*, which is
+  exactly what makes few-shot work and exactly what makes the resulting score
+  meaningless. `evals/evaluate.py` therefore passes no pool, and the
+  `--examples` help text says why.
+* **The cache key covers the prompt's inputs, not the selection code.**
+  `nl2sql.examples.pool_fingerprint` digests the pool's contents and the header
+  that introduces them, and `nl2sql.llm.build_cache_identity` folds that in.
+  Those are the two things that can change with no code change — a caller swaps
+  files, or someone rewords the instruction — so a key blind to either would
+  replay SQL written under a different prompt. What it does *not* cover is the
+  selection code itself: retuning `nl2sql.examples.similarity` can change which
+  examples an unchanged pool yields, and no runtime digest can see that. It is a
+  code change, and it gets the remedy every code change gets — delete the cache
+  file or pass `--no-cache`. Drawing that line explicitly is the point; the same
+  limit applies to the system prompt's neighbours and is worth stating rather
+  than papering over. The pool is sorted before hashing, because a reordered
+  pool selects identically and hashing it differently would orphan entries that
+  are still correct. With no pool the few-shot segment is omitted entirely, so
+  `nl2sql.llm.build_user_message` and the cache identity are both byte-identical
+  to what they were before this module existed.
+
 ### `nl2sql/cli.py`
 
 Argument parsing and presentation only; it holds no analytical logic.

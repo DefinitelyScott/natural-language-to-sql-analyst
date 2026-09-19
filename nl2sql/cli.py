@@ -14,6 +14,7 @@ import os
 import sys
 
 from . import catalog, generator, llm, output, runner, schema
+from .examples import DEFAULT_LIMIT, Example, load_examples
 from .runner import QueryTimeoutError, UnsafeQueryError
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -30,6 +31,10 @@ _TABLE_PREVIEW_ROWS = 20
 # catalog, so requiring a built database to list it would be a false dependency.
 _NEEDS_DB = frozenset({"ask", "explain", "schema"})
 
+# Commands that accept --examples. Both are generation commands; `rules` and
+# `schema` never build a prompt, so the flag would have nothing to act on.
+_TAKES_EXAMPLES = frozenset({"ask", "explain"})
+
 # Shared help for --no-cache. Caching is on by default here even though the
 # library defaults it off: the cache file belongs to the person running the
 # command, and paying for a model call they have already paid for is not a
@@ -39,6 +44,19 @@ _NO_CACHE_HELP = (
     "do not read or write the local SQL cache; regenerate the query even if an "
     "identical question, schema, model and prompt were answered before "
     "(--llm only — offline SQL is never cached)"
+)
+
+# Shared help for --examples. The warning is carried in `--help` rather than
+# only in the README because the mistake it describes — measuring the model on
+# questions it was just shown the answers to — produces a *better* score, so
+# nothing about the run itself would prompt anyone to go looking for it.
+_EXAMPLES_HELP = (
+    "JSONL file of solved {\"question\", \"sql\"} pairs to draw few-shot "
+    "examples from for the model prompt (--llm only). The "
+    f"{DEFAULT_LIMIT} most similar to your question are included; the question "
+    "itself is excluded if the file contains it. Do NOT point this at "
+    "evals/gold.jsonl while scoring the LLM backend with evals/evaluate.py — "
+    "that measures recall of the examples, not text-to-SQL."
 )
 
 
@@ -161,6 +179,7 @@ def main(argv: list[str] | None = None) -> int:
     ask.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
     ask.add_argument("--llm", action="store_true", help="use the LLM backend")
     ask.add_argument("--no-cache", action="store_true", help=_NO_CACHE_HELP)
+    ask.add_argument("--examples", metavar="PATH", help=_EXAMPLES_HELP)
     ask.add_argument("--max-rows", type=int, default=1000)
     ask.add_argument(
         "--timeout-ms",
@@ -203,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     why.add_argument("--db", default=_DEFAULT_DB, help="path to the SQLite database")
     why.add_argument("--llm", action="store_true", help="use the LLM backend")
     why.add_argument("--no-cache", action="store_true", help=_NO_CACHE_HELP)
+    why.add_argument("--examples", metavar="PATH", help=_EXAMPLES_HELP)
 
     rules = sub.add_parser(
         "rules",
@@ -278,6 +298,29 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    few_shot: list[Example] = []
+    if args.command in _TAKES_EXAMPLES and args.examples:
+        # Refused rather than ignored. `--examples` without `--llm` is not a
+        # harmless no-op from the user's side: they asked for examples, got an
+        # answer, and have no way to tell the examples were never used.
+        if not args.llm:
+            print(
+                "Error: --examples shapes the model prompt and needs --llm. "
+                "The offline backend answers by matching rules, not by reading "
+                "examples.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            few_shot = load_examples(args.examples)
+        except (OSError, ValueError) as exc:
+            # Fatal, unlike the malformed gold file `rules` tolerates. There the
+            # examples decorate an answer that stands without them; here they
+            # are what the user asked to change the prompt with, so continuing
+            # would silently answer a different question than the one posed.
+            print(f"Error: could not read --examples ({exc})", file=sys.stderr)
+            return 2
+
     if args.command == "rules":
         # A missing or malformed gold file costs the listing its examples, not
         # the listing itself: the rules are the answer and they come from the
@@ -314,6 +357,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.question,
                 use_llm=args.llm,
                 use_cache=not args.no_cache,
+                examples=few_shot,
             )
         except llm.NoRuleMatchError as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -336,6 +380,7 @@ def main(argv: list[str] | None = None) -> int:
             # 0, so the intent has to be stated here rather than fall out of a
             # falsy value someone passed by accident.
             timeout_ms=args.timeout_ms or None,
+            examples=few_shot,
         )
     except llm.NoRuleMatchError as exc:
         # Handled ahead of the general ValueError clause below, which it
