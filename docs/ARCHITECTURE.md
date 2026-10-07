@@ -411,6 +411,11 @@ Tests are grouped by the invariant they defend, not by module:
   `test_suggestions.py`.
 * **Catalog invariants** — `test_rule_catalog.py` pins one gold question per
   rule and asserts no rule is unreachable or shadowed into inertness.
+  `test_shadowing.py` covers the same overlap from the question's side: it
+  records every gold question that more than one rule claims, so the places
+  where an answer depends on catalog order are enumerated rather than
+  discovered. The first asks whether a rule ever wins; the second asks which
+  rules lost, and to whom.
 * **Harness correctness** — `test_evaluate.py`, `test_report_comparison.py`.
   The thing that grades the system needs grading too; a harness that scores a
   wrong answer as correct is worse than no harness.

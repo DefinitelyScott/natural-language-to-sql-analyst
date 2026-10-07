@@ -176,10 +176,26 @@ read as a distribution and the alternative is doing that division by eye.
 each region place?" and "how many products are in each category?" are recorded
 as questions the catalog must *decline*.
 
+A third guard, `_DESCENDING_ONLY`, covers the same failure along the ranking
+axis. The top-products rule matched `products?.*by revenue` and the
+top-customers rule matched `customers?.*spent`, so "what are the bottom 5
+products by revenue?" came back as the five *best* products and "which
+customers spent the least?" as the five biggest spenders. Both leaderboards now
+decline any question carrying an ascending-rank word (bottom, worst, least,
+lowest, fewest, smallest, weakest). The low end of the product ranking gets its
+own rule; the customer one has none yet, so it is declined, and
+`precision.jsonl` records it, along with "at least $1,000 in sales" (a
+threshold, not a ranking) and the bottom products *by units*.
+
 **Group-by breakdowns** — revenue by category, by region, and by region ×
-category; top products by revenue; best-selling product by units, both overall
-and within each category; each category's share of total revenue
-(`SUM(...) OVER ()`); category purchase penetration — the share of the buyer
+category; top products by revenue, and the bottom five — a `LEFT JOIN` from
+`products` with `COALESCE(..., 0)`, because at the low end the product that
+never sold is the most important row and an inner join would drop it;
+best-selling product by units, both overall and within each category; each category's share of total revenue
+(`SUM(...) OVER ()`); category breadth — how many distinct categories each customer has bought
+from, as a distribution (customers and share of buyers at each breadth level), which cuts the same
+purchase facts the other way round from penetration: on the sample data 92 of 115 buyers have bought
+from all four categories, so the thin 1-3 tail is the cross-sell opportunity; category purchase penetration — the share of the buyer
 base that bought from each category, which is the *reach* complement of that
 revenue share and can disagree with it (a cheap add-on can touch nearly every
 customer off a thin slice of revenue, and a big-ticket line can do the reverse).
@@ -233,7 +249,7 @@ dimensions and still returning a plausible-looking table); cumulative
 running-total revenue by month (an explicit `ROWS BETWEEN UNBOUNDED PRECEDING
 AND CURRENT ROW` frame); a 7-day moving average of daily revenue (a *bounded*
 `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` frame over a gap-free calendar spine
-— the catalog's only recursive CTE and only `LEFT JOIN`; without the spine's
+— the catalog's only recursive CTE; without the spine's
 zero-filled days, a rows-based frame would silently span more than a week
 whenever a day had no orders); the top-spending customer within each region (a
 partitioned greatest-N-per-group ranking via `ROW_NUMBER()`); customer spend
@@ -344,6 +360,13 @@ long the ones who did took to get there. It is the only pattern anchored on
 signups in, and the only one whose join has to be a `LEFT JOIN` — a customer who
 never ordered is precisely the numerator's complement, and an inner join would
 drop them and report 100% activation for every month.
+
+**Peaks and troughs** — best and worst month by revenue, returned as one
+two-row result ("highest" and "lowest") whichever end the question names, so a
+"worst month" question can never be answered with the best one. It declines
+rather than guesses when the question is scoped to a year, a category, a region
+or a different measure (growth, average order value), because the SQL ranks
+total revenue over every month on record and would otherwise ignore the scope.
 
 Two reading caveats are inherent to the metric rather than to this
 implementation, and both are why the report is split by cohort instead of
@@ -502,9 +525,9 @@ python -m nl2sql.cli explain "How many customers have never ordered?"
 Question: How many customers have never ordered?
 Backend:  offline
 
-Matched offline rule #25: customers?\b[^?]*\bnever\b[^?]*\b(?:order(?:ed)?|bought|buy|purchased?)\b|...
+Matched offline rule #27: customers?\b[^?]*\bnever\b[^?]*\b(?:order(?:ed)?|bought|buy|purchased?)\b|...
 Also matched (shadowed, in catalog order):
-  #26: \A(?!...).*how many (?:customers|users)
+  #29: \A(?!...).*how many (?:customers|users)
 
 SQL (not executed):
   SELECT c.id AS customer_id, c.name AS name, c.signup_date AS signup_date, ... WHERE NOT EXISTS (...)
@@ -774,7 +797,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 53 questions  |  execution accuracy: 53/53 (100%)  [offline backend]
+Evaluated 57 questions  |  execution accuracy: 57/57 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -816,8 +839,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 53,
-  "passed": 53,
+  "total": 57,
+  "passed": 57,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -897,20 +920,20 @@ A record may instead carry a `known_gap` — a phrasing the catalog does *not*
 reach today, with the reason:
 
 ```json
-{"canonical": "Show revenue by region", "paraphrase": "Break down revenue per region",
- "known_gap": "the region rule accepts only 'by region', while the category rule accepts 'by' or 'per'"}
+{"canonical": "Which customers have never placed an order?", "paraphrase": "Show customers with no orders.",
+ "known_gap": "the rule requires the explicit word 'never'; a bare 'no orders' also reads as 'none in the window', which the at-risk rule owns"}
 ```
 
 Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **49 gating pairs and
-10 known gaps**:
+can never improve the headline. The set currently holds **61 gating pairs and
+6 known gaps**:
 
 ```
-Paraphrase robustness: 49/49 rephrasings route to the canonical rule
-  Known gaps (not gating): 10
+Paraphrase robustness: 61/61 rephrasings route to the canonical rule
+  Known gaps (not gating): 6
 ```
 
 Every rule the gold set reaches carries at least one rephrasing, and
@@ -943,15 +966,15 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 50/53 gold queries are written independently of the rule they test
+Gold independence: 54/57 gold queries are written independently of the rule they test
   Self-comparing (not gating): 3 — these prove the SQL runs, not that it answers the question
-    [COPY] rule #27: How many customers do we have?
-    [COPY] rule #51: How many orders do we have?
-    [COPY] rule #52: How many products are in the catalog?
+    [COPY] rule #29: How many customers do we have?
+    [COPY] rule #54: How many orders do we have?
+    [COPY] rule #56: How many products are in the catalog?
 ```
 
 So three rows of the 100% above are still self-referential, and the honest
-reading of the headline is "53/53, of which 50 are real comparisons". Publishing
+reading of the headline is "57/57, of which 54 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
@@ -965,7 +988,7 @@ answer by a different route: restating `COUNT(*) FROM products` as
 second opinion, which raises the ratio while proving nothing.
 
 That is exactly what the three remaining rows are, and it is why this number
-stops at 50/53 rather than climbing to 53/53. "How many rows are in this table"
+stops at 54/57 rather than climbing to 57/57. "How many rows are in this table"
 has one honest formulation; the second one needed to clear the comparison would
 be the same query wearing a different function name, and the two could not
 disagree about a primary key however wrong the rule became. The backlog is at
@@ -1023,6 +1046,70 @@ higher than the one printed. And independence is a property of the *offline*
 run only; under `--llm` the model writes its own SQL and cannot copy a gold query
 it never saw, so the check is skipped rather than reported as vacuously perfect.
 
+### Catalog shadowing
+
+The offline backend routes by **first match** over an ordered list of regexes.
+When a question matches one rule, order is irrelevant. When it matches several,
+the answer is decided by which of them was registered first — and none of the
+three checks above can see that. Execution accuracy compares the winner's output
+against gold and never asks who else was in the running. The precision guard
+only looks at questions that must match *nothing*. The paraphrase set only asks
+whether two phrasings agree with each other, which they will whether or not a
+third rule is one line away from taking both.
+
+So the harness also reports, for every gold question, every rule it matches
+rather than only the winner:
+
+```
+Catalog shadowing: 48/57 gold questions match exactly one rule
+  Order-dependent (not gating): 9 — these reach the right rule only because it is registered first
+    [SHADOWED] Show revenue by region and category.
+        also matched by rule #21: Show revenue by category
+        also matched by rule #41: Show revenue by region
+    [SHADOWED] How much revenue comes from new vs returning customers?
+        also matched by rule #39: How many repeat customers are there?
+        also matched by rule #53: What is the total revenue?
+```
+
+Nine of the fifty-six are decided this way, and **none of them is a bug**. In
+every case the answering rule's pattern is strictly more demanding than the ones
+behind it — "average order value *by region*" ahead of "average order value",
+"revenue by category *with a total row*" ahead of "revenue by category" — which
+is the ordering the catalog is supposed to have. Specific before general is the
+reason first-match resolution works at all. Reporting them is not an admission;
+it is the list of places where that discipline is load-bearing.
+
+Two are worth a closer look, because a mis-ordering there would not merely
+coarsen the answer, it would change its subject:
+
+- **"How much revenue comes from new vs returning customers?"** also matches the
+  repeat-customer rule, which counts customers, and the total-revenue rule,
+  which returns one grand total. The latter's unscoped/ungrouped guards do not
+  decline this phrasing, because the split is expressed as "new vs returning"
+  rather than as a year or a `by <dimension>` clause they know to look for.
+- **"What share of customers bought from each category?"** also matches the
+  revenue-share-by-category rule. Both are "a percentage per category"; they
+  differ only in the denominator, so the wrong one returns a table of the right
+  shape with the right column names and the wrong meaning.
+
+Like gold independence this is a **ratchet, not a gate**.
+`tests/test_shadowing.py` records the nine by name — naming the losing rules by
+*their* gold questions rather than by index, so inserting a rule does not
+invalidate the record — and fails when the overlap set grows, including when a
+question already on the list picks up a third claimant. The usual way that
+happens is a pattern widened to catch a phrasing variant, which also widens it
+across an older rule's question: nothing fails, the older question keeps working
+only because of where the two happen to sit, and the dependency surfaces months
+later when someone reorders the catalog for an unrelated reason. Each entry
+carries a rationale saying what the rule behind it would have answered instead,
+because "this overlap is correct ordering rather than a latent bug" is a
+judgement, and an unexplained baseline is just a list of overlaps nobody has
+looked at.
+
+The check needs no database and no schema — shadowing is a property of the
+patterns and their order — and it is offline-only, since an LLM has no rule
+catalog to order.
+
 ### What counts as a matching result
 
 Two details decide whether the reported accuracy is meaningful:
@@ -1034,7 +1121,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 38 of the 53 gold questions
+  `"ordered": true` and are compared as returned. 42 of the 57 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL
@@ -1053,6 +1140,22 @@ pytest -q
 ruff check .   # same config CI runs, from pyproject.toml
 mypy           # --strict over nl2sql/, evals/, scripts/; config in pyproject.toml
 ```
+
+The whole suite runs with no API key, no network and without the `openai`
+package installed — including the tests for the backend that uses all three.
+`LLMBackend` reads `OPENAI_API_KEY` and lazily imports `openai` inside its
+constructor, and `tests/test_llm_backend.py` installs a fake `openai` module in
+`sys.modules` so that import resolves to a recorder. The alternative was to add
+a `client` parameter to the constructor, which would put a seam in shipped code
+that exists only for tests; the lazy import is already a seam.
+
+That matters because the request itself is the thing worth pinning. Everything
+that decides what the model is asked — which of the two system prompts is used,
+`temperature=0`, the message order, whether few-shot examples are attached — is
+assembled in `to_sql` and `repair`, and before those tests existed it was
+asserted only by stubs that *stand in for* the class rather than exercise it. A
+stub agreeing with itself proves nothing about the real request. None of this
+claims the model writes good SQL; that is what `evals/` measures.
 
 The shipped code type-checks clean under `mypy --strict`, enforced by CI as its
 own job against the oldest supported interpreter. That is a gate rather than a

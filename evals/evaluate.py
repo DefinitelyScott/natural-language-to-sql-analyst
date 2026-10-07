@@ -54,6 +54,19 @@ executes but cannot show it answers what was asked. Those rows are reported, not
 hidden, for the same reason a known gap is — a headline of 100% should be read
 next to how much of it is self-referential.
 
+The shadowing check (:func:`check_shadowing`) measures a property of the
+*catalog's order* rather than of any single rule. Routing is first-match over an
+ordered list, so a question matching more than one pattern is answered by
+whichever of them happens to be registered first — and nothing in the other
+checks can see that. Execution accuracy stays at 100% while a question is
+resolved by a coin flip that was settled years ago by the order two rules were
+written in; the precision guard only looks at questions that must match
+*nothing*; the paraphrase set only compares two phrasings against each other.
+This check reports, for every gold question, every rule it matches rather than
+only the winner, so the questions whose answer rests on catalog order are named.
+Like the independence check it reports without gating, and the ratchet lives in
+``tests/test_shadowing.py``.
+
 Every question produces a :class:`QuestionResult` rather than just a pass/fail
 tally. A bare accuracy number tells you *that* a backend regressed; the per
 question record — the SQL it generated, whether the run errored or merely
@@ -257,6 +270,7 @@ def build_report(
     guards: list[GuardResult] | None = None,
     paraphrases: list[ParaphraseResult] | None = None,
     independence: list[IndependenceResult] | None = None,
+    shadowing: list[ShadowResult] | None = None,
 ) -> JsonRecord:
     """Assemble a JSON-serializable report from evaluated questions.
 
@@ -283,6 +297,12 @@ def build_report(
     is the point of carrying it in the report at all — the two are read
     together, and a consumer that keeps only the accuracy keeps the half of the
     picture that flatters the run.
+
+    ``shadowing`` is offline-only because it measures an ordered rule catalog,
+    which no LLM has. Its ``contested`` list carries the full match list per
+    question rather than a count, since the question a reader has on seeing the
+    number is always *which rules*, and recovering that from the archive would
+    otherwise mean re-running the matcher against the catalog of the day.
     """
     passed = sum(1 for result in results if result.passed)
     total = len(results)
@@ -314,6 +334,12 @@ def build_report(
             "checked": len(independence),
             "independent": sum(1 for item in independence if item.independent),
             "questions": [asdict(item) for item in independence],
+        }
+    if shadowing is not None:
+        report["shadowing"] = {
+            "checked": len(shadowing),
+            "single_match": sum(1 for item in shadowing if not item.contested),
+            "contested": [asdict(item) for item in shadowing if item.contested],
         }
     return report
 
@@ -658,6 +684,84 @@ def format_independence(results: list[IndependenceResult]) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------------------- #
+# Catalog shadowing: which questions are resolved only by rule order
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class ShadowResult:
+    """Every rule one gold question matches, in catalog order.
+
+    ``matched[0]`` is the rule that answers the question; anything after it
+    matched too and lost on position alone. An empty tuple means no rule matched
+    — already a hard ``ERROR`` in the accuracy run, and counted here as
+    uncontested rather than reported twice under a metric about rule order.
+    """
+
+    question: str
+    matched: tuple[int, ...]
+
+    @property
+    def contested(self) -> bool:
+        """Whether more than one rule claims this question."""
+        return len(self.matched) > 1
+
+
+def check_shadowing(
+    backend: llm.OfflineBackend, gold: list[JsonRecord]
+) -> list[ShadowResult]:
+    """Record every rule each gold question matches, not just the winner.
+
+    Reads routing directly rather than generating SQL: the question is which
+    patterns claim the question, and the answering rule's output says nothing
+    about the ones behind it. That also makes this the one check in the harness
+    that needs neither a database nor a schema.
+    """
+    return [
+        ShadowResult(record["question"], tuple(backend.matching_rule_indexes(record["question"])))
+        for record in gold
+    ]
+
+
+def shadow_examples(results: list[ShadowResult]) -> dict[int, str]:
+    """Map each rule index to the gold question that routes to it.
+
+    Derived from ``results`` rather than from the catalog module, because the
+    gold set holds one question per rule (pinned by
+    ``tests/test_rule_catalog.py``), so the winner of every question already
+    *is* that rule's example. Reading it back out of the same routing the check
+    just performed is what keeps the naming from disagreeing with the matching
+    it describes. A rule that no gold question reaches is simply absent.
+    """
+    return {item.matched[0]: item.question for item in results if item.matched}
+
+
+def format_shadowing(results: list[ShadowResult]) -> str:
+    """Render the shadowing outcome as a console block.
+
+    Names each losing rule by the gold question that routes to it rather than by
+    index alone, because "rule #50" does not tell you what would have been
+    answered instead, and "What is the total revenue?" does. A rule with no gold
+    question of its own falls back to its index.
+    """
+    examples = shadow_examples(results)
+    contested = [item for item in results if item.contested]
+    lines = [
+        f"Catalog shadowing: {len(results) - len(contested)}/{len(results)} gold "
+        f"questions match exactly one rule"
+    ]
+    if contested:
+        lines.append(
+            f"  Order-dependent (not gating): {len(contested)} — "
+            f"these reach the right rule only because it is registered first"
+        )
+        for item in contested:
+            lines.append(f"    [SHADOWED] {item.question}")
+            for index in item.matched[1:]:
+                name = examples.get(index, "(no gold question routes here)")
+                lines.append(f"        also matched by rule #{index}: {name}")
+    return "\n".join(lines)
+
+
 @dataclass(frozen=True)
 class ReportComparison:
     """How the per-question outcomes of two runs differ.
@@ -863,7 +967,17 @@ def main(argv: list[str] | None = None) -> int:
             offline, schema.schema_context(args.db), load_gold(GOLD_PATH)
         )
     )
-    report = build_report(results, backend_name, guards, paraphrases, independence)
+    # Offline-only because it measures the order of a rule catalog, which the
+    # LLM path does not have. Shares the gold file with the independence check
+    # above rather than threading one load through both: the read is cheap next
+    # to a per-question query pair, and keeping each check's inputs its own is
+    # what lets either be removed without disturbing the other.
+    shadowing = (
+        None if offline is None else check_shadowing(offline, load_gold(GOLD_PATH))
+    )
+    report = build_report(
+        results, backend_name, guards, paraphrases, independence, shadowing
+    )
 
     total, passed = report["total"], report["passed"]
     pct = round(100 * report["execution_accuracy"])
@@ -889,6 +1003,10 @@ def main(argv: list[str] | None = None) -> int:
     if independence is not None:
         print()
         print(format_independence(independence))
+
+    if shadowing is not None:
+        print()
+        print(format_shadowing(shadowing))
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as fh:
@@ -928,6 +1046,14 @@ def main(argv: list[str] | None = None) -> int:
     # fails the suite while the existing backlog stays visible rather than
     # blocking. That split also puts the two jobs where they belong — the harness
     # measures and reports, the test decides what is allowed to change.
+    #
+    # Shadowing does not gate either, and for a stronger reason than the
+    # backlog one above: a contested question is not by itself a defect. Nine of
+    # them are the ordinary consequence of a specific rule sitting ahead of the
+    # general rule it refines, which is the ordering the catalog is *supposed*
+    # to have. What would be a defect is a new one appearing unnoticed, and that
+    # is a change against a recorded baseline rather than a threshold — so it
+    # belongs in ``tests/test_shadowing.py``, which holds the baseline.
     return 0 if passed == total and not guard_failed and not routing_failed else 1
 
 

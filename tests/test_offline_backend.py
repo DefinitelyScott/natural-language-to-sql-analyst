@@ -3101,7 +3101,7 @@ def test_grouped_count_questions_do_not_fall_through_to_the_totals():
 
     for question in (
         "How many orders did each region place?",
-        "How many products are in each category?",
+        "How many orders were placed in each category?",
         "How many customers are in each category?",
     ):
         with pytest.raises(NoRuleMatchError):
@@ -3164,3 +3164,242 @@ def test_end_to_end_customer_count_by_region():
     # Largest region first, ties broken by name: four regions over one customer
     # table make an exact tie ordinary, and the gold row is compared row for row.
     assert rows == sorted(rows, key=lambda row: (-row[1], row[0]))
+
+
+# --- Synonym vocabulary widened to close documented paraphrase gaps ---------
+#
+# Four rules used a narrower vocabulary than the rest of the catalog, so
+# ordinary rephrasings fell through to no rule at all. Each was recorded as a
+# `known_gap` in evals/paraphrases.jsonl; these tests pin the closed behaviour
+# so the widening cannot silently regress, and -- more importantly -- pin the
+# rules the widening must NOT start swallowing.
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the total revenue?",
+        "What are our total sales?",
+        "What was our overall sales figure?",
+        "How much revenue did we make?",
+        "How much sales have we done?",
+    ],
+)
+def test_total_revenue_rule_treats_sales_as_a_synonym_for_revenue(question):
+    # "revenue|sales" already alternate freely elsewhere in the catalog; this
+    # rule was the exception. All five phrasings collapse order_items to a
+    # single unfiltered, ungrouped sum.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "SUM(oi.quantity * oi.unit_price)" in sql
+    assert "GROUP BY" not in sql.upper()
+    assert "WHERE" not in sql.upper()
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["What was total revenue in 2023?", "What were our total sales in 2023?"],
+)
+def test_widened_total_rule_still_declines_period_scoped_sales(question):
+    # The widening is only safe because of the _UNSCOPED_ONLY guard in front
+    # of it: this SQL sums every order item with no date filter, so answering
+    # a question that names a year would return a plausible, correctly
+    # labelled number for the wrong period. Adding "sales" to the vocabulary
+    # must not create a second way in past that guard.
+    with pytest.raises(NoRuleMatchError):
+        OfflineBackend().to_sql(question, schema="")
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["What were total sales by month in 2024?", "Show total sales by category."],
+)
+def test_widened_total_rule_does_not_shadow_grouped_sales_questions(question):
+    # _UNGROUPED_ONLY declines the same phrasing when it asks for a breakdown,
+    # which lets these fall through to the rules that do group. Asserting the
+    # SQL differs from the bare total is the point: a grouped question that
+    # silently collapsed to one all-time figure is the failure being guarded.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY" in sql.upper()
+    assert sql != OfflineBackend().to_sql("What is the total revenue?", schema="")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which 5 customers spent the most?",
+        "Who are our five biggest customers?",
+        "Show our largest customers.",
+        "Who are our top customers?",
+        "List the 10 biggest customers.",
+    ],
+)
+def test_top_spenders_rule_accepts_size_superlatives(question):
+    # This schema has no size attribute for a customer, so "biggest"/"largest"
+    # can only mean spend. The count is optional because the SQL always
+    # returns five rows -- including for "the 10 biggest customers", which is
+    # answered with a five-row leaderboard rather than declined.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "ORDER BY total_spent DESC" in sql
+    assert "LIMIT 5" in sql
+
+
+def test_concentration_question_outranks_the_widened_top_spenders_rule():
+    # The interesting interaction in this change. "How concentrated is revenue
+    # among our biggest customers?" now matches *both* rules: the Pareto rule
+    # on "concentrated", and the top-spenders rule on "biggest customers".
+    # First-match resolution decides, and the Pareto rule is registered first
+    # -- without that ordering this question would return a plain top-5 list
+    # and answer something the user did not ask.
+    concentration = OfflineBackend().to_sql(
+        "How concentrated is revenue among our biggest customers?", schema=""
+    )
+    top_spenders = OfflineBackend().to_sql(
+        "Who are our five biggest customers?", schema=""
+    )
+    assert "NTILE(5)" in concentration
+    assert "NTILE" not in top_spenders
+    assert concentration != top_spenders
+
+
+def test_concentration_adjective_and_noun_reach_the_same_rule():
+    # The predicative phrasing puts the adjective before its subject, which
+    # neither noun alternative could reach; both word orders are spelled out.
+    noun = OfflineBackend().to_sql("Show revenue concentration.", schema="")
+    adjective = OfflineBackend().to_sql("How concentrated is revenue?", schema="")
+    assert noun == adjective
+
+
+@pytest.mark.parametrize(
+    "question",
+    ["Show revenue by region", "Break down revenue per region", "Sales per region."],
+)
+def test_revenue_by_region_accepts_the_same_connectors_as_its_sibling(question):
+    # The category rule always allowed "by" or "per"; the region rule allowed
+    # only "by". The two were inconsistent for no reason but the order they
+    # were written in.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY c.region" in sql
+
+
+def test_region_rule_stays_pinned_to_the_literal_region_column():
+    # "Show revenue by salesperson" is a precision-guard question precisely
+    # because it borrows this rule's vocabulary for a column the schema does
+    # not have. Widening the connector must not widen the dimension.
+    with pytest.raises(NoRuleMatchError):
+        OfflineBackend().to_sql("Show revenue by salesperson.", schema="")
+    with pytest.raises(NoRuleMatchError):
+        OfflineBackend().to_sql("Break down revenue per salesperson.", schema="")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many products are in each category?",
+        "Show the number of products per category.",
+        "Products by category",
+        "What is the product count by category?",
+        "Which category has the most products?",
+    ],
+)
+def test_offline_matches_products_per_category_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY p.category" in sql
+    assert "product_count" in sql
+
+
+def test_products_per_category_leaves_the_whole_catalog_count_alone():
+    # The grouped rule sits ahead of the catalog-wide count. The ungrouped
+    # phrasings must still reach the single-number rule, or "how many products
+    # do we have?" would come back as four rows.
+    backend = OfflineBackend()
+    for question in (
+        "How many products are in the catalog?",
+        "How many products do we have?",
+    ):
+        assert backend.to_sql(question, schema="") == (
+            "SELECT COUNT(*) AS product_count FROM products"
+        )
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_products_per_category():
+    # Cross-check against a direct recomputation in Python rather than SQL, so
+    # the assertion does not restate the rule's own GROUP BY.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "How many products are in each category?")
+    assert ans.result.columns == [
+        "category",
+        "product_count",
+        "avg_price",
+        "min_price",
+        "max_price",
+    ]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        catalog = conn.execute("SELECT category, price FROM products").fetchall()
+    finally:
+        conn.close()
+
+    prices: dict[str, list[float]] = {}
+    for category, price in catalog:
+        prices.setdefault(category, []).append(price)
+
+    expected = sorted(
+        (
+            (cat, len(vals), round(sum(vals) / len(vals), 2), min(vals), max(vals))
+            for cat, vals in prices.items()
+        ),
+        key=lambda row: (-row[1], row[0]),
+    )
+    assert [tuple(row) for row in ans.result.rows] == expected
+    # Every product is counted exactly once: the groups partition the catalog.
+    assert sum(row[1] for row in ans.result.rows) == len(catalog)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many different categories does each customer buy from?",
+        "How many categories do customers buy from?",
+        "Show categories per customer.",
+        "What is the category breadth of our customers?",
+        "What is the number of distinct categories per customer?",
+    ],
+)
+def test_offline_matches_category_breadth_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "categories_bought" in sql, question
+
+
+def test_category_breadth_does_not_shadow_category_penetration():
+    # Both rules speak of customers and categories; the penetration questions
+    # must keep their per-category answer.
+    backend = OfflineBackend()
+    for question in (
+        "How many customers bought from each category?",
+        "What share of customers bought from each category?",
+    ):
+        assert "penetration_pct" in backend.to_sql(question, schema=""), question
+
+
+def test_category_breadth_distribution_is_consistent_with_the_data():
+    # The distribution must account for every buyer exactly once, the shares
+    # must total 100, and the breadth must never exceed the category count.
+    import sqlite3
+
+    sql = OfflineBackend().to_sql(
+        "How many different categories does each customer buy from?", schema=""
+    )
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(sql).fetchall()
+        buyers = conn.execute("SELECT COUNT(DISTINCT customer_id) FROM orders").fetchone()[0]
+        categories = conn.execute("SELECT COUNT(DISTINCT category) FROM products").fetchone()[0]
+    finally:
+        conn.close()
+    assert sum(r[1] for r in rows) == buyers
+    assert sum(r[2] for r in rows) == pytest.approx(100.0, abs=0.2)
+    assert [r[0] for r in rows] == sorted({r[0] for r in rows})
+    assert all(1 <= r[0] <= categories for r in rows)

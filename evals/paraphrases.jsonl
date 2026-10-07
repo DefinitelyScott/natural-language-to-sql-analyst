@@ -28,9 +28,9 @@
 {"canonical": "What is the average time between orders?", "paraphrase": "What is the typical time between orders?"}
 {"canonical": "How many unique customers placed an order each month in 2024?", "paraphrase": "How many distinct customers ordered each month in 2024?"}
 {"canonical": "Which categories have above-average revenue?", "paraphrase": "Which categories are above average in revenue?"}
-{"canonical": "What is the total revenue?", "paraphrase": "What are our total sales?", "known_gap": "the rule keys on 'total revenue' / 'overall revenue' / 'how much revenue'; 'total sales' is not in its vocabulary"}
-{"canonical": "Which 5 customers spent the most?", "paraphrase": "Who are our five biggest customers?", "known_gap": "the rule needs either 'spent' or the literal 'top five customers'; 'biggest customers' carries neither"}
-{"canonical": "Show revenue by region", "paraphrase": "Break down revenue per region", "known_gap": "the region rule accepts only 'by region', while the category rule accepts 'by' or 'per' — an inconsistency between two sibling rules"}
+{"canonical": "What is the total revenue?", "paraphrase": "What are our total sales?"}
+{"canonical": "Which 5 customers spent the most?", "paraphrase": "Who are our five biggest customers?"}
+{"canonical": "Show revenue by region", "paraphrase": "Break down revenue per region"}
 {"canonical": "What is the median order value?", "paraphrase": "What's the median value of an order?", "known_gap": "the rule needs 'median' adjacent to 'order value/total/basket'; this phrasing splits the two across 'value of an order'"}
 {"canonical": "What is the average number of items per order?", "paraphrase": "How many items are in an average order?", "known_gap": "the rule needs 'items/units per order' or 'basket size'; this phrasing inverts the noun order"}
 {"canonical": "How long does it take a new customer to place their first order?", "paraphrase": "What is the average lag from signup to first purchase?"}
@@ -50,10 +50,18 @@
 {"canonical": "How many orders contain products from more than one category?", "paraphrase": "How many orders span multiple categories?"}
 {"canonical": "What were total sales by month in 2024?", "paraphrase": "Break the 2024 total sales down by month.", "known_gap": "the rule keys on the literal word order 'total sales by month'; inverting it to 'total sales down by month' is not reached"}
 {"canonical": "Show the 7-day moving average of daily revenue.", "paraphrase": "Smooth daily revenue with a rolling weekly average.", "known_gap": "the window adjective must sit directly beside 'average'; 'rolling weekly average' separates them, and 'smoothed' is matched only next to revenue/sales"}
-{"canonical": "What share of revenue comes from the top 20% of customers?", "paraphrase": "How concentrated is revenue among our biggest customers?", "known_gap": "the rule matches the noun 'concentration' but not the adjective 'concentrated'"}
+{"canonical": "What share of revenue comes from the top 20% of customers?", "paraphrase": "How concentrated is revenue among our biggest customers?"}
 {"canonical": "What is the best-selling product in each category?", "paraphrase": "Within each category, which product sold the most units?", "known_gap": "the rule needs a top/best word adjacent to 'product'; 'sold the most units' carries the same meaning with none of that vocabulary"}
 {"canonical": "Which category do customers buy from first?", "paraphrase": "Which category acquires the most customers?"}
 {"canonical": "Which customers have never placed an order?", "paraphrase": "Which customers signed up but never ordered?"}
 {"canonical": "Which customers have never placed an order?", "paraphrase": "Show customers with no orders.", "known_gap": "the rule requires the explicit word 'never'; a bare 'no orders' also reads as 'none in the window', which the at-risk rule owns"}
 {"canonical": "How many customers are in each region?", "paraphrase": "Show the number of customers by region."}
 {"canonical": "How many customers are in each region?", "paraphrase": "Which region has the most customers?"}
+{"canonical": "What are the bottom 5 products by revenue?", "paraphrase": "Which products generated the least sales?"}
+{"canonical": "How many products are in each category?", "paraphrase": "Which category has the most products?"}
+{"canonical": "How many different categories does each customer buy from?", "paraphrase": "How many categories have customers bought from, per customer?"}
+{"canonical": "How many different categories does each customer buy from?", "paraphrase": "Show the category breadth of our customers."}
+{"canonical": "How many different categories does each customer buy from?", "paraphrase": "Show categories per customer."}
+{"canonical": "Which month had the highest revenue?", "paraphrase": "What was our best month for sales?"}
+{"canonical": "Which month had the highest revenue?", "paraphrase": "Which month was the worst for revenue?"}
+{"canonical": "Which month had the highest revenue?", "paraphrase": "Which was the peak sales month?"}

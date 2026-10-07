@@ -93,6 +93,28 @@ _GROUPED = (
 #: nearest-question suggestions, instead of a total wearing a breakdown's label.
 _UNGROUPED_ONLY = rf"\A(?!.*(?:{_GROUPED}))"
 
+#: Words that invert a ranking: the question wants the *low* end of a list.
+#: Used only as the body of :data:`_DESCENDING_ONLY`.
+_ASCENDING_RANK = r"\b(?:bottom|worst|least|lowest|fewest|smallest|weakest)\b"
+
+#: Prefix for a leaderboard rule whose SQL is ``ORDER BY ... DESC LIMIT n``.
+#:
+#: The third guard of the family, for a third way a broad matcher can answer a
+#: question it was not asked. "Top products by revenue" was matched in part by
+#: ``products?.*by revenue``, so "what are the bottom 5 products by revenue?"
+#: reached it and came back as the five *best* products; the top-customers rule
+#: matched ``customers?.*spent``, so "which customers spent the least?" returned
+#: the five biggest spenders. Both results are correctly labelled and plausible,
+#: and exactly backwards, which is worse than no answer at all.
+#:
+#: Declining is the fix here rather than flipping the sort order inside the
+#: rule, because a rule's SQL is fixed text: the guard lets the descending rule
+#: stay what it is, and the ascending questions the catalog does implement get
+#: their own rule. "At least" is declined along with the superlatives. That is
+#: deliberate — "customers who spent at least $500" is a threshold filter, which
+#: no leaderboard rule computes either.
+_DESCENDING_ONLY = rf"\A(?!.*{_ASCENDING_RANK})"
+
 
 def build_catalog() -> list[tuple[re.Pattern[str], str]]:
     """Return the ordered rule catalog: one ``(matcher, sql)`` pair per question.
@@ -348,6 +370,54 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'
             GROUP BY month
             ORDER BY month
+            """,
+        ),
+        # Best and worst month by revenue. "Which month had the highest
+        # revenue?" is a ranking of the monthly series, so it needs its own
+        # rule: the monthly-sales rule above is year-scoped and returns the
+        # whole series, and "total revenue" would answer with one number that
+        # has no month in it.
+        #
+        # The rule answers BOTH ends in one two-row result rather than only the
+        # end the question names. The pattern accepts "highest" and "lowest"
+        # alike, and a rule that matched "worst month" but returned the best
+        # one would be the backwards-answer failure the _DESCENDING_ONLY family
+        # exists to prevent. Two labelled rows are correct for either wording
+        # and let a reader see the spread, at the cost of one extra row.
+        #
+        # Three guards keep it from answering a question it was not asked:
+        #   * _UNSCOPED_ONLY: SQL covers every month on record, so "best month
+        #     in 2024" declines instead of ignoring the year.
+        #   * the dimension lookahead: "which category had its best month?"
+        #     wants a per-category answer this SQL cannot give.
+        #   * growth/average: "best month for revenue growth" is a different
+        #     measure, left to the growth rule.
+        #
+        # Ties break on the earlier month so the result is deterministic.
+        (
+            re.compile(
+                _UNSCOPED_ONLY
+                + r"\A(?!.*\b(?:categor(?:y|ies)|regions?|products?|customers?"
+                r"|growth|average|avg|orders?)\b)"
+                r".*(?:\b(?:highest|best|peak|biggest|strongest|top|lowest"
+                r"|worst|weakest|slowest)\s+(?:revenue\s+|sales\s+)?months?\b"
+                r"|\bmonths?\b[^?]*\b(?:highest|lowest|most|least|best|worst)"
+                r"\b[^?]*\b(?:revenue|sales)\b)",
+                re.I,
+            ),
+            """
+            WITH monthly AS (
+                SELECT strftime('%Y-%m', o.order_date) AS month,
+                       ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY month
+            )
+            SELECT 'highest' AS label, month, revenue
+            FROM (SELECT * FROM monthly ORDER BY revenue DESC, month LIMIT 1)
+            UNION ALL
+            SELECT 'lowest' AS label, month, revenue
+            FROM (SELECT * FROM monthly ORDER BY revenue ASC, month LIMIT 1)
             """,
         ),
         # Monthly revenue per category -- a category time series, not the
@@ -705,12 +775,26 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # across runs. The matcher owns the pareto / 80-20 / concentration /
         # quintile vocabulary, which no other rule uses -- note "quintile"
         # is deliberately distinct from the quartiles rule's "quartile".
+        #
+        # The adjective "concentrated" is matched as well as the noun
+        # "concentration", because the natural phrasing of this question is
+        # predicative ("how concentrated is revenue among our biggest
+        # customers?") and puts the adjective before its subject, which the
+        # two noun alternatives above cannot reach. Both orders are spelled
+        # out rather than using a lookaround, and both are anchored to a
+        # revenue word so a bare "concentrated" cannot pull in an unrelated
+        # question. This ordering matters: the top-5-customers rule below
+        # also accepts "biggest customers", so if this rule did not claim the
+        # predicative phrasing first, that question would route to a plain
+        # top-5 list and answer a different question than the one asked.
         (
             re.compile(
                 r"\bpareto\b|"
                 r"\b80[/\-\s]?20\b|"
                 r"(revenue|sales|spend(?:ing)?)\s+concentration|"
                 r"concentration\s+of\s+(revenue|sales|spend(?:ing)?)|"
+                r"\bconcentrated\b[^?]*\b(?:revenue|sales|spend(?:ing)?)\b|"
+                r"\b(?:revenue|sales|spend(?:ing)?)\b[^?]*\bconcentrated\b|"
                 r"top\s*20\s*%|"
                 r"\bquintiles?\b",
                 re.I,
@@ -883,8 +967,30 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             FROM customer_revenue
             """,
         ),
+        # "Biggest"/"largest customer" is ranked by spend here, not by order
+        # count: this schema has no size attribute for a customer, so revenue
+        # is the only thing the superlative can mean. The count is left
+        # optional ("top customers", "our 5 biggest customers") because the
+        # SQL always returns five rows -- a phrasing that names no number
+        # still wants a short leaderboard, and answering with five is closer
+        # to the intent than declining.
+        #
+        # Deliberately *not* matched: a superlative next to a region or a
+        # percentage. Both belong to earlier rules -- top-spender-per-region
+        # and the Pareto/concentration rule -- and first-match resolution is
+        # what keeps this broad phrasing from stealing them.
+        #
+        # The _DESCENDING_ONLY prefix declines "which customers spent the
+        # least?": ``customers?.*spent`` would otherwise match it and return
+        # the five biggest spenders under a correct-looking label.
         (
-            re.compile(r"customers?\b.*\bspent|top\s*(5|five)\s*customers", re.I),
+            re.compile(
+                _DESCENDING_ONLY
+                + r".*(?:customers?\b.*\bspent|"
+                r"\b(?:top|biggest|largest|highest[-\s]?spending)\s+"
+                r"(?:\d+\s+|five\s+)?customers?\b)",
+                re.I,
+            ),
             """
             SELECT c.name,
                    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS total_spent
@@ -1022,6 +1128,63 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             SELECT category, units_sold, revenue
             FROM report
             ORDER BY (category = 'Total'), revenue DESC
+            """,
+        ),
+        # Category breadth: how many distinct categories each customer has
+        # bought from, summarised as a distribution -- one row per breadth
+        # value (1..N) with the number and share of customers at that value.
+        #
+        # This is the per-customer companion to the penetration rule directly
+        # below. Penetration asks "how many customers reached each category"
+        # (one row per category); breadth asks "how many categories did each
+        # customer reach" (one row per breadth level). The same purchase
+        # facts cut the other way, and the second cut answers a different
+        # decision: penetration says which category is under-sold, breadth
+        # says how many customers are single-category shoppers a cross-sell
+        # campaign could still reach. On the sample data most customers have
+        # bought from all four categories, so the interesting rows are the
+        # thin tail at 1-3 -- a reading the distribution makes visible and a
+        # single average ("3.8 categories") would hide.
+        #
+        # Two steps because the question has two levels: the CTE counts
+        # distinct categories per customer (COUNT(DISTINCT) so a customer
+        # who bought three Electronics items counts once), and the outer
+        # query counts customers per count. Customers with no orders are
+        # absent by construction -- breadth is undefined for them -- and the
+        # share denominator is the CTE's own row count, so the percentages
+        # sum to 100 over buyers rather than over the whole customer table.
+        #
+        # Registered ahead of penetration because "customers ... categories"
+        # vocabulary overlaps. The matcher needs "how many categories"
+        # (counting categories, not customers), "categories per customer" or
+        # the explicit word "breadth", none of which a penetration question
+        # ("how many customers bought from each category?") contains.
+        (
+            re.compile(
+                r"\bhow many\s+(?:different\s+|distinct\s+|unique\s+|separate\s+)?"
+                r"categor(?:y|ies)\b[^?]*\b(?:customers?|buyers?|shoppers?)\b|"
+                r"\bcategor(?:y|ies)\s+(?:per|by)\s+customer\b|"
+                r"\bnumber\s+of\s+(?:different\s+|distinct\s+|unique\s+)?"
+                r"categor(?:y|ies)\b[^?]*\b(?:customers?|buyers?|shoppers?)\b|"
+                r"\bcategory\s+breadth\b|\bbreadth\s+of\s+(?:purchases?|categor(?:y|ies))\b",
+                re.I,
+            ),
+            """
+            WITH per_customer AS (
+                SELECT o.customer_id AS customer_id,
+                       COUNT(DISTINCT p.category) AS categories_bought
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                JOIN products p ON p.id = oi.product_id
+                GROUP BY o.customer_id
+            )
+            SELECT categories_bought,
+                   COUNT(*) AS customers,
+                   ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM per_customer), 1)
+                       AS pct_of_buyers
+            FROM per_customer
+            GROUP BY categories_bought
+            ORDER BY categories_bought
             """,
         ),
         # Category purchase penetration: how many distinct customers bought
@@ -1477,10 +1640,15 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # ranking above: a cheap high-volume item can top units-sold while a
         # pricier item tops revenue. Requiring the word "revenue" keeps this
         # rule from shadowing the best-selling (units) rule.
+        #
+        # The _DESCENDING_ONLY prefix declines "bottom 5 products by revenue",
+        # which ``products?.*by revenue`` used to answer with the top five. The
+        # low end has its own rule, directly below.
         (
             re.compile(
-                r"top.*products?.*revenue|products?.*by revenue|"
-                r"highest[- ]revenue products?",
+                _DESCENDING_ONLY
+                + r".*(?:top.*products?.*revenue|products?.*by revenue|"
+                r"highest[- ]revenue products?)",
                 re.I,
             ),
             """
@@ -1490,6 +1658,43 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             JOIN order_items oi ON oi.product_id = p.id
             GROUP BY p.id
             ORDER BY revenue DESC
+            LIMIT 5
+            """,
+        ),
+        # The five lowest-revenue products: the other end of the leaderboard
+        # above, and not simply that query with ASC. The top-N rule can use an
+        # inner JOIN because a product with no sales can never rank near the
+        # top. At the bottom it is the most important row there is, and an
+        # inner JOIN drops it silently, so the list would start at the weakest
+        # product that sold *something*. Hence the LEFT JOIN from products and
+        # COALESCE(..., 0), which turns "no sales" into a revenue of 0 that
+        # sorts first. (Every product in the sample data has sales, so the
+        # distinction is pinned by a test on a purpose-built database.)
+        #
+        # p.id breaks revenue ties so the cut at five is the same on every run.
+        # The matcher requires an ascending-rank word *and* revenue/sales, so
+        # "worst-selling product" (units) and "least popular product"
+        # (undefined) are declined rather than answered by a revenue ranking.
+        # It shares no match with the top-N rule: that one's _DESCENDING_ONLY
+        # guard rejects every word this one requires. The lookbehind excludes
+        # "at least", so "products with at least $1,000 in sales" (a threshold
+        # no rule computes) is declined instead of answered with a bottom five.
+        (
+            re.compile(
+                r"(?<!\bat\s)" + _ASCENDING_RANK
+                + r"[^?]*\bproducts?\b[^?]*\b(?:revenue|sales)\b|"
+                r"\bproducts?\b[^?]*(?<!\bat\s)" + _ASCENDING_RANK
+                + r"[^?]*\b(?:revenue|sales)\b|"
+                r"\blowest[-\s]revenue\s+products?\b",
+                re.I,
+            ),
+            """
+            SELECT p.name,
+                   ROUND(COALESCE(SUM(oi.quantity * oi.unit_price), 0), 2) AS revenue
+            FROM products p
+            LEFT JOIN order_items oi ON oi.product_id = p.id
+            GROUP BY p.id
+            ORDER BY revenue ASC, p.id
             LIMIT 5
             """,
         ),
@@ -1766,8 +1971,17 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             WHERE order_date >= date((SELECT MAX(order_date) FROM orders), '-30 day')
             """,
         ),
+        # "per region" is accepted alongside "by region" so this rule takes
+        # the same connectors as its sibling revenue-by-category rule, which
+        # has always allowed both. The two were inconsistent for no reason
+        # other than the order they were written in.
+        #
+        # The dimension stays the literal word "region" rather than a general
+        # ``by \w+``: "show revenue by salesperson" is a precision-guard
+        # question precisely because it borrows this rule's vocabulary for a
+        # column the schema does not have, and must go unanswered.
         (
-            re.compile(r"(revenue|sales).*by region", re.I),
+            re.compile(r"(revenue|sales).*\b(?:by|per)\s+regions?\b", re.I),
             """
             SELECT c.region,
                    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
@@ -2199,11 +2413,19 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # collapses a whole table to a single row with no date filter and no
         # GROUP BY. See those two constants for why declining beats
         # answering there.
+        # "Sales" is treated as a synonym for "revenue" here. Elsewhere in
+        # the catalog the two already alternate freely ("revenue|sales"); this
+        # rule was the exception, so "what are our total sales?" fell through
+        # to no rule at all. Widening it is safe only because of the two
+        # guards above it: "total sales by month in 2024" carries both a year
+        # and a grouping word, so it is declined here and answered by the
+        # dedicated monthly-sales rule registered much earlier.
         (
             re.compile(
                 _UNSCOPED_ONLY
                 + _UNGROUPED_ONLY
-                + r".*(?:total revenue|overall revenue|how much revenue)",
+                + r".*(?:(?:total|overall)\s+(?:revenue|sales)"
+                + r"|how much\s+(?:revenue|sales))",
                 re.I,
             ),
             """
@@ -2220,6 +2442,47 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
                 re.I,
             ),
             "SELECT COUNT(*) AS order_count FROM orders",
+        ),
+        # Catalog breadth by category: how many products each category carries
+        # and the price range they span. This is the grouped counterpart to the
+        # whole-catalog product count below, and it is registered ahead of it
+        # for the same reason the customers-by-region rule sits ahead of the
+        # customer count: the count rule's _UNGROUPED_ONLY guard already stops
+        # it answering "how many products are in each category?" with one
+        # number, so without this rule that question would get no answer.
+        #
+        # It reads `products` alone, so a category with no sales still appears
+        # -- the point of a catalog-side question -- which a query joined
+        # through order_items would silently drop. AVG(price) is the list
+        # price in `products`, not a realised price: the sample data sells
+        # every line at list, but the column a reader wants is the catalog's.
+        #
+        # ORDER BY breaks ties on category: the sample catalog is three
+        # products in every category, so an exact four-way tie is the
+        # ordinary case and would otherwise leave row order to SQLite's
+        # grouping order and the eval's row-for-row comparison to luck.
+        (
+            re.compile(
+                r"\b(?:how many|number of|count of)\s+products?\b[^?]*"
+                r"\b(?:by|per|across|(?:in|for|within)\s+(?:each|every)|each)"
+                r"\s+categor(?:y|ies)\b"
+                r"|\bproducts?\s+(?:by|per)\s+categor(?:y|ies)\b"
+                r"|\bproduct\s+counts?\b[^?]*\b(?:by|per)\s+categor(?:y|ies)\b"
+                r"|\bwhich\s+categor(?:y|ies)\b[^?]*"
+                r"\b(?:most|fewest|largest|smallest|highest|lowest)\s+"
+                r"(?:number\s+of\s+)?products\b",
+                re.I,
+            ),
+            """
+            SELECT p.category AS category,
+                   COUNT(*) AS product_count,
+                   ROUND(AVG(p.price), 2) AS avg_price,
+                   MIN(p.price) AS min_price,
+                   MAX(p.price) AS max_price
+            FROM products p
+            GROUP BY p.category
+            ORDER BY product_count DESC, category
+            """,
         ),
         (
             re.compile(
