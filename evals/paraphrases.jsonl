@@ -65,3 +65,5 @@
 {"canonical": "Which month had the highest revenue?", "paraphrase": "What was our best month for sales?"}
 {"canonical": "Which month had the highest revenue?", "paraphrase": "Which month was the worst for revenue?"}
 {"canonical": "Which month had the highest revenue?", "paraphrase": "Which was the peak sales month?"}
+{"canonical": "What is the best-selling product in each region?", "paraphrase": "Show the top selling product per region."}
+{"canonical": "What is the best-selling product in each region?", "paraphrase": "What is the top-selling product for each region?"}

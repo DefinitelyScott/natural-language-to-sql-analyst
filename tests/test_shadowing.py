@@ -10,7 +10,7 @@ questions that must match *nothing*; the paraphrase set only asks whether two
 phrasings agree with each other, which they do whether or not a third rule is
 quietly one line away from taking both.
 
-Nine of the fifty-three gold questions are decided this way today, and that is
+Ten of the fifty-eight gold questions are decided this way today, and that is
 not in itself a defect. In every one of them the answering rule's pattern is
 strictly more demanding than the patterns behind it — "average order value *by
 region*" ahead of "average order value", "revenue by category *with a total
@@ -19,7 +19,7 @@ supposed to have. Specific before general is the whole reason first-match
 resolution works at all.
 
 What is a defect is a *new* one appearing without anyone noticing, because the
-new one is exactly as invisible as these nine were. The usual way it happens is
+new one is exactly as invisible as these ten were. The usual way it happens is
 a rule widened to catch a phrasing variant, which also widens it across some
 older rule's question; nothing fails, the older question keeps working only
 because of where the two sit, and the dependency is discovered later by someone
@@ -33,7 +33,7 @@ The record names the losing rules by their own gold questions rather than by
 index, so inserting a rule does not invalidate it — an index shifts, a question
 does not.
 
-Two of the nine deserve a second look, and are called out in
+Two of the ten deserve a second look, and are called out in
 :data:`SHADOWING_RATIONALE`: for most of the set a mis-ordering would return a
 *coarser* answer to the question that was asked, which is wrong but recognisably
 related to it, while for "new vs returning revenue" and "share of customers by
@@ -101,6 +101,9 @@ ACCEPTED_SHADOWING: dict[str, tuple[str, ...]] = {
     "What is the best-selling product in each category?": (
         "What is the best selling product?",
     ),
+    "What is the best-selling product in each region?": (
+        "What is the best selling product?",
+    ),
     "How much revenue comes from new vs returning customers?": (
         "How many repeat customers are there?",
         "What is the total revenue?",
@@ -148,6 +151,10 @@ SHADOWING_RATIONALE: dict[str, str] = {
     ),
     "What is the best-selling product in each category?": (
         "the per-category winner ahead of the global one, which would return a "
+        "single product for the whole catalog."
+    ),
+    "What is the best-selling product in each region?": (
+        "the per-region winner ahead of the global one, which would return a "
         "single product for the whole catalog."
     ),
     "How much revenue comes from new vs returning customers?": (

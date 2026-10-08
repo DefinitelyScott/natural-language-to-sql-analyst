@@ -191,7 +191,7 @@ threshold, not a ranking) and the bottom products *by units*.
 category; top products by revenue, and the bottom five — a `LEFT JOIN` from
 `products` with `COALESCE(..., 0)`, because at the low end the product that
 never sold is the most important row and an inner join would drop it;
-best-selling product by units, both overall and within each category; each category's share of total revenue
+best-selling product by units, overall, within each category and within each customer region (the region rule rolls units up through orders to the customer, since region lives on `customers`); each category's share of total revenue
 (`SUM(...) OVER ()`); category breadth — how many distinct categories each customer has bought
 from, as a distribution (customers and share of buyers at each breadth level), which cuts the same
 purchase facts the other way round from penetration: on the sample data 92 of 115 buyers have bought
@@ -797,7 +797,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 57 questions  |  execution accuracy: 57/57 (100%)  [offline backend]
+Evaluated 58 questions  |  execution accuracy: 58/58 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -839,8 +839,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 57,
-  "passed": 57,
+  "total": 58,
+  "passed": 58,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -928,11 +928,11 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **61 gating pairs and
+can never improve the headline. The set currently holds **63 gating pairs and
 6 known gaps**:
 
 ```
-Paraphrase robustness: 61/61 rephrasings route to the canonical rule
+Paraphrase robustness: 63/63 rephrasings route to the canonical rule
   Known gaps (not gating): 6
 ```
 
@@ -966,15 +966,15 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 54/57 gold queries are written independently of the rule they test
+Gold independence: 55/58 gold queries are written independently of the rule they test
   Self-comparing (not gating): 3 — these prove the SQL runs, not that it answers the question
     [COPY] rule #29: How many customers do we have?
-    [COPY] rule #54: How many orders do we have?
-    [COPY] rule #56: How many products are in the catalog?
+    [COPY] rule #55: How many orders do we have?
+    [COPY] rule #57: How many products are in the catalog?
 ```
 
 So three rows of the 100% above are still self-referential, and the honest
-reading of the headline is "57/57, of which 54 are real comparisons". Publishing
+reading of the headline is "58/58, of which 55 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
@@ -988,7 +988,7 @@ answer by a different route: restating `COUNT(*) FROM products` as
 second opinion, which raises the ratio while proving nothing.
 
 That is exactly what the three remaining rows are, and it is why this number
-stops at 54/57 rather than climbing to 57/57. "How many rows are in this table"
+stops at 55/58 rather than climbing to 58/58. "How many rows are in this table"
 has one honest formulation; the second one needed to clear the comparison would
 be the same query wearing a different function name, and the two could not
 disagree about a primary key however wrong the rule became. The backlog is at
@@ -1061,17 +1061,17 @@ So the harness also reports, for every gold question, every rule it matches
 rather than only the winner:
 
 ```
-Catalog shadowing: 48/57 gold questions match exactly one rule
-  Order-dependent (not gating): 9 — these reach the right rule only because it is registered first
+Catalog shadowing: 48/58 gold questions match exactly one rule
+  Order-dependent (not gating): 10 — these reach the right rule only because it is registered first
     [SHADOWED] Show revenue by region and category.
         also matched by rule #21: Show revenue by category
-        also matched by rule #41: Show revenue by region
+        also matched by rule #42: Show revenue by region
     [SHADOWED] How much revenue comes from new vs returning customers?
-        also matched by rule #39: How many repeat customers are there?
-        also matched by rule #53: What is the total revenue?
+        also matched by rule #40: How many repeat customers are there?
+        also matched by rule #54: What is the total revenue?
 ```
 
-Nine of the fifty-six are decided this way, and **none of them is a bug**. In
+Ten of the fifty-eight are decided this way, and **none of them is a bug**. In
 every case the answering rule's pattern is strictly more demanding than the ones
 behind it — "average order value *by region*" ahead of "average order value",
 "revenue by category *with a total row*" ahead of "revenue by category" — which
@@ -1093,7 +1093,7 @@ coarsen the answer, it would change its subject:
   shape with the right column names and the wrong meaning.
 
 Like gold independence this is a **ratchet, not a gate**.
-`tests/test_shadowing.py` records the nine by name — naming the losing rules by
+`tests/test_shadowing.py` records the ten by name — naming the losing rules by
 *their* gold questions rather than by index, so inserting a rule does not
 invalidate the record — and fails when the overlap set grows, including when a
 question already on the list picks up a third claimant. The usual way that
@@ -1121,7 +1121,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 42 of the 57 gold questions
+  `"ordered": true` and are compared as returned. 43 of the 58 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

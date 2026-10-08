@@ -1576,6 +1576,72 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ),
             "SELECT COUNT(*) AS customer_count FROM customers",
         ),
+        # The best-selling product (by units) *within each customer region*:
+        # the same greatest-N-per-group shape as the per-category rule below,
+        # with one structural difference that is the reason this is a rule of
+        # its own and not a tweak to that one. Category lives on `products`;
+        # region lives on `customers`, so the units must be rolled up through
+        # the full chain order_items -> orders -> customers. The first CTE
+        # groups by (region, product) rather than by product alone, because a
+        # product's units in the East and in the West are different numbers
+        # and each region needs its own ranking.
+        #
+        # Without this rule the question was answered *wrongly*, not declined:
+        # "best-selling product in each region" matches none of the
+        # per-category rule's words, so it fell through to the global
+        # "best selling product" rule and came back as one product with no
+        # regional breakdown. The negative lookahead at the front keeps the
+        # rule honest about what it computes: it declines "top 3 products per
+        # region" (a rank-1 query cannot return three rows), revenue/sales
+        # phrasings (this ranks by units, like its category sibling) and the
+        # worst-seller phrasings, rather than answer them with a rank-1 units
+        # query. What happens to them next is up to the later rules: "top 3
+        # products per region" has no rule and raises NoRuleMatchError, while
+        # "best-selling products by region by revenue" still reaches the global
+        # best-seller rule, a pre-existing gap this rule neither causes nor
+        # closes.
+        #
+        # ROW_NUMBER, not RANK: ties resolve to the smaller product id, so each
+        # region yields exactly one row and the output is identical on every
+        # run. Registered ahead of both the per-category and the global rule
+        # because it requires a region word that neither of them mentions.
+        (
+            re.compile(
+                r"\A(?!.*(?:\btop\s+\d+\b|\b(?:revenue|sales|worst)\b|"
+                + _ASCENDING_RANK
+                + r")).*(?:(?:best|top)[-\s]*(?:selling\s+)?products?\b[^?]*"
+                r"\b(?:in|per|by|within|for|across)\s+(?:each\s+|every\s+)?regions?\b|"
+                r"\bregions?\b[^?]*\b(?:best|top)[-\s]*(?:selling\s+)?products?\b)",
+                re.I,
+            ),
+            """
+            WITH region_product_units AS (
+                SELECT c.region AS region,
+                       p.id AS product_id,
+                       p.name AS name,
+                       SUM(oi.quantity) AS units_sold
+                FROM customers c
+                JOIN orders o ON o.customer_id = c.id
+                JOIN order_items oi ON oi.order_id = o.id
+                JOIN products p ON p.id = oi.product_id
+                GROUP BY c.region, p.id
+            ),
+            ranked AS (
+                SELECT region,
+                       name,
+                       units_sold,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY region
+                           ORDER BY units_sold DESC, product_id
+                       ) AS rn
+                FROM region_product_units
+            )
+            SELECT region, name, units_sold
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY region
+            """,
+        ),
         # The best-selling product (by units) *within each category*: another
         # "greatest-N-per-group" ranking, the product-and-category analogue of
         # the top-customer-per-region rule above. A first CTE rolls units up to

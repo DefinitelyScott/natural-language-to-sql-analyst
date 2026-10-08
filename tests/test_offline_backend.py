@@ -1511,6 +1511,90 @@ def test_best_selling_per_category_does_not_shadow_global_best_seller():
     assert "LIMIT 1" in sql
 
 
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the best-selling product in each region?",
+        "Show the top selling product per region.",
+        "Best product by region",
+        "Which region's best-selling product is which?",
+    ],
+)
+def test_best_selling_product_per_region_routes_to_region_rule(question):
+    # Region lives on `customers`, so this rule is a different query from the
+    # per-category one, not a parameter swap: it partitions by region.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "PARTITION BY region" in sql
+    assert "WHERE rn = 1" in sql
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What are the top 3 products per region?",
+        "What is the worst-selling product in each region?",
+        "Which are the bottom products in each region?",
+    ],
+)
+def test_per_region_best_seller_declines_questions_it_cannot_answer(question):
+    # A rank-1 units query cannot answer "top 3" or a worst-seller question, and
+    # returning one anyway would be a well-formed table for a different question.
+    with pytest.raises(NoRuleMatchError):
+        OfflineBackend().to_sql(question, schema="")
+
+
+def test_per_region_rule_does_not_capture_neighbouring_questions():
+    # The global and per-category best-seller rules, and the per-region top
+    # *customer* rule, all share words with this one and must keep their own SQL.
+    backend = OfflineBackend()
+    assert "region_product_units" not in backend.to_sql(
+        "What is the best selling product?", schema=""
+    )
+    assert "region_product_units" not in backend.to_sql(
+        "What is the best-selling product in each category?", schema=""
+    )
+    assert "region_product_units" not in backend.to_sql(
+        "Who is the top-spending customer in each region?", schema=""
+    )
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_best_selling_product_per_region():
+    # Recompute the winners in Python from the raw tables: units per
+    # (region, product), then the max per region with the smaller product id
+    # winning ties -- the same tiebreak the SQL states in its ORDER BY.
+    import sqlite3
+
+    ans = generator.answer_question(DB, "What is the best-selling product in each region?")
+    assert ans.result.columns == ["region", "name", "units_sold"]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            """
+            SELECT c.region, p.id, p.name, SUM(oi.quantity)
+            FROM order_items oi
+            JOIN orders o ON o.id = oi.order_id
+            JOIN customers c ON c.id = o.customer_id
+            JOIN products p ON p.id = oi.product_id
+            GROUP BY c.region, p.id
+            """
+        ).fetchall()
+        regions = {r[0] for r in conn.execute("SELECT region FROM customers")}
+    finally:
+        conn.close()
+
+    winners: dict[str, tuple[int, int, str]] = {}
+    for region, pid, name, units in rows:
+        best = winners.get(region)
+        if best is None or (units, -pid) > (best[0], -best[1]):
+            winners[region] = (units, pid, name)
+    expected = [(region, winners[region][2], winners[region][0]) for region in sorted(winners)]
+
+    assert [tuple(row) for row in ans.result.rows] == expected
+    assert {row[0] for row in ans.result.rows} == regions  # no region dropped
+
+
 @pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
 def test_end_to_end_best_selling_product_per_category():
     # Cross-check the per-category winner against an independent Python
