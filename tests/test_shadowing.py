@@ -10,7 +10,7 @@ questions that must match *nothing*; the paraphrase set only asks whether two
 phrasings agree with each other, which they do whether or not a third rule is
 quietly one line away from taking both.
 
-Ten of the fifty-eight gold questions are decided this way today, and that is
+Eleven of the fifty-nine gold questions are decided this way today, and that is
 not in itself a defect. In every one of them the answering rule's pattern is
 strictly more demanding than the patterns behind it — "average order value *by
 region*" ahead of "average order value", "revenue by category *with a total
@@ -19,7 +19,7 @@ supposed to have. Specific before general is the whole reason first-match
 resolution works at all.
 
 What is a defect is a *new* one appearing without anyone noticing, because the
-new one is exactly as invisible as these ten were. The usual way it happens is
+new one is exactly as invisible as these eleven were. The usual way it happens is
 a rule widened to catch a phrasing variant, which also widens it across some
 older rule's question; nothing fails, the older question keeps working only
 because of where the two sit, and the dependency is discovered later by someone
@@ -33,7 +33,7 @@ The record names the losing rules by their own gold questions rather than by
 index, so inserting a rule does not invalidate it — an index shifts, a question
 does not.
 
-Two of the ten deserve a second look, and are called out in
+Two of the eleven deserve a second look, and are called out in
 :data:`SHADOWING_RATIONALE`: for most of the set a mis-ordering would return a
 *coarser* answer to the question that was asked, which is wrong but recognisably
 related to it, while for "new vs returning revenue" and "share of customers by
@@ -80,7 +80,7 @@ _SHADOWING_RE = re.compile(r"Catalog shadowing: (\d+)/(\d+) gold\s+questions")
 #: a specific rule sitting ahead of the general rule it refines is correct, and
 #: "fixing" it would mean narrowing one of the two patterns until they stop
 #: overlapping, which costs reach for no gain in correctness. The list exists so
-#: that the tenth entry has to be added deliberately.
+#: that the twelfth entry has to be added deliberately.
 ACCEPTED_SHADOWING: dict[str, tuple[str, ...]] = {
     "How has revenue by category changed month over month?": (
         "Show month-over-month revenue growth in 2024.",
@@ -104,6 +104,7 @@ ACCEPTED_SHADOWING: dict[str, tuple[str, ...]] = {
     "What is the best-selling product in each region?": (
         "What is the best selling product?",
     ),
+    "Show revenue by customer signup quarter.": ("Show revenue by quarter in 2024.",),
     "How much revenue comes from new vs returning customers?": (
         "How many repeat customers are there?",
         "What is the total revenue?",
@@ -130,6 +131,11 @@ SHADOWING_RATIONALE: dict[str, str] = {
         "a two-dimension breakdown ahead of both single-dimension rules. "
         "Either would return a correctly-computed table with one of the two "
         "dimensions silently collapsed."
+    ),
+    "Show revenue by customer signup quarter.": (
+        "a narrower refinement of revenue-by-quarter: the rule behind buckets "
+        "the same revenue by order date instead of signup date, which returns a "
+        "plausible quarterly table that answers a different question."
     ),
     "Show revenue by category with a total row.": (
         "the rollup refines the plain breakdown: the rule behind returns the "

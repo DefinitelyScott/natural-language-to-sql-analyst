@@ -3487,3 +3487,49 @@ def test_category_breadth_distribution_is_consistent_with_the_data():
     assert sum(r[2] for r in rows) == pytest.approx(100.0, abs=0.2)
     assert [r[0] for r in rows] == sorted({r[0] for r in rows})
     assert all(1 <= r[0] <= categories for r in rows)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show revenue by customer signup quarter.",
+        "Show sales by signup quarter.",
+        "Break down revenue by quarter of sign-up.",
+    ],
+)
+def test_offline_matches_revenue_by_signup_quarter_phrasings(question):
+    # Acquisition view: group by when the customer joined, not when they ordered.
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "c.signup_date" in sql
+    assert "LEFT JOIN orders" in sql
+
+
+def test_revenue_by_signup_quarter_does_not_shadow_order_date_quarters():
+    # "revenue by quarter" has no signup word and must keep bucketing by
+    # order_date, which is a different question with different numbers.
+    plain = OfflineBackend().to_sql("Show revenue by quarter in 2024.", schema="")
+    assert "signup_date" not in plain
+    assert "o.order_date" in plain
+
+
+def test_revenue_by_signup_quarter_keeps_customers_who_never_ordered():
+    # Run the rule's SQL on a tiny in-memory DB: a signup who never ordered must
+    # still count toward `customers` (an inner join would drop them).
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, region TEXT, signup_date TEXT);
+        CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, order_date TEXT);
+        CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, product_id INTEGER,
+                                  quantity INTEGER, unit_price REAL);
+        INSERT INTO customers VALUES (1,'a','East','2023-02-01'),(2,'b','East','2023-03-15'),
+                                     (3,'c','West','2023-05-01');
+        INSERT INTO orders VALUES (1, 1, '2024-01-05');
+        INSERT INTO order_items VALUES (1, 1, 1, 2, 10.0), (2, 1, 2, 1, 5.0);
+        """
+    )
+    sql = OfflineBackend().to_sql("Show revenue by customer signup quarter.", schema="")
+    rows = conn.execute(sql).fetchall()
+    assert rows == [("2023-Q1", 2, 25.0, 12.5), ("2023-Q2", 1, 0.0, 0.0)]

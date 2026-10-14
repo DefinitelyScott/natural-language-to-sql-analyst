@@ -2142,6 +2142,54 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY month
             """,
         ),
+        # Revenue by the quarter a customer *signed up* -- an acquisition view,
+        # as opposed to the "revenue by quarter" rule below, which buckets by
+        # when the order happened. The two answer different questions: a 2023-Q1
+        # signup still ordering in 2024 counts under 2023-Q1 here and under
+        # 2024-Qn there.
+        #
+        # Two design choices a reader should be able to defend:
+        #   * Revenue is rolled up to one row per customer first (a CTE), and
+        #     only then grouped by signup quarter. Joining customers straight to
+        #     order_items and counting rows would make `customers` an item
+        #     count, not a customer count.
+        #   * LEFT JOINs with COALESCE(..., 0) keep customers who never ordered.
+        #     An inner join would silently drop them, which shrinks each
+        #     quarter's `customers` and inflates `revenue_per_customer`: the
+        #     metric would flatter exactly the quarters whose signups did not
+        #     convert.
+        # Registered ahead of "revenue by quarter" because that rule's
+        # `(revenue|sales).*(by|per).*quarter` would otherwise take
+        # "revenue by signup quarter" and answer with order-date quarters.
+        # The word "cohort" is deliberately not a trigger: the cohort-retention
+        # rule owns it.
+        (
+            re.compile(
+                r"\bsign[-\s]?up\s+quarters?\b"
+                r"|\bquarters?\s+(?:of|they)\s+(?:sign[-\s]?up|signed\s+up|joined)\b",
+                re.I,
+            ),
+            """
+            WITH customer_revenue AS (
+                SELECT c.id AS customer_id,
+                       strftime('%Y', c.signup_date) || '-Q' || (
+                           (CAST(strftime('%m', c.signup_date) AS INTEGER) + 2) / 3
+                       ) AS signup_quarter,
+                       COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS revenue
+                FROM customers c
+                LEFT JOIN orders o ON o.customer_id = c.id
+                LEFT JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY c.id
+            )
+            SELECT signup_quarter,
+                   COUNT(*) AS customers,
+                   ROUND(SUM(revenue), 2) AS revenue,
+                   ROUND(SUM(revenue) / COUNT(*), 2) AS revenue_per_customer
+            FROM customer_revenue
+            GROUP BY signup_quarter
+            ORDER BY signup_quarter
+            """,
+        ),
         # Revenue bucketed by calendar quarter for 2024. SQLite has no
         # quarter function, so the quarter number is derived from the month
         # with integer arithmetic: (month + 2) / 3 maps months 1-3 -> 1,
