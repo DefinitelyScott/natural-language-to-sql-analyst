@@ -1560,6 +1560,51 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY customer_count DESC, region
             """,
         ),
+        # Order counts by customer region: the grouped sibling of "how many
+        # orders do we have?". Before this rule the question was *declined* --
+        # the plain order counter carries _UNGROUPED_ONLY, so "how many orders
+        # per region?" raised NoRuleMatchError instead of returning one total
+        # wearing a breakdown's label -- and this makes the breakdown answerable.
+        #
+        # Region lives on `customers`, not `orders`, so the count goes through
+        # the join orders -> customers. It is an inner join on purpose: every
+        # order has a customer (foreign key), and a region with no orders has
+        # nothing to count, so there is no LEFT JOIN row to preserve here (the
+        # signup-quarter rule above needs one; this one does not).
+        #
+        # COUNT(*) counts orders, not items: joining order_items would repeat
+        # each order once per line and inflate every region. The share column
+        # divides by a scalar subquery over all orders, so it stays a share of
+        # the whole even if a WHERE is later added to the outer query.
+        #
+        # The word "revenue"/"sales" is not a trigger: "revenue by region" has
+        # its own rule and measures money, not order volume. ORDER BY breaks
+        # ties on region so the row order is deterministic.
+        (
+            re.compile(
+                r"\b(?:how many|number of|count of)\s+orders?\b"
+                r"[^?]*\b(?:by|per|across|(?:in|for|within)\s+(?:each|every)"
+                r"|each)\s+regions?\b"
+                r"|\bhow many\s+orders\s+did\s+(?:each|every)\s+regions?\b"
+                r"|\borders?\s+(?:by|per)\s+regions?\b"
+                r"|\border\s+counts?\b[^?]*\b(?:by|per)\s+regions?\b"
+                r"|\bwhich\s+regions?\b[^?]*"
+                r"\b(?:most|fewest|largest|smallest|highest|lowest)\s+"
+                r"(?:number\s+of\s+)?orders\b",
+                re.I,
+            ),
+            """
+            SELECT c.region AS region,
+                   COUNT(*) AS order_count,
+                   ROUND(
+                       100.0 * COUNT(*) / (SELECT COUNT(*) FROM orders), 1
+                   ) AS pct_of_orders
+            FROM orders o
+            JOIN customers c ON c.id = o.customer_id
+            GROUP BY c.region
+            ORDER BY order_count DESC, region
+            """,
+        ),
         (
             # Guarded by _UNSCOPED_ONLY: this counts every row in
             # `customers`, so "how many customers churned last month?" is

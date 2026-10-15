@@ -152,7 +152,7 @@ broad ones — "orders in the last 30 days" must not be swallowed by "how many
 orders". The catalog currently covers:
 
 **Counts and totals** — customer count, order count, product count, total
-revenue, and customer headcount by region.
+revenue, customer headcount by region, and order count by region.
 
 That last one is the grouped counterpart of the first, and it exists because of
 how the ungrouped rules fail. Each of the four totals collapses a whole table to
@@ -172,9 +172,12 @@ ahead of the customer counter — adjacent on purpose, since the guard on one an
 the existence of the other are a single decision. It carries each region's share
 of the customer base beside the count, because a headcount split four ways is
 read as a distribution and the alternative is doing that division by eye.
-`evals/precision.jsonl` pins the other half of the fix: "how many orders did
-each region place?" and "how many products are in each category?" are recorded
-as questions the catalog must *decline*.
+Order counts have the same shape: orders by customer region is answered (join
+`orders` to `customers`, `COUNT(*)` so line items do not inflate the count, with
+each region's share of all orders), while `evals/precision.jsonl` pins the other
+half of the fix: "how many orders were placed in each category?" and "how many
+products are in each category?" are recorded as questions the catalog must
+*decline*, because no rule counts by those groupings.
 
 A third guard, `_DESCENDING_ONLY`, covers the same failure along the ranking
 axis. The top-products rule matched `products?.*by revenue` and the
@@ -797,7 +800,7 @@ matches the gold result set).
 
 ```
 $ python evals/evaluate.py
-Evaluated 59 questions  |  execution accuracy: 59/59 (100%)  [offline backend]
+Evaluated 60 questions  |  execution accuracy: 60/60 (100%)  [offline backend]
 ```
 
 Run it against the LLM backend with `--llm` to benchmark a model.
@@ -839,8 +842,8 @@ python evals/evaluate.py --json eval-report.json
 ```json
 {
   "backend": "offline",
-  "total": 59,
-  "passed": 59,
+  "total": 60,
+  "passed": 60,
   "execution_accuracy": 1.0,
   "questions": [
     {
@@ -928,11 +931,11 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **65 gating pairs and
+can never improve the headline. The set currently holds **67 gating pairs and
 6 known gaps**:
 
 ```
-Paraphrase robustness: 65/65 rephrasings route to the canonical rule
+Paraphrase robustness: 67/67 rephrasings route to the canonical rule
   Known gaps (not gating): 6
 ```
 
@@ -966,7 +969,7 @@ That is not a hypothetical here. The harness measures it and prints it under the
 other two checks:
 
 ```
-Gold independence: 56/59 gold queries are written independently of the rule they test
+Gold independence: 57/60 gold queries are written independently of the rule they test
   Self-comparing (not gating): 3 — these prove the SQL runs, not that it answers the question
     [COPY] rule #29: How many customers do we have?
     [COPY] rule #55: How many orders do we have?
@@ -974,7 +977,7 @@ Gold independence: 56/59 gold queries are written independently of the rule they
 ```
 
 So three rows of the 100% above are still self-referential, and the honest
-reading of the headline is "59/59, of which 56 are real comparisons". Publishing
+reading of the headline is "60/60, of which 57 are real comparisons". Publishing
 that number is the point: an eval set is a claim about a system, and a claim
 nobody has audited for tautologies is worth less than a smaller one that has
 been.
@@ -988,7 +991,7 @@ answer by a different route: restating `COUNT(*) FROM products` as
 second opinion, which raises the ratio while proving nothing.
 
 That is exactly what the three remaining rows are, and it is why this number
-stops at 56/59 rather than climbing to 59/59. "How many rows are in this table"
+stops at 57/60 rather than climbing to 60/60. "How many rows are in this table"
 has one honest formulation; the second one needed to clear the comparison would
 be the same query wearing a different function name, and the two could not
 disagree about a primary key however wrong the rule became. The backlog is at
@@ -1061,7 +1064,7 @@ So the harness also reports, for every gold question, every rule it matches
 rather than only the winner:
 
 ```
-Catalog shadowing: 48/59 gold questions match exactly one rule
+Catalog shadowing: 49/60 gold questions match exactly one rule
   Order-dependent (not gating): 11 — these reach the right rule only because it is registered first
     [SHADOWED] Show revenue by region and category.
         also matched by rule #21: Show revenue by category
@@ -1071,7 +1074,7 @@ Catalog shadowing: 48/59 gold questions match exactly one rule
         also matched by rule #54: What is the total revenue?
 ```
 
-Eleven of the fifty-nine are decided this way, and **none of them is a bug**. In
+Eleven of the sixty are decided this way, and **none of them is a bug**. In
 every case the answering rule's pattern is strictly more demanding than the ones
 behind it — "average order value *by region*" ahead of "average order value",
 "revenue by category *with a total row*" ahead of "revenue by category" — which
@@ -1121,7 +1124,7 @@ Two details decide whether the reported accuracy is meaningful:
   have?") order is meaningless and rows are compared as a set. For a *ranking*
   ("the top 5 customers by spend") or a *sequence* ("revenue by month"), the
   right rows in the wrong order are a wrong answer, so those rows set
-  `"ordered": true` and are compared as returned. 44 of the 59 gold questions
+  `"ordered": true` and are compared as returned. 45 of the 60 gold questions
   are order-sensitive.
 
 The flag is a judgment about the question, not a mechanical "does the gold SQL

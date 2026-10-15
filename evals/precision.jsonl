@@ -13,8 +13,7 @@
 {"question": "Forecast revenue for next quarter.", "reason": "prediction, not a query over recorded facts"}
 {"question": "Delete every order placed before June.", "reason": "an instruction to write; the catalog answers questions and the runner denies writes outright"}
 {"question": "Which products have never been sold?", "reason": "the never-ordered rule is scoped to customers; no rule covers unsold products, and every product in the sample data has sales"}
-{"question": "How many orders did each region place?", "reason": "grouped; the order-count rule returns one all-time total and no rule breaks orders down by region, so it must not answer with the ungrouped count"}
-{"question": "How many orders were placed in each region?", "reason": "grouped; the order-count rule returns one total and no rule counts orders per region, so it must not answer with the whole-table order count"}
+{"question": "How many orders were placed in each category?", "reason": "grouped by a dimension no rule implements; the order-count rule returns one all-time total, and order counts are only broken out by region, so it must not answer with the ungrouped count"}
 {"question": "Which customers spent the least?", "reason": "inverted ranking; the top-customers rule sorts by spend descending and there is no bottom-customers rule, so it must not answer with the five biggest spenders"}
 {"question": "Which products had at least $1,000 in sales?", "reason": "a threshold filter, not a ranking; 'at least' must not be read as 'least' and answered with the bottom five products"}
 {"question": "What are the bottom 5 products by units sold?", "reason": "the bottom-products rule ranks by revenue; a units ranking of the low end is not implemented and must not be answered in revenue"}

@@ -3184,7 +3184,6 @@ def test_grouped_count_questions_do_not_fall_through_to_the_totals():
         assert sql != "SELECT COUNT(*) AS customer_count FROM customers"
 
     for question in (
-        "How many orders did each region place?",
         "How many orders were placed in each category?",
         "How many customers are in each category?",
     ):
@@ -3533,3 +3532,56 @@ def test_revenue_by_signup_quarter_keeps_customers_who_never_ordered():
     sql = OfflineBackend().to_sql("Show revenue by customer signup quarter.", schema="")
     rows = conn.execute(sql).fetchall()
     assert rows == [("2023-Q1", 2, 25.0, 12.5), ("2023-Q2", 1, 0.0, 0.0)]
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many orders were placed in each region?",
+        "How many orders did each region place?",
+        "Show the number of orders by region.",
+        "Orders per region",
+        "Which region has the most orders?",
+    ],
+)
+def test_offline_matches_order_count_by_region_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY c.region" in sql
+    # COUNT(*) over orders joined only to customers: joining order_items would
+    # repeat each order once per line item.
+    assert "order_items" not in sql
+
+
+def test_order_count_by_region_leaves_neighbouring_rules_alone():
+    backend = OfflineBackend()
+    assert "GROUP BY c.region" in backend.to_sql("Show revenue by region", schema="")
+    assert "total_revenue" not in backend.to_sql("Orders per region", schema="")
+    assert (
+        backend.to_sql("How many orders do we have?", schema="")
+        == "SELECT COUNT(*) AS order_count FROM orders"
+    )
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_order_count_by_region():
+    # Recomputed in Python from the raw tables, not from the rule's own SQL.
+    import sqlite3
+    from collections import Counter
+
+    ans = generator.answer_question(DB, "How many orders were placed in each region?")
+    assert ans.result.columns == ["region", "order_count", "pct_of_orders"]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        regions = dict(conn.execute("SELECT id, region FROM customers"))
+        order_customers = [r[0] for r in conn.execute("SELECT customer_id FROM orders")]
+    finally:
+        conn.close()
+
+    expected = Counter(regions[c] for c in order_customers)
+    rows = ans.result.rows
+    assert {r[0]: r[1] for r in rows} == dict(expected)
+    assert sum(r[1] for r in rows) == len(order_customers)
+    assert sum(r[2] for r in rows) == pytest.approx(100.0, abs=0.2)
+    counts = [r[1] for r in rows]
+    assert counts == sorted(counts, reverse=True)
