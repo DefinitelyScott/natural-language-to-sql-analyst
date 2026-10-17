@@ -3585,3 +3585,101 @@ def test_end_to_end_order_count_by_region():
     assert sum(r[2] for r in rows) == pytest.approx(100.0, abs=0.2)
     counts = [r[1] for r in rows]
     assert counts == sorted(counts, reverse=True)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What is the average revenue per customer in each region?",
+        "Show ARPU by region.",
+        "Which region has the highest spend per customer?",
+        "Revenue per customer by region",
+    ],
+)
+def test_offline_matches_arpu_by_region_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "GROUP BY c.region" in sql
+    assert "avg_revenue_per_customer" in sql
+
+
+def test_arpu_by_region_leaves_neighbouring_rules_alone():
+    backend = OfflineBackend()
+    # The ungrouped ARPU question still gets the single global figure.
+    assert "GROUP BY c.region" not in backend.to_sql(
+        "What is the average revenue per customer?", schema=""
+    )
+    # Per-region questions about other measures keep their own rules.
+    assert "paying_customers" not in backend.to_sql("Show revenue by region", schema="")
+    assert "customer_spend" in backend.to_sql(
+        "Who is the top-spending customer in each region?", schema=""
+    )
+
+
+def test_arpu_by_region_averages_per_customer_not_per_order_line():
+    # One region, two paying customers: A has two order lines (10 + 20), B has
+    # one (30). Per-customer totals are 30 and 30, so ARPU is 30.0; averaging
+    # the three raw lines would give 20.0. A customer who never ordered must
+    # not dilute the denominator.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE customers (id INTEGER, name TEXT, region TEXT, signup_date TEXT);
+        CREATE TABLE orders (id INTEGER, customer_id INTEGER, order_date TEXT);
+        CREATE TABLE order_items (
+            id INTEGER, order_id INTEGER, product_id INTEGER,
+            quantity INTEGER, unit_price REAL
+        );
+        INSERT INTO customers VALUES
+            (1, 'A', 'North', '2024-01-01'),
+            (2, 'B', 'North', '2024-01-01'),
+            (3, 'C', 'North', '2024-01-01');
+        INSERT INTO orders VALUES (1, 1, '2024-02-01'), (2, 2, '2024-02-02');
+        INSERT INTO order_items VALUES
+            (1, 1, 1, 1, 10.0), (2, 1, 2, 1, 20.0), (3, 2, 1, 1, 30.0);
+        """
+    )
+    sql = OfflineBackend().to_sql("Show ARPU by region.", schema="")
+    assert conn.execute(sql).fetchall() == [("North", 2, 60.0, 30.0)]
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_arpu_by_region():
+    # Recomputed in Python from the raw tables, not from the rule's own SQL.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(DB, "What is the average revenue per customer in each region?")
+    assert ans.result.columns == [
+        "region",
+        "paying_customers",
+        "total_revenue",
+        "avg_revenue_per_customer",
+    ]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        regions = dict(conn.execute("SELECT id, region FROM customers"))
+        spend: dict[int, float] = defaultdict(float)
+        for customer_id, qty, price in conn.execute(
+            "SELECT o.customer_id, oi.quantity, oi.unit_price "
+            "FROM orders o JOIN order_items oi ON oi.order_id = o.id"
+        ):
+            spend[customer_id] += qty * price
+    finally:
+        conn.close()
+
+    by_region: dict[str, list[float]] = defaultdict(list)
+    for customer_id, total in spend.items():
+        by_region[regions[customer_id]].append(total)
+
+    rows = ans.result.rows
+    assert {r[0] for r in rows} == set(by_region)
+    for region, buyers, revenue, avg in rows:
+        totals = by_region[region]
+        assert buyers == len(totals)
+        assert revenue == pytest.approx(sum(totals), abs=0.01)
+        assert avg == pytest.approx(sum(totals) / len(totals), abs=0.01)
+    avgs = [r[3] for r in rows]
+    assert avgs == sorted(avgs, reverse=True)

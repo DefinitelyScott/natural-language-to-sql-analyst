@@ -71,3 +71,5 @@
 {"canonical": "Show revenue by customer signup quarter.", "paraphrase": "Break down revenue by quarter of sign-up."}
 {"canonical": "How many orders were placed in each region?", "paraphrase": "Show the number of orders by region."}
 {"canonical": "How many orders were placed in each region?", "paraphrase": "Which region has the most orders?"}
+{"canonical": "What is the average revenue per customer in each region?", "paraphrase": "Show ARPU by region."}
+{"canonical": "What is the average revenue per customer in each region?", "paraphrase": "Which region has the highest spend per customer?"}

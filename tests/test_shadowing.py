@@ -112,6 +112,11 @@ ACCEPTED_SHADOWING: dict[str, tuple[str, ...]] = {
     "How many orders contain products from more than one category?": (
         "How many orders do we have?",
     ),
+    # ARPU by region sits ahead of the ungrouped ARPU rule, which also matches
+    # "revenue per customer" and would answer with one global figure.
+    "What is the average revenue per customer in each region?": (
+        "What is the average revenue per customer?",
+    ),
 }
 
 #: What the question would be answered with if the order were reversed.
@@ -176,6 +181,11 @@ SHADOWING_RATIONALE: dict[str, str] = {
         "more than one category', so it matches and would return the count of "
         "all orders rather than of the cross-category subset — a plausible "
         "single number, several times too large."
+    ),
+    "What is the average revenue per customer in each region?": (
+        "the ungrouped ARPU rule keys on 'revenue per customer' and does not "
+        "look at 'region', so it would return one global average with the "
+        "regional split silently dropped -- correctly labelled, wrong grain."
     ),
 }
 

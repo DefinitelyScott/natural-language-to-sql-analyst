@@ -930,6 +930,54 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY monetary DESC, customer_id
             """,
         ),
+        # ARPU by customer region: the grouped counterpart of the ARPU rule
+        # below, registered ahead of it for the same reason the order-count-by-
+        # region rule sits ahead of the order counter -- "revenue per customer
+        # by region" contains the phrase the ungrouped ARPU rule keys on, so
+        # without this rule it would be answered with one global figure and
+        # the region silently dropped.
+        #
+        # Two lookaheads rather than one ordered pattern, because the question
+        # arrives in either order ("ARPU by region" / "which region has the
+        # highest spend per customer?"): one asserts a per-customer revenue
+        # phrase, the other asserts the word "region". Both must hold, and
+        # neither fixes where the other sits in the sentence.
+        #
+        # The shape is the ARPU rule's: roll spend up to one row per customer
+        # first, then average those totals, so the figure is revenue per
+        # *customer* and not per order line. Only customers who have ordered
+        # are counted (the INNER JOIN), the same "per paying customer"
+        # definition as the ungrouped rule, so the regional numbers are
+        # directly comparable with the global one. paying_customers is shown
+        # beside the average because a regional mean over a handful of buyers
+        # is weaker evidence than one over dozens.
+        (
+            re.compile(
+                r"\A(?=.*(?:\barpu\b"
+                r"|(?:revenue|spend|sales)\s+per\s+customer"
+                r"|per[- ]customer\s+(?:revenue|spend|sales)"
+                r"|(?:average|avg|mean).*(?:revenue|spend|sales).*per\s+customer))"
+                r"(?=.*\bregions?\b)",
+                re.I,
+            ),
+            """
+            WITH customer_revenue AS (
+                SELECT o.customer_id AS customer_id,
+                       SUM(oi.quantity * oi.unit_price) AS revenue
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY o.customer_id
+            )
+            SELECT c.region AS region,
+                   COUNT(*) AS paying_customers,
+                   ROUND(SUM(cr.revenue), 2) AS total_revenue,
+                   ROUND(AVG(cr.revenue), 2) AS avg_revenue_per_customer
+            FROM customer_revenue cr
+            JOIN customers c ON c.id = cr.customer_id
+            GROUP BY c.region
+            ORDER BY avg_revenue_per_customer DESC, region
+            """,
+        ),
         # Average revenue per customer (ARPU): mean lifetime spend per paying
         # customer. A first CTE rolls the money up to one row per customer
         # (their total spend); the outer query then AVGs those per-customer
