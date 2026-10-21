@@ -3683,3 +3683,114 @@ def test_end_to_end_arpu_by_region():
         assert avg == pytest.approx(sum(totals) / len(totals), abs=0.01)
     avgs = [r[3] for r in rows]
     assert avgs == sorted(avgs, reverse=True)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which products are priced above the average for their category?",
+        "Which products cost more than their category's average price?",
+        "List products with a price above their category average.",
+        "Show products that are more expensive than the average in their category",
+    ],
+)
+def test_offline_matches_products_above_category_average_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "category_avg_price" in sql
+    assert "premium" in sql
+
+
+def test_products_above_category_average_leaves_neighbouring_rules_alone():
+    backend = OfflineBackend()
+    # The revenue-based "above-average categories" question keeps its own rule.
+    assert "category_revenue" in backend.to_sql(
+        "Which categories have above-average revenue?", schema=""
+    )
+    # Plain product-revenue and category questions are untouched.
+    assert "premium" not in backend.to_sql("Show revenue by category", schema="")
+    assert "premium" not in backend.to_sql(
+        "What are the top 5 products by revenue?", schema=""
+    )
+
+
+def test_products_above_category_average_uses_each_categorys_own_mean():
+    # Category X: prices 10, 20, 90 (mean 40) -> only the 90 item qualifies.
+    # Category Y: prices 100, 110 (mean 105) -> only the 110 item qualifies.
+    # A single global mean (66.0) would wrongly return 90, 100 and 110, and
+    # would miss nothing in Y but add Y's 100; this data separates the two.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE products (
+            id INTEGER, name TEXT, category TEXT, price REAL
+        );
+        INSERT INTO products VALUES
+            (1, 'x10', 'X', 10.0), (2, 'x20', 'X', 20.0), (3, 'x90', 'X', 90.0),
+            (4, 'y100', 'Y', 100.0), (5, 'y110', 'Y', 110.0);
+        """
+    )
+    sql = OfflineBackend().to_sql(
+        "Which products are priced above the average for their category?", schema=""
+    )
+    assert conn.execute(sql).fetchall() == [
+        ("X", "x90", 90.0, 40.0, 50.0),
+        ("Y", "y110", 110.0, 105.0, 5.0),
+    ]
+
+
+def test_products_above_category_average_excludes_ties_and_single_product_categories():
+    # A product equal to its category mean is not "above" it, and a category
+    # with one product has itself as the mean, so it never qualifies.
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(
+        """
+        CREATE TABLE products (id INTEGER, name TEXT, category TEXT, price REAL);
+        INSERT INTO products VALUES
+            (1, 'a', 'X', 10.0), (2, 'b', 'X', 10.0), (3, 'solo', 'Z', 50.0);
+        """
+    )
+    sql = OfflineBackend().to_sql(
+        "Which products cost more than their category average price?", schema=""
+    )
+    assert conn.execute(sql).fetchall() == []
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_products_above_category_average():
+    # Recomputed in Python from the raw products table, not from the rule's SQL.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(
+        DB, "Which products are priced above the average for their category?"
+    )
+    assert ans.result.columns == [
+        "category",
+        "name",
+        "price",
+        "category_avg_price",
+        "premium",
+    ]
+
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        products = conn.execute("SELECT category, name, price FROM products").fetchall()
+    finally:
+        conn.close()
+
+    prices: dict[str, list[float]] = defaultdict(list)
+    for category, _, price in products:
+        prices[category].append(price)
+    mean = {c: sum(v) / len(v) for c, v in prices.items()}
+    expected = {name for category, name, price in products if price > mean[category]}
+
+    rows = ans.result.rows
+    assert {r[1] for r in rows} == expected
+    assert expected  # the sample data must exercise the rule
+    for category, _, price, avg, premium in rows:
+        assert avg == pytest.approx(mean[category], abs=0.005)
+        assert premium == pytest.approx(price - mean[category], abs=0.005)

@@ -73,3 +73,5 @@
 {"canonical": "How many orders were placed in each region?", "paraphrase": "Which region has the most orders?"}
 {"canonical": "What is the average revenue per customer in each region?", "paraphrase": "Show ARPU by region."}
 {"canonical": "What is the average revenue per customer in each region?", "paraphrase": "Which region has the highest spend per customer?"}
+{"canonical": "Which products are priced above the average for their category?", "paraphrase": "Which products cost more than their category's average price?"}
+{"canonical": "Which products are priced above the average for their category?", "paraphrase": "List products with a price above their category average."}

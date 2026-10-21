@@ -1077,6 +1077,60 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY c.region, revenue DESC
             """,
         ),
+        # Products priced above the average price of their own category. This
+        # is a question about the catalog, not about sales: it reads only the
+        # products table, so a product that has never sold still appears.
+        #
+        # The comparison is *per row against a group statistic*, which is the
+        # one shape the catalog has not used yet. The category rule below
+        # compares a group total to the mean of all group totals (a scalar
+        # subquery); here every product is compared to the mean of *its own*
+        # group, so the threshold differs from row to row. The derived table
+        # ``avg_by_category`` computes one mean per category and the JOIN on
+        # category hands each product the mean it must beat. A single global
+        # AVG(price) would answer a different question ("pricier than the
+        # average product") and would flag every Electronics item simply
+        # because that category is expensive.
+        #
+        # ``premium`` is price minus the category mean, ordered descending
+        # within each category, so the biggest outlier leads its group. The
+        # comparison uses the unrounded mean; only the displayed columns are
+        # rounded, so a product 0.001 above the mean is not dropped by
+        # rounding noise.
+        #
+        # The matcher uses lookaheads because the sentence can be ordered
+        # many ways ("priced above their category average", "cost more than
+        # the average in their category"). It needs a product word, a price
+        # word, an above-type word, an average word and a category word, all
+        # present. The price word is what keeps it apart from the
+        # above-average-revenue rule below, which has no price vocabulary, and
+        # that rule stays registered after this one so neither shadows the
+        # other.
+        (
+            re.compile(
+                r"\A(?=.*\bproducts?\b)"
+                r"(?=.*\b(?:price[ds]?|pricier|expensive|costs?|costly)\b)"
+                r"(?=.*\b(?:above|over|higher|greater|more|exceeds?)\b)"
+                r"(?=.*\b(?:average|avg|mean)\b)"
+                r"(?=.*\bcategor(?:y|ies)\b)",
+                re.I,
+            ),
+            """
+            SELECT p.category AS category,
+                   p.name AS name,
+                   p.price AS price,
+                   ROUND(a.avg_price, 2) AS category_avg_price,
+                   ROUND(p.price - a.avg_price, 2) AS premium
+            FROM products p
+            JOIN (
+                SELECT category, AVG(price) AS avg_price
+                FROM products
+                GROUP BY category
+            ) a ON a.category = p.category
+            WHERE p.price > a.avg_price
+            ORDER BY p.category, premium DESC, p.name
+            """,
+        ),
         # Categories whose revenue is above the average category revenue.
         # A first CTE totals each category's revenue; the outer query then
         # keeps only the categories whose revenue exceeds the mean, obtained
