@@ -2205,6 +2205,64 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY revenue DESC
             """,
         ),
+        # Order-value distribution -- how the 900 orders spread across fixed
+        # dollar bands, as opposed to the single-number answers the average
+        # and median order-value rules give. A mean of ~$180 cannot tell a
+        # shop of uniform $180 baskets from one of many $20 baskets and a few
+        # $900 ones; the band counts can.
+        #
+        # An order's total exists only as an aggregate, so it is computed once
+        # in a CTE (SUM over order_items per order) and then banded. Joining
+        # orders to order_items and grouping by band directly would count
+        # *item rows*, not orders, and bucket each line by its own value.
+        # Orders with no items have no total and are left out, the same way
+        # the average and median order-value rules treat them.
+        #
+        # pct_of_orders is divided by the number of totalled orders, so the
+        # column sums to 100. ORDER BY MIN(total) sorts bands by their actual
+        # contents (cheapest first) rather than by label text, which would
+        # put '$100-$199.99' ahead of '$50-$99.99'.
+        #
+        # Registered ahead of the price-tier rule only to keep the banding
+        # rules together; its vocabulary (distribution/histogram/bands of
+        # order value) does not overlap with the average-order-value rules'
+        # "average ... order value" or the orders-per-customer rule's
+        # "distribution of orders".
+        (
+            re.compile(
+                r"\b(?:distribution|histogram|breakdown|spread)\s+of\s+"
+                r"(?:the\s+)?(?:order|basket)\s+(?:values?|totals?|sizes?)\b"
+                r"|\b(?:order|basket)\s+(?:values?|totals?|sizes?)\s+"
+                r"(?:distribution|histogram|breakdown|bands?|buckets?|brackets?)\b"
+                r"|\borders?\s+(?:by|per)\s+(?:order\s+)?(?:value|total|size)\s+"
+                r"(?:band|bucket|bracket|range)s?\b"
+                r"|\bhow\s+are\s+(?:order|basket)\s+(?:values?|totals?|sizes?)\s+"
+                r"distributed\b",
+                re.I,
+            ),
+            """
+            WITH order_totals AS (
+                SELECT order_id,
+                       SUM(quantity * unit_price) AS total
+                FROM order_items
+                GROUP BY order_id
+            )
+            SELECT CASE
+                       WHEN total < 50 THEN 'Under $50'
+                       WHEN total < 100 THEN '$50-$99.99'
+                       WHEN total < 200 THEN '$100-$199.99'
+                       WHEN total < 400 THEN '$200-$399.99'
+                       ELSE '$400 and up'
+                   END AS order_value_band,
+                   COUNT(*) AS orders,
+                   ROUND(100.0 * COUNT(*) / (SELECT COUNT(*) FROM order_totals), 1)
+                       AS pct_of_orders,
+                   ROUND(SUM(total), 2) AS revenue
+            FROM order_totals
+            GROUP BY order_value_band
+            ORDER BY MIN(total)
+            """,
+        ),
         # Revenue by price tier -- fixed-threshold *banding* of a continuous
         # variable: each product falls into Budget / Mid-range / Premium by
         # comparing its price against dollar cutoffs. This is the complement

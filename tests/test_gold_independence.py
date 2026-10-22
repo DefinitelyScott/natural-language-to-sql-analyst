@@ -136,6 +136,15 @@ REWRITE_RATIONALE = {
         "before summing by weekday rather than summing across the orders x "
         "order_items fan-out."
     ),
+    "Show the distribution of order values.": (
+        "the rule totals each order in a CTE and bands the total with a CASE "
+        "ladder, ordering bands by the smallest total observed in each; the "
+        "gold query states the band bounds as data in a VALUES relation, "
+        "totals each order with a correlated subquery, joins on a half-open "
+        "range and orders by the declared lower bound. A wrong comparison in "
+        "the ladder (< where <= belongs) or banding item lines instead of "
+        "order totals moves the rule and not the gold query."
+    ),
     "Show revenue by price tier.": (
         "the rule bands prices with a CASE ladder and orders the bands by "
         "MIN(p.price) observed in each; the gold query states the boundaries as "

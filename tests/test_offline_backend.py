@@ -3794,3 +3794,76 @@ def test_end_to_end_products_above_category_average():
     for category, _, price, avg, premium in rows:
         assert avg == pytest.approx(mean[category], abs=0.005)
         assert premium == pytest.approx(price - mean[category], abs=0.005)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Show the distribution of order values.",
+        "What is the order value distribution?",
+        "Show a histogram of order totals.",
+        "How are order values distributed?",
+        "Break down orders by value band.",
+    ],
+)
+def test_offline_matches_order_value_distribution_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "order_value_band" in sql
+    assert "WITH order_totals" in sql
+
+
+def test_order_value_distribution_does_not_shadow_neighbouring_rules():
+    # The band vocabulary must not capture the scalar order-value rules or the
+    # orders-per-customer distribution, which share the words "order" and
+    # "distribution" but answer different questions.
+    backend = OfflineBackend()
+    for question in (
+        "What is the average order value?",
+        "What is the median order value?",
+        "Show the distribution of orders per customer.",
+        "What are the 10 largest orders?",
+        "Show revenue by price tier.",
+    ):
+        assert "order_value_band" not in backend.to_sql(question, schema=""), question
+    assert len(backend.matching_rule_indexes("Show the distribution of order values.")) == 1
+
+
+@pytest.mark.skipif(not os.path.exists(DB), reason="sample DB not built")
+def test_end_to_end_order_value_distribution():
+    # Independent Python recomputation from raw item rows: total each order,
+    # bucket it, and the query must agree band for band. Every order lands in
+    # exactly one band, so counts sum to the order total, percentages to ~100
+    # and band revenue to total revenue; bands come back cheapest-first.
+    import sqlite3
+    from collections import defaultdict
+
+    ans = generator.answer_question(DB, "Show the distribution of order values.")
+    assert ans.result.columns == ["order_value_band", "orders", "pct_of_orders", "revenue"]
+    rows = [tuple(row) for row in ans.result.rows]
+    assert [r[0] for r in rows] == [
+        "Under $50", "$50-$99.99", "$100-$199.99", "$200-$399.99", "$400 and up",
+    ]
+
+    def band(total: float) -> str:
+        for limit, label in ((50, "Under $50"), (100, "$50-$99.99"),
+                             (200, "$100-$199.99"), (400, "$200-$399.99")):
+            if total < limit:
+                return label
+        return "$400 and up"
+
+    conn = sqlite3.connect(DB)
+    try:
+        totals = [t for (t,) in conn.execute(
+            "SELECT SUM(quantity * unit_price) FROM order_items GROUP BY order_id")]
+    finally:
+        conn.close()
+    counts: dict[str, int] = defaultdict(int)
+    revenue: dict[str, float] = defaultdict(float)
+    for t in totals:
+        counts[band(t)] += 1
+        revenue[band(t)] += t
+    for label, n, pct, rev in rows:
+        assert n == counts[label]
+        assert pct == pytest.approx(100.0 * n / len(totals), abs=0.05)
+        assert rev == pytest.approx(revenue[label], abs=0.01)
+    assert sum(r[1] for r in rows) == len(totals)
