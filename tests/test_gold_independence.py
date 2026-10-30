@@ -89,6 +89,14 @@ KNOWN_SELF_COMPARING = frozenset(
 #: An entry is documentation, not an assertion; the mechanical check is
 #: ``check_independence``, which compares the two query texts.
 REWRITE_RATIONALE = {
+    "How many units were sold in each category?": (
+        "the rule joins products to order_items and aggregates with a window "
+        "total for the share column; the gold query sums quantity in a "
+        "correlated subquery per category, counts orders with EXISTS rather "
+        "than COUNT(DISTINCT), and divides by a separate scalar total. A join "
+        "that counted line items as orders would inflate the rule's orders "
+        "column and not the gold query's."
+    ),
     "What were total sales by month in 2024?": (
         "the rule sums across the orders x order_items fan-out; the gold query "
         "totals each order in a correlated subquery first and then sums those "

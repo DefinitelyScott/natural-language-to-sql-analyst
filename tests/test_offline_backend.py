@@ -3867,3 +3867,52 @@ def test_end_to_end_order_value_distribution():
         assert pct == pytest.approx(100.0 * n / len(totals), abs=0.05)
         assert rev == pytest.approx(revenue[label], abs=0.01)
     assert sum(r[1] for r in rows) == len(totals)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many units were sold in each category?",
+        "Show units sold by category.",
+        "Quantity ordered per category.",
+        "Items sold across categories.",
+    ],
+)
+def test_offline_matches_units_sold_by_category_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "units_sold" in sql
+    assert "pct_of_units" in sql
+
+
+def test_units_sold_by_category_does_not_shadow_neighbouring_rules():
+    # Revenue and best-seller questions share the word "category" but are
+    # measured in dollars or ranked by product, not totalled in units.
+    backend = OfflineBackend()
+    for question in (
+        "Show revenue by category",
+        "What is the best-selling product in each category?",
+        "What is the average number of items per order?",
+    ):
+        assert "pct_of_units" not in backend.to_sql(question, schema="")
+
+
+def test_end_to_end_units_sold_by_category():
+    import sqlite3
+
+    # Independent recomputation in Python from the raw tables.
+    sql = OfflineBackend().to_sql("How many units were sold in each category?", schema="")
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(sql).fetchall()
+        expected: dict[str, int] = {}
+        for category, quantity in conn.execute(
+            "SELECT p.category, oi.quantity FROM order_items oi "
+            "JOIN products p ON p.id = oi.product_id"
+        ):
+            expected[category] = expected.get(category, 0) + quantity
+    finally:
+        conn.close()
+    assert {r[0]: r[1] for r in rows} == expected
+    assert sum(r[3] for r in rows) == pytest.approx(100.0, abs=0.2)
+    units = [r[1] for r in rows]
+    assert units == sorted(units, reverse=True)

@@ -1393,6 +1393,36 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY revenue DESC
             """,
         ),
+        # Units sold by category -- volume, where the neighbouring rules rank
+        # by dollars. A category of cheap goods can lead on units and trail on
+        # revenue, so the two answers differ and neither stands in for the
+        # other. The pattern requires a unit/quantity word *and* a category
+        # dimension, so it does not capture the revenue-by-category rules
+        # (no "units") or the best-selling-product rules (no "units sold").
+        #
+        # SUM(quantity) counts units; COUNT(DISTINCT order_id) counts the
+        # orders they arrived in (COUNT(*) would count line items). The share
+        # column is divided by the window total, so it sums to 100.
+        (
+            re.compile(
+                r"\b(?:units?|quantit(?:y|ies)|items?)\s+(?:(?:was|were|are|is)\s+)?(?:sold|ordered|purchased)\b"
+                r"[^?]*\b(?:by|per|across|in\s+each|for\s+each)\s+categor(?:y|ies)\b"
+                r"|\bcategor(?:y|ies)\b[^?]*\b(?:units?|quantit(?:y|ies))\s+"
+                r"(?:sold|ordered|purchased)\b",
+                re.I,
+            ),
+            """
+            SELECT p.category AS category,
+                   SUM(oi.quantity) AS units_sold,
+                   COUNT(DISTINCT oi.order_id) AS orders,
+                   ROUND(100.0 * SUM(oi.quantity)
+                         / SUM(SUM(oi.quantity)) OVER (), 1) AS pct_of_units
+            FROM products p
+            JOIN order_items oi ON oi.product_id = p.id
+            GROUP BY p.category
+            ORDER BY units_sold DESC, category
+            """,
+        ),
         (
             re.compile(r"(revenue|sales).*(by|per).*(category)", re.I),
             """
