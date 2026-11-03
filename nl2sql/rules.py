@@ -2560,6 +2560,54 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY revenue_change DESC, product
             """,
         ),
+        # Busiest calendar days -- the ten dates with the most orders. This is
+        # a *peak-day* question: it ranks individual dates, where the
+        # day-of-week rule below pools every Monday into one row, and the
+        # largest-orders rule ranks single orders by value, not days by volume.
+        #
+        # Revenue needs each order's total first, so the inner query totals
+        # items per order and the outer one groups those orders by date.
+        # Joining order_items straight to a GROUP BY order_date would make
+        # COUNT(*) count line items rather than orders.
+        #
+        # RANK() (not ROW_NUMBER) is deliberate: the sample data has many
+        # days tied on the same order count, and ROW_NUMBER would present an
+        # arbitrary date-order tie-break as if it were a real ranking. With
+        # RANK, tied days share a rank number and the reader can see it. The
+        # LIMIT still cuts the list at ten rows, so the tail of a tie may be
+        # truncated; the rank column makes that visible rather than hiding it.
+        #
+        # Two guards keep it from over-matching. The negative lookahead
+        # declines "busiest day of the week" (a weekday question for the
+        # rule below), and _UNSCOPED_ONLY declines period-scoped phrasings
+        # ("busiest day in 2024") that this all-time SQL does not honour.
+        (
+            re.compile(
+                _UNSCOPED_ONLY
+                + r"(?!.*(?:\bof\s+(?:the\s+)?week\b|\bweekdays?\b)).*"
+                r"(?:\b(?:busiest|peak|most[-\s]active)\s+(?:calendar\s+)?days?\b"
+                r"|\bdays?\b[^?]*\bmost\s+orders\b"
+                r"|\bmost\s+orders\b[^?]*\b(?:in|on)\s+a\s+(?:single\s+)?day\b)",
+                re.I,
+            ),
+            """
+            SELECT order_date AS order_date,
+                   COUNT(*) AS orders,
+                   ROUND(SUM(total), 2) AS revenue,
+                   RANK() OVER (ORDER BY COUNT(*) DESC) AS busiest_rank
+            FROM (
+                SELECT o.id AS id,
+                       o.order_date AS order_date,
+                       SUM(oi.quantity * oi.unit_price) AS total
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY o.id, o.order_date
+            )
+            GROUP BY order_date
+            ORDER BY orders DESC, order_date
+            LIMIT 10
+            """,
+        ),
         # Revenue split by day of the week (Sunday..Saturday). SQLite's
         # strftime('%w', ...) returns the weekday as a digit 0-6 with
         # Sunday == 0; a CASE expression turns that digit into a readable

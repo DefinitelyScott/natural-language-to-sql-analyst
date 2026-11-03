@@ -89,6 +89,15 @@ KNOWN_SELF_COMPARING = frozenset(
 #: An entry is documentation, not an assertion; the mechanical check is
 #: ``check_independence``, which compares the two query texts.
 REWRITE_RATIONALE = {
+    "Which day had the most orders?": (
+        "the rule totals items per order in a derived table, groups those "
+        "orders by date and ranks with RANK() OVER; the gold query counts "
+        "orders per date in a CTE, sums revenue in a correlated subquery and "
+        "computes the rank as 1 + the number of dates with a strictly higher "
+        "count. A join that counted line items as orders would inflate the "
+        "rule's orders column and not the gold query's, and ROW_NUMBER in "
+        "place of RANK would disagree with the gold rank on tied days."
+    ),
     "How many units were sold in each category?": (
         "the rule joins products to order_items and aggregates with a window "
         "total for the share column; the gold query sums quantity in a "

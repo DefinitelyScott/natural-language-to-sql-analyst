@@ -19,3 +19,4 @@
 {"question": "What are the bottom 5 products by units sold?", "reason": "the bottom-products rule ranks by revenue; a units ranking of the low end is not implemented and must not be answered in revenue"}
 {"question": "Which month in 2024 had the highest revenue?", "reason": "year-scoped; the best-and-worst-month rule covers every month on record and must decline rather than ignore the year"}
 {"question": "Which category had its best month?", "reason": "asks for a per-category answer; the best-and-worst-month rule ranks total revenue only"}
+{"question": "Which day of the week has the most orders?", "reason": "a weekday question; the busiest-days rule ranks individual dates, and the day-of-week rule only reports revenue, so this must decline rather than return calendar dates"}

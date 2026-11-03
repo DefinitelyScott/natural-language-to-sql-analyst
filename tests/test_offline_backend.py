@@ -3916,3 +3916,64 @@ def test_end_to_end_units_sold_by_category():
     assert sum(r[3] for r in rows) == pytest.approx(100.0, abs=0.2)
     units = [r[1] for r in rows]
     assert units == sorted(units, reverse=True)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which day had the most orders?",
+        "What were our busiest days?",
+        "Show the peak day for orders.",
+        "On which dates did we get the most orders in a single day?",
+    ],
+)
+def test_offline_matches_busiest_days_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "busiest_rank" in sql
+
+
+def test_busiest_days_declines_weekday_and_period_scoped_questions():
+    # "Day of the week" is a different question (a weekday rollup) and a year
+    # scope is a window this all-time SQL does not honour; answering either
+    # with the top-ten dates would look right and be wrong.
+    backend = OfflineBackend()
+    for question in (
+        "Which day of the week has the most orders?",
+        "What was the busiest day in 2024?",
+        "Which day last month had the most orders?",
+    ):
+        if backend.matching_rule_indexes(question):
+            assert "busiest_rank" not in backend.to_sql(question, schema="")
+
+
+def test_busiest_days_does_not_shadow_neighbouring_rules():
+    backend = OfflineBackend()
+    for question in (
+        "Show revenue by day of week.",
+        "What are the 10 largest orders?",
+        "Which month had the highest revenue?",
+    ):
+        assert "busiest_rank" not in backend.to_sql(question, schema="")
+
+
+def test_end_to_end_busiest_days():
+    import sqlite3
+
+    sql = OfflineBackend().to_sql("Which day had the most orders?", schema="")
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(sql).fetchall()
+        per_day: dict[str, int] = {}
+        for (order_date,) in conn.execute(
+            "SELECT order_date FROM orders WHERE id IN (SELECT order_id FROM order_items)"
+        ):
+            per_day[order_date] = per_day.get(order_date, 0) + 1
+    finally:
+        conn.close()
+    assert len(rows) == 10
+    counts = sorted(per_day.values(), reverse=True)
+    assert [r[1] for r in rows] == counts[:10]
+    assert all(per_day[r[0]] == r[1] for r in rows)
+    # RANK: tied days share a rank, and a rank is 1 + days strictly ahead.
+    for _, orders, _, rank in rows:
+        assert rank == 1 + sum(1 for n in per_day.values() if n > orders)

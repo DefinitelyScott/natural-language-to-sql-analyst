@@ -81,3 +81,6 @@
 {"canonical": "How many units were sold in each category?", "paraphrase": "Show units sold by category."}
 {"canonical": "How many units were sold in each category?", "paraphrase": "Quantity ordered per category."}
 {"canonical": "How many units were sold in each category?", "paraphrase": "Items sold across categories."}
+{"canonical": "Which day had the most orders?", "paraphrase": "What were our busiest days?"}
+{"canonical": "Which day had the most orders?", "paraphrase": "Show the peak day for orders."}
+{"canonical": "Which day had the most orders?", "paraphrase": "On which dates did we get the most orders in a single day?"}
