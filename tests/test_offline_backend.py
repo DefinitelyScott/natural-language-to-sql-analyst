@@ -3977,3 +3977,67 @@ def test_end_to_end_busiest_days():
     # RANK: tied days share a rank, and a rank is 1 + days strictly ahead.
     for _, orders, _, rank in rows:
         assert rank == 1 + sum(1 for n in per_day.values() if n > orders)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many orders were placed each month?",
+        "Show the number of orders per month.",
+        "Orders each month.",
+        "What was our monthly order volume?",
+    ],
+)
+def test_offline_matches_orders_by_month_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "strftime('%Y-%m', order_date) AS month" in sql
+    assert "COUNT(*) AS orders" in sql
+
+
+def test_orders_by_month_declines_period_scoped_questions():
+    # A year or relative window is one this all-time SQL does not honour;
+    # answering with every month on record would look right and be wrong.
+    backend = OfflineBackend()
+    for question in (
+        "How many orders were placed each month in 2024?",
+        "Show orders per month over the last 6 months.",
+    ):
+        assert backend.matching_rule_indexes(question) == []
+
+
+def test_orders_by_month_does_not_shadow_neighbouring_rules():
+    backend = OfflineBackend()
+    for question in (
+        "Show total sales by month in 2024",
+        "How many orders were placed in the last 30 days?",
+        "How many unique customers placed an order each month in 2024?",
+        "How many orders do we have?",
+    ):
+        assert "COUNT(*) AS orders" not in backend.to_sql(question, schema="") or (
+            "strftime('%Y-%m', order_date) AS month" not in backend.to_sql(question, schema="")
+        )
+
+
+def test_end_to_end_orders_by_month():
+    import sqlite3
+
+    sql = OfflineBackend().to_sql("How many orders were placed each month?", schema="")
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(sql).fetchall()
+        per_month: dict[str, int] = {}
+        for (order_date,) in conn.execute(
+            "SELECT order_date FROM orders WHERE id IN (SELECT order_id FROM order_items)"
+        ):
+            per_month[order_date[:7]] = per_month.get(order_date[:7], 0) + 1
+        total_revenue = conn.execute(
+            "SELECT ROUND(SUM(quantity * unit_price), 2) FROM order_items"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    # One row per month, in calendar order, each count equal to a Python tally.
+    assert [r[0] for r in rows] == sorted(per_month)
+    assert {r[0]: r[1] for r in rows} == per_month
+    # Counting orders, not line items: the counts sum to the order total.
+    assert sum(r[1] for r in rows) == sum(per_month.values())
+    assert sum(r[2] for r in rows) == pytest.approx(total_revenue, abs=0.05)

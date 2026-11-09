@@ -2608,6 +2608,55 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             LIMIT 10
             """,
         ),
+        # Order volume by month -- how many orders were placed in each calendar
+        # month, with the revenue those orders brought in. The catalog already
+        # had revenue by month (dollars) and monthly active customers (people);
+        # this is the third monthly view, order *counts*, which is what an
+        # operations question like "was March busier than February?" asks.
+        #
+        # Like the busiest-days rule, it totals items per order in a derived
+        # table first and groups those orders by month afterwards. Joining
+        # order_items straight to GROUP BY month would make COUNT(*) count
+        # line items, not orders, and an order with three items would be
+        # counted three times. The inner JOIN also means an order with no
+        # items is not counted, so orders and revenue describe the same set.
+        #
+        # strftime('%Y-%m', ...) keeps the year in the label, so January 2024
+        # and January 2025 stay separate rows rather than merging into one
+        # "01" bucket. A month with no orders produces no row (there is no
+        # calendar table to anchor a LEFT JOIN on); in the sample data every
+        # month has orders, so this matters only if the data develops a gap.
+        #
+        # _UNSCOPED_ONLY declines period-scoped phrasings ("each month in
+        # 2024", "last 6 months"): this SQL covers every month on record, and
+        # answering a windowed question with all months would look right while
+        # ignoring the window. "Revenue by month" is answered by an earlier
+        # rule, so the "orders" noun is required here.
+        (
+            re.compile(
+                _UNSCOPED_ONLY
+                + r".*(?:\borders?\b[^?]*\b(?:by|per|each|every)\s+month\b"
+                r"|\bmonthly\s+orders?\b"
+                r"|\bmonth(?:ly)?\s+(?:order\s+)?(?:counts?|volumes?)\b"
+                r"|\bnumber\s+of\s+orders\b[^?]*\bmonth\b)",
+                re.I,
+            ),
+            """
+            SELECT strftime('%Y-%m', order_date) AS month,
+                   COUNT(*) AS orders,
+                   ROUND(SUM(total), 2) AS revenue
+            FROM (
+                SELECT o.id AS id,
+                       o.order_date AS order_date,
+                       SUM(oi.quantity * oi.unit_price) AS total
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                GROUP BY o.id, o.order_date
+            )
+            GROUP BY month
+            ORDER BY month
+            """,
+        ),
         # Revenue split by day of the week (Sunday..Saturday). SQLite's
         # strftime('%w', ...) returns the weekday as a digit 0-6 with
         # Sunday == 0; a CASE expression turns that digit into a readable

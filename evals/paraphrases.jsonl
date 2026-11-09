@@ -84,3 +84,6 @@
 {"canonical": "Which day had the most orders?", "paraphrase": "What were our busiest days?"}
 {"canonical": "Which day had the most orders?", "paraphrase": "Show the peak day for orders."}
 {"canonical": "Which day had the most orders?", "paraphrase": "On which dates did we get the most orders in a single day?"}
+{"canonical": "How many orders were placed each month?", "paraphrase": "Show the number of orders per month."}
+{"canonical": "How many orders were placed each month?", "paraphrase": "Orders each month."}
+{"canonical": "How many orders were placed each month?", "paraphrase": "What was our monthly order volume?"}
