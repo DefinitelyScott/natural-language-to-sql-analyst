@@ -10,7 +10,7 @@ questions that must match *nothing*; the paraphrase set only asks whether two
 phrasings agree with each other, which they do whether or not a third rule is
 quietly one line away from taking both.
 
-Eleven of the fifty-nine gold questions are decided this way today, and that is
+Eleven of the sixty-six gold questions are decided this way today, and that is
 not in itself a defect. In every one of them the answering rule's pattern is
 strictly more demanding than the patterns behind it — "average order value *by
 region*" ahead of "average order value", "revenue by category *with a total
@@ -94,9 +94,6 @@ ACCEPTED_SHADOWING: dict[str, tuple[str, ...]] = {
     "What share of customers bought from each category?": (
         "What percentage of revenue comes from each category?",
     ),
-    "What is the average order value by month in 2024?": (
-        "What is the average order value?",
-    ),
     "What is the average order value by region?": ("What is the average order value?",),
     "What is the best-selling product in each category?": (
         "What is the best selling product?",
@@ -153,9 +150,6 @@ SHADOWING_RATIONALE: dict[str, str] = {
         "question asks what fraction of *customers* bought from each. A "
         "mis-ordering here changes the subject of the answer rather than its "
         "granularity, and both tables are one percentage column per category."
-    ),
-    "What is the average order value by month in 2024?": (
-        "the monthly series ahead of the single overall figure."
     ),
     "What is the average order value by region?": (
         "the per-region breakdown ahead of the single overall figure."

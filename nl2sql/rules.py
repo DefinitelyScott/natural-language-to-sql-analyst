@@ -30,11 +30,11 @@ import re
 #: The single optional ``\w+`` between the qualifier and the unit is what lets
 #: one alternative cover "last month", "last 7 days" and "past few weeks"
 #: without enumerating the fillers.
-_PERIOD_SCOPED = (
+_RELATIVE_PERIOD = (
     r"\b(?:last|past|previous|this|current)\s+(?:\w+\s+)?"
     r"(?:day|week|month|quarter|year)s?\b"
-    r"|\b(?:19|20)\d{2}\b"
 )
+_PERIOD_SCOPED = _RELATIVE_PERIOD + r"|\b(?:19|20)\d{2}\b"
 
 #: Prefix for a rule whose SQL aggregates over a whole table with no date
 #: filter, e.g. ``SELECT COUNT(*) FROM orders``.
@@ -56,6 +56,32 @@ _PERIOD_SCOPED = (
 #: the last 30 days", "revenue by month in 2024") are registered earlier and
 #: win under first-match resolution before these are consulted.
 _UNSCOPED_ONLY = rf"\A(?!.*(?:{_PERIOD_SCOPED}))"
+
+#: The calendar year that the year-pinned time-series rules hardcode in their
+#: SQL (``WHERE o.order_date >= '2024-01-01' AND o.order_date < '2025-01-01'``).
+#: It is the last complete year in the sample data. Kept as one constant so the
+#: guard below and ``tests/test_pinned_year.py`` agree on which year that is.
+PINNED_YEAR = 2024
+
+#: Prefix for a rule whose SQL is pinned to :data:`PINNED_YEAR`.
+#:
+#: The sibling of :data:`_UNSCOPED_ONLY` for the opposite kind of rule. Those
+#: rules ignore a period they were asked about; these *substitute* one. "Show
+#: revenue by quarter in 2023." used to match the quarterly rule and come back
+#: as four rows labelled 2024-Q1 .. 2024-Q4: an answer about the wrong year,
+#: and worse than declining, because nothing in the CLI output says the year
+#: in the question was replaced.
+#:
+#: The guard declines any *other* calendar year and any relative window ("last
+#: 6 months", "this year"), because the SQL honours neither. It does not
+#: decline a question that names no period at all: "show revenue by quarter"
+#: still returns 2024, which the result labels make visible (``2024-Q1``,
+#: ``2024-01``). That is a narrower, labelled default rather than a silent
+#: substitution, and changing it would mean parameterising the year, which is
+#: a feature rather than a guard.
+_PINNED_YEAR_ONLY = (
+    rf"\A(?!.*(?:{_RELATIVE_PERIOD}|\b(?!{PINNED_YEAR}\b)(?:19|20)\d{{2}}\b))"
+)
 
 #: Phrases that ask for a *breakdown* — one row per group — rather than a single
 #: number: "by region", "per category", "in each region", "for every month".
@@ -361,7 +387,7 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             """,
         ),
         (
-            re.compile(r"total sales by month.*2024", re.I),
+            re.compile(_PINNED_YEAR_ONLY + r".*total sales by month.*2024", re.I),
             """
             SELECT strftime('%Y-%m', o.order_date) AS month,
                    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
@@ -457,10 +483,11 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # see a gap rather than have it silently smoothed over.
         (
             re.compile(
-                r"categor(?:y|ies).*(?:monthly|by\s+month|per\s+month|"
+                _PINNED_YEAR_ONLY
+                + r".*(?:categor(?:y|ies).*(?:monthly|by\s+month|per\s+month|"
                 r"each\s+month|over\s+time|month[- ]over[- ]month|trend)|"
                 r"(?:monthly|by\s+month|per\s+month|each\s+month|over\s+time|"
-                r"month[- ]over[- ]month|trend).*categor(?:y|ies)",
+                r"month[- ]over[- ]month|trend).*categor(?:y|ies))",
                 re.I,
             ),
             """
@@ -503,8 +530,9 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # above so a question naming a category keeps that dimension.
         (
             re.compile(
-                r"month[- ]over[- ]month|(revenue|sales)\s+growth|"
-                r"growth.*(revenue|sales)",
+                _PINNED_YEAR_ONLY
+                + r".*(?:month[- ]over[- ]month|(revenue|sales)\s+growth|"
+                r"growth.*(revenue|sales))",
                 re.I,
             ),
             """
@@ -538,10 +566,11 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # ahead of the broad "total revenue" rule so it is not shadowed.
         (
             re.compile(
-                r"cumulative\s+(revenue|sales)|"
+                _PINNED_YEAR_ONLY
+                + r".*(?:cumulative\s+(revenue|sales)|"
                 r"running\s+(total|sum)\s+(of\s+)?(revenue|sales)|"
                 r"(revenue|sales)\s+running\s+total|"
-                r"(revenue|sales)\s+to\s+date",
+                r"(revenue|sales)\s+to\s+date)",
                 re.I,
             ),
             """
@@ -1030,10 +1059,14 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         #
         # The _DESCENDING_ONLY prefix declines "which customers spent the
         # least?": ``customers?.*spent`` would otherwise match it and return
-        # the five biggest spenders under a correct-looking label.
+        # the five biggest spenders under a correct-looking label. The
+        # _UNSCOPED_ONLY prefix declines "which customers spent the most in
+        # 2023?", which used to return the all-time leaderboard: the SQL has
+        # no date filter, so the year was silently dropped.
         (
             re.compile(
-                _DESCENDING_ONLY
+                _UNSCOPED_ONLY
+                + _DESCENDING_ONLY
                 + r".*(?:customers?\b.*\bspent|"
                 r"\b(?:top|biggest|largest|highest[-\s]?spending)\s+"
                 r"(?:\d+\s+|five\s+)?customers?\b)",
@@ -1423,8 +1456,14 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY units_sold DESC, category
             """,
         ),
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
-            re.compile(r"(revenue|sales).*(by|per).*(category)", re.I),
+            re.compile(
+                _UNSCOPED_ONLY + r".*(revenue|sales).*(by|per).*(category)", re.I
+            ),
             """
             SELECT p.category,
                    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
@@ -1451,9 +1490,10 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # the plain rule.
         (
             re.compile(
-                r"(average|avg).*order value.*"
+                _PINNED_YEAR_ONLY
+                + r".*(?:(average|avg).*order value.*"
                 r"(by\s+month|per\s+month|each\s+month|monthly|over\s+time)|"
-                r"monthly.*(average|avg).*order value",
+                r"monthly.*(average|avg).*order value)",
                 re.I,
             ),
             """
@@ -1482,8 +1522,14 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # Requiring the word "region" and registering this rule ahead of the
         # plain "average order value" rule below keeps a bare "average order
         # value" question routed to that simpler overall rule.
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
-            re.compile(r"(average|avg).*order value.*region", re.I),
+            re.compile(
+                _UNSCOPED_ONLY + r".*(average|avg).*order value.*region", re.I
+            ),
             """
             SELECT c.region,
                    ROUND(AVG(order_total), 2) AS avg_order_value
@@ -1500,8 +1546,12 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY avg_order_value DESC
             """,
         ),
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
-            re.compile(r"(average|avg).*order value", re.I),
+            re.compile(_UNSCOPED_ONLY + r".*(average|avg).*order value", re.I),
             """
             SELECT ROUND(AVG(order_total), 2) AS average_order_value
             FROM (
@@ -1528,10 +1578,15 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # between the two is itself informative. The matcher requires the word
         # "median", which no other rule uses, so it neither shadows nor is
         # shadowed by the average-order-value rules.
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
             re.compile(
-                r"median\s+(order\s+(value|total)|basket)|"
-                r"order\s+(value|total).*median",
+                _UNSCOPED_ONLY
+                + r".*(?:median\s+(order\s+(value|total)|basket)|"
+                r"order\s+(value|total).*median)",
                 re.I,
             ),
             """
@@ -1563,11 +1618,17 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # items/units-per-order or basket-size phrase, so it does not shadow
         # the "order value" rule (which owns the "order value" wording) or the
         # broad order/product count rules.
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
             re.compile(
-                r"(average|avg|mean)\s+(number\s+of\s+)?(items?|units?)\s+per\s+order|"
+                _UNSCOPED_ONLY
+                + r".*(?:(average|avg|mean)\s+(number\s+of\s+)?(items?|units?)"
+                r"\s+per\s+order|"
                 r"(items?|units?)\s+per\s+order|"
-                r"average\s+basket\s+size|basket\s+size",
+                r"average\s+basket\s+size|basket\s+size)",
                 re.I,
             ),
             """
@@ -1866,8 +1927,12 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             ORDER BY category
             """,
         ),
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
-            re.compile(r"(best|top).*selling product", re.I),
+            re.compile(_UNSCOPED_ONLY + r".*(best|top).*selling product", re.I),
             """
             SELECT p.name,
                    SUM(oi.quantity) AS units_sold
@@ -1886,10 +1951,13 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         #
         # The _DESCENDING_ONLY prefix declines "bottom 5 products by revenue",
         # which ``products?.*by revenue`` used to answer with the top five. The
-        # low end has its own rule, directly below.
+        # low end has its own rule, directly below. The _UNSCOPED_ONLY prefix
+        # declines year- and window-scoped phrasings, for the same reason as
+        # the top-customers rule: the ranking is computed over all time.
         (
             re.compile(
-                _DESCENDING_ONLY
+                _UNSCOPED_ONLY
+                + _DESCENDING_ONLY
                 + r".*(?:top.*products?.*revenue|products?.*by revenue|"
                 r"highest[- ]revenue products?)",
                 re.I,
@@ -2223,8 +2291,16 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # ``by \w+``: "show revenue by salesperson" is a precision-guard
         # question precisely because it borrows this rule's vocabulary for a
         # column the schema does not have, and must go unanswered.
+        #
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
-            re.compile(r"(revenue|sales).*\b(?:by|per)\s+regions?\b", re.I),
+            re.compile(
+                _UNSCOPED_ONLY + r".*(revenue|sales).*\b(?:by|per)\s+regions?\b",
+                re.I,
+            ),
             """
             SELECT c.region,
                    ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue
@@ -2258,16 +2334,21 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # order value) does not overlap with the average-order-value rules'
         # "average ... order value" or the orders-per-customer rule's
         # "distribution of orders".
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
             re.compile(
-                r"\b(?:distribution|histogram|breakdown|spread)\s+of\s+"
+                _UNSCOPED_ONLY
+                + r".*(?:\b(?:distribution|histogram|breakdown|spread)\s+of\s+"
                 r"(?:the\s+)?(?:order|basket)\s+(?:values?|totals?|sizes?)\b"
                 r"|\b(?:order|basket)\s+(?:values?|totals?|sizes?)\s+"
                 r"(?:distribution|histogram|breakdown|bands?|buckets?|brackets?)\b"
                 r"|\borders?\s+(?:by|per)\s+(?:order\s+)?(?:value|total|size)\s+"
                 r"(?:band|bucket|bracket|range)s?\b"
                 r"|\bhow\s+are\s+(?:order|basket)\s+(?:values?|totals?|sizes?)\s+"
-                r"distributed\b",
+                r"distributed\b)",
                 re.I,
             ),
             """
@@ -2341,7 +2422,10 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             """,
         ),
         (
-            re.compile(r"(monthly )?new customers.*(by month|2024)", re.I),
+            re.compile(
+                _PINNED_YEAR_ONLY + r".*(monthly )?new customers.*(by month|2024)",
+                re.I,
+            ),
             """
             SELECT strftime('%Y-%m', signup_date) AS month,
                    COUNT(*) AS new_customers
@@ -2363,9 +2447,10 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # buyers).
         (
             re.compile(
-                r"(unique|distinct|active)\s+(customers?|buyers?|shoppers?)"
+                _PINNED_YEAR_ONLY
+                + r".*(?:(unique|distinct|active)\s+(customers?|buyers?|shoppers?)"
                 r".*(month|2024)|"
-                r"monthly.*(unique|distinct|active)\s+(customers?|buyers?)",
+                r"monthly.*(unique|distinct|active)\s+(customers?|buyers?))",
                 re.I,
             ),
             """
@@ -2433,7 +2518,8 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # quarterly phrasings are not shadowed by it.
         (
             re.compile(
-                r"(revenue|sales).*(by|per).*quarter|quarterly (revenue|sales)",
+                _PINNED_YEAR_ONLY
+                + r".*(?:(revenue|sales).*(by|per).*quarter|quarterly (revenue|sales))",
                 re.I,
             ),
             """
@@ -2478,7 +2564,10 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # names); the answer is a *set* of customers, so the gold row is
         # marked "ordered": false.
         (
-            re.compile(r"(every|each|all\s+(four|4))\s+quarters?\b", re.I),
+            re.compile(
+                _PINNED_YEAR_ONLY + r".*(every|each|all\s+(four|4))\s+quarters?\b",
+                re.I,
+            ),
             """
             SELECT c.id AS customer_id,
                    c.name AS customer,
@@ -2526,10 +2615,11 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # with an identical change in a stable order across runs.
         (
             re.compile(
-                r"(first|1st|second|2nd)\s+half\s+of\s+(the\s+)?(year|2024)|"
+                _PINNED_YEAR_ONLY
+                + r".*(?:(first|1st|second|2nd)\s+half\s+of\s+(the\s+)?(year|2024)|"
                 r"(first|1st)\s+half\b.*\b(second|2nd)\s+half\b|"
                 r"\bh1\b.*\bh2\b|"
-                r"half[-\s]?over[-\s]?half",
+                r"half[-\s]?over[-\s]?half)",
                 re.I,
             ),
             """
@@ -2787,10 +2877,15 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # of it is what routes the question here (first-rule-wins), and
         # `explain` reports the broad rule as shadowed for exactly this
         # question.
+        # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
+        # period-scoped phrasing ("... in 2023", "... this quarter") would
+        # otherwise be answered with the all-time figure. See
+        # :data:`_UNSCOPED_ONLY`.
         (
             re.compile(
-                r"orders?\b.*\b(more than one|multiple|two or more|several)\b"
-                r".*categor|cross[-\s]categor",
+                _UNSCOPED_ONLY
+                + r".*(?:orders?\b.*\b(more than one|multiple|two or more|several)\b"
+                r".*categor|cross[-\s]categor)",
                 re.I,
             ),
             """

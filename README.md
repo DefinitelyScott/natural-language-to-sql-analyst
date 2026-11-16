@@ -190,6 +190,41 @@ own rule; the customer one has none yet, so it is declined, and
 `precision.jsonl` records it, along with "at least $1,000 in sales" (a
 threshold, not a ranking) and the bottom products *by units*.
 
+The period guard was first applied only to the whole-table totals, but the same
+failure reached further: the all-time leaderboards and breakdowns (top
+customers, top products by revenue, best-selling product, average order value,
+revenue by category, revenue by region) have no date filter either, so "which
+customers spent the most in 2023?" came back as the all-time leaderboard with
+the year silently dropped. Those six rules now carry `_UNSCOPED_ONLY` as well,
+and `precision.jsonl` records one year- or window-scoped question for each. A
+side effect is one fewer order-dependent gold question below: "average order
+value by month in 2024" no longer also matches the plain average-order-value
+rule, because that rule now declines any question naming a year.
+
+The opposite failure lived in the ten time-series rules whose SQL is pinned to
+calendar 2024 (monthly sales, month-over-month growth, cumulative revenue,
+revenue by quarter, and so on). Their patterns accepted any year, so "show
+revenue by quarter in 2023" came back as four rows labelled `2024-Q1` ..
+`2024-Q4`: not a dropped period but a substituted one. Those rules now carry
+`_PINNED_YEAR_ONLY`, which declines any other calendar year and any relative
+window ("last 6 months", "this year"). A question naming no period still gets
+2024, which the month and quarter labels in the result make visible; making
+the year a parameter would be a feature, not a guard. `tests/test_pinned_year.py`
+finds the pinned rules from their SQL rather than from a list, rewrites each
+one's gold questions to ask about another period, and asserts they decline, so
+a new pinned rule added without the guard fails there unedited.
+
+The remaining unscoped rules are tracked by `tests/test_unscoped_period.py`,
+which finds every rule whose SQL names no date column, appends "in 2023", "in
+the last 90 days" and "this year" to its gold question, and runs the result
+through the whole offline backend, so a guarded rule that declines only to fall
+through to an unguarded one still fails. Rules not yet guarded sit in its
+`KNOWN_PERIOD_GAPS` list as a ratchet: a new gap fails the test, and so does a
+fixed one left on the list. The five order-level statistics (average order
+value by region, median order value, items per order, the order-value
+distribution, and multi-category orders) have since been guarded as a batch,
+with one period-scoped question each in `precision.jsonl`.
+
 **Group-by breakdowns** — revenue by category, by region, and by region ×
 category; top products by revenue, and the bottom five — a `LEFT JOIN` from
 `products` with `COALESCE(..., 0)`, because at the low end the product that
@@ -1073,8 +1108,8 @@ So the harness also reports, for every gold question, every rule it matches
 rather than only the winner:
 
 ```
-Catalog shadowing: 54/66 gold questions match exactly one rule
-  Order-dependent (not gating): 12 — these reach the right rule only because it is registered first
+Catalog shadowing: 55/66 gold questions match exactly one rule
+  Order-dependent (not gating): 11 — these reach the right rule only because it is registered first
     [SHADOWED] Show revenue by region and category.
         also matched by rule #21: Show revenue by category
         also matched by rule #42: Show revenue by region
@@ -1083,7 +1118,7 @@ Catalog shadowing: 54/66 gold questions match exactly one rule
         also matched by rule #54: What is the total revenue?
 ```
 
-Twelve of the sixty-six are decided this way, and **none of them is a bug**. In
+Eleven of the sixty-six are decided this way, and **none of them is a bug**. In
 every case the answering rule's pattern is strictly more demanding than the ones
 behind it — "average order value *by region*" ahead of "average order value",
 "revenue by category *with a total row*" ahead of "revenue by category" — which
@@ -1105,7 +1140,7 @@ coarsen the answer, it would change its subject:
   shape with the right column names and the wrong meaning.
 
 Like gold independence this is a **ratchet, not a gate**.
-`tests/test_shadowing.py` records the twelve by name — naming the losing rules by
+`tests/test_shadowing.py` records the eleven by name — naming the losing rules by
 *their* gold questions rather than by index, so inserting a rule does not
 invalidate the record — and fails when the overlap set grows, including when a
 question already on the list picks up a third claimant. The usual way that

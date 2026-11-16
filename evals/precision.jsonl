@@ -21,3 +21,19 @@
 {"question": "Which category had its best month?", "reason": "asks for a per-category answer; the best-and-worst-month rule ranks total revenue only"}
 {"question": "Which day of the week has the most orders?", "reason": "a weekday question; the busiest-days rule ranks individual dates, and the day-of-week rule only reports revenue, so this must decline rather than return calendar dates"}
 {"question": "How many orders were placed each month in 2024?", "reason": "year-scoped; the orders-by-month rule covers every month on record and must decline rather than ignore the year"}
+{"question": "Which customers spent the most in 2023?", "reason": "year-scoped; the top-customers rule ranks all-time spend and must decline rather than drop the year"}
+{"question": "What is the average order value in 2023?", "reason": "year-scoped; the average-order-value rule averages every order on record with no date filter"}
+{"question": "What is the best selling product this year?", "reason": "period-scoped; the best-selling-product rule counts units over all time"}
+{"question": "What are the top products by revenue in 2024?", "reason": "year-scoped; the top-products rule ranks all-time revenue"}
+{"question": "Show revenue by category for the last 90 days.", "reason": "window-scoped; the revenue-by-category rule has no date filter and would return the all-time split"}
+{"question": "Show revenue by region in 2023.", "reason": "year-scoped; the revenue-by-region rule has no date filter and would return the all-time split"}
+{"question": "Show revenue by quarter in 2023.", "reason": "names a year other than the one the quarterly rule's SQL is pinned to; it used to return 2024-Q1..Q4 under a 2023 question"}
+{"question": "Show month-over-month revenue growth in 2023.", "reason": "the growth rule's SQL is pinned to 2024 and must decline another year rather than substitute it"}
+{"question": "Show cumulative revenue by month for the last 6 months.", "reason": "a relative window; the cumulative rule covers calendar 2024 only and cannot honour it"}
+{"question": "How many new customers signed up by month in 2023?", "reason": "the signups-by-month rule filters signup_date to 2024; answering would report the wrong year"}
+{"question": "Which customers placed an order in every quarter of 2023?", "reason": "the every-quarter rule tests the four quarters of 2024 only"}
+{"question": "What is the average order value by region in 2023?", "reason": "year-scoped; the AOV-by-region rule averages every order on record, and the plain AOV rule it would fall through to is guarded too"}
+{"question": "What is the median order value this year?", "reason": "period-scoped; the median rule ranks every order total on record with no date filter"}
+{"question": "What is the average number of items per order in the last 90 days?", "reason": "window-scoped; the basket-size rule averages units over all orders"}
+{"question": "Show the distribution of order values in 2023.", "reason": "year-scoped; the order-value bands count every order on record"}
+{"question": "How many orders contain products from more than one category in 2023?", "reason": "year-scoped; the multi-category rule and the order-count rule it would fall through to both have no date filter"}
