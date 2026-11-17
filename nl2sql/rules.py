@@ -1044,6 +1044,77 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             FROM customer_revenue
             """,
         ),
+        # Most frequent customers -- ranked by how many orders they placed,
+        # not by how much they spent. The two leaderboards differ: a customer
+        # with many small orders tops this one and can miss the spend top 5,
+        # and "frequency" is the F in RFM, which retention work asks about
+        # directly. Before this rule existed, "top customers by number of
+        # orders" fell through to the spend leaderboard below (its
+        # ``top ... customers`` alternative matched first) and came back as a
+        # spend ranking under a correct-looking label, so this rule is
+        # registered ahead of it.
+        #
+        # Order counts tie heavily (seven customers share 13 orders in the
+        # sample data), so the cut-off is a rank, not a row count: RANK()
+        # numbers the customers, and ``WHERE order_rank <= 10`` keeps every
+        # customer tied at the boundary. ``LIMIT 10`` would instead drop part
+        # of a tie by customer id, presenting an arbitrary choice as a
+        # ranking. The result can therefore exceed ten rows; that is the
+        # honest answer when the tenth place is shared.
+        #
+        # COUNT(*) is taken over orders only, before revenue is joined in --
+        # a join to order_items first would count line items as orders. The
+        # EXISTS filter keeps an order with no items out of both columns, so
+        # orders and revenue describe the same set.
+        #
+        # Guards: _DESCENDING_ONLY declines "fewest orders" (this SQL ranks
+        # the top), _UNSCOPED_ONLY declines "most orders in 2024" (it has no
+        # date filter), and _UNGROUPED_ONLY declines "most orders in each
+        # region" (it ranks the whole customer base, not within a region).
+        (
+            re.compile(
+                _UNSCOPED_ONLY
+                + _DESCENDING_ONLY
+                + _UNGROUPED_ONLY
+                + r".*(?:\bcustomers?\b[^?]*\bmost\s+orders\b"
+                r"|\bmost\s+frequent\s+(?:customers?|buyers?|shoppers?)\b"
+                r"|\bcustomers?\b[^?]*\b(?:order|buy|shop|purchase)(?:s|ed)?\s+"
+                r"(?:the\s+)?most\s+(?:often|frequently)\b"
+                r"|\bcustomers?\b[^?]*\bby\s+(?:(?:the\s+)?number\s+of\s+orders"
+                r"|order\s+(?:count|volume|frequency))\b)",
+                re.I,
+            ),
+            """
+            WITH order_counts AS (
+                SELECT o.customer_id AS customer_id,
+                       COUNT(*) AS orders
+                FROM orders o
+                WHERE EXISTS (
+                    SELECT 1 FROM order_items oi WHERE oi.order_id = o.id
+                )
+                GROUP BY o.customer_id
+            ),
+            ranked AS (
+                SELECT customer_id,
+                       orders,
+                       RANK() OVER (ORDER BY orders DESC) AS order_rank
+                FROM order_counts
+            )
+            SELECT c.id AS customer_id,
+                   c.name AS customer,
+                   c.region,
+                   r.orders,
+                   ROUND(SUM(oi.quantity * oi.unit_price), 2) AS revenue,
+                   r.order_rank
+            FROM ranked r
+            JOIN customers c ON c.id = r.customer_id
+            JOIN orders o ON o.customer_id = c.id
+            JOIN order_items oi ON oi.order_id = o.id
+            WHERE r.order_rank <= 10
+            GROUP BY c.id, c.name, c.region, r.orders, r.order_rank
+            ORDER BY r.order_rank, c.id
+            """,
+        ),
         # "Biggest"/"largest customer" is ranked by spend here, not by order
         # count: this schema has no size attribute for a customer, so revenue
         # is the only thing the superlative can mean. The count is left

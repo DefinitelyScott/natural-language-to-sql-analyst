@@ -89,6 +89,14 @@ KNOWN_SELF_COMPARING = frozenset(
 #: An entry is documentation, not an assertion; the mechanical check is
 #: ``check_independence``, which compares the two query texts.
 REWRITE_RATIONALE = {
+    "Which customers placed the most orders?": (
+        "the rule counts orders in a CTE before any join, ranks them with "
+        "RANK() OVER and keeps rank <= 10; the gold query joins items first, "
+        "counts DISTINCT order ids, and computes each customer's rank as one "
+        "plus the number of customers with strictly more orders in a "
+        "correlated subquery. A rule that counted line items as orders, or "
+        "cut ties with LIMIT 10, would disagree with the gold result."
+    ),
     "How many orders were placed each month?": (
         "the rule totals items per order in a derived table and groups those "
         "orders by month; the gold query takes the distinct months from "

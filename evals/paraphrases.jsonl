@@ -87,3 +87,6 @@
 {"canonical": "How many orders were placed each month?", "paraphrase": "Show the number of orders per month."}
 {"canonical": "How many orders were placed each month?", "paraphrase": "Orders each month."}
 {"canonical": "How many orders were placed each month?", "paraphrase": "What was our monthly order volume?"}
+{"canonical": "Which customers placed the most orders?", "paraphrase": "Who are our most frequent customers?"}
+{"canonical": "Which customers placed the most orders?", "paraphrase": "Show the top customers by number of orders."}
+{"canonical": "Which customers placed the most orders?", "paraphrase": "Which customers buy most often?"}

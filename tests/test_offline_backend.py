@@ -4041,3 +4041,81 @@ def test_end_to_end_orders_by_month():
     # Counting orders, not line items: the counts sum to the order total.
     assert sum(r[1] for r in rows) == sum(per_month.values())
     assert sum(r[2] for r in rows) == pytest.approx(total_revenue, abs=0.05)
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Which customers placed the most orders?",
+        "Who are our most frequent customers?",
+        "Show the top customers by number of orders.",
+        "Which customers buy most often?",
+        "Top 10 customers by order count",
+    ],
+)
+def test_offline_matches_most_frequent_customers_phrasings(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert "RANK() OVER (ORDER BY orders DESC) AS order_rank" in sql
+    assert "r.order_rank <= 10" in sql
+
+
+def test_order_count_leaderboard_is_not_answered_by_spend_leaderboard():
+    # Regression: "top customers by number of orders" used to reach the spend
+    # leaderboard through its "top ... customers" alternative, returning a
+    # ranking by dollars under a label that asked for a ranking by orders.
+    sql = OfflineBackend().to_sql("Show the top customers by number of orders.", schema="")
+    assert "total_spent" not in sql
+
+
+def test_most_frequent_customers_declines_other_questions():
+    backend = OfflineBackend()
+    for question in (
+        "Which customers placed the fewest orders?",  # ascending: SQL ranks the top
+        "Which customers placed the most orders in 2024?",  # no date filter
+        "Which customers placed the most orders last month?",
+        "Which customer placed the most orders in each region?",  # per-group
+    ):
+        assert backend.matching_rule_indexes(question) == []
+
+
+def test_most_frequent_customers_does_not_take_neighbouring_questions():
+    backend = OfflineBackend()
+    frequent_sql = backend.to_sql("Which customers placed the most orders?", schema="")
+    for question in (
+        "Which 5 customers spent the most?",
+        "Who are our top customers?",
+        "Show the distribution of orders per customer.",
+        "Which day had the most orders?",
+        "How many orders do we have?",
+    ):
+        assert backend.to_sql(question, schema="") != frequent_sql
+
+
+def test_end_to_end_most_frequent_customers_keeps_ties_at_the_cutoff():
+    # Checked against counts computed in Python, not against another query:
+    # every customer whose order count is at least the tenth-highest count is
+    # returned (ties included), and nobody below it is.
+    db_path = os.path.join(os.path.dirname(__file__), "..", "data", "store.db")
+    if not os.path.exists(db_path):
+        pytest.skip("sample DB not built; run scripts/build_sample_db.py")
+    import sqlite3
+    from collections import Counter
+
+    sql = OfflineBackend().to_sql("Which customers placed the most orders?", schema="")
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute(sql).fetchall()
+        # One (customer, order) pair per order that has items, tallied here.
+        pairs = conn.execute(
+            "SELECT DISTINCT o.customer_id, o.id FROM orders o "
+            "JOIN order_items oi ON oi.order_id = o.id"
+        ).fetchall()
+    per_customer = Counter(customer_id for customer_id, _ in pairs)
+
+    tenth_highest = sorted(per_customer.values(), reverse=True)[9]
+    expected = {cid for cid, n in per_customer.items() if n >= tenth_highest}
+    assert {row[0] for row in rows} == expected
+    assert len(rows) >= 10
+    for customer_id, _, _, orders, _, rank in rows:
+        assert orders == per_customer[customer_id]
+        assert rank == 1 + sum(1 for n in per_customer.values() if n > orders)
+    assert [row[5] for row in rows] == sorted(row[5] for row in rows)

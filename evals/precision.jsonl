@@ -37,3 +37,4 @@
 {"question": "What is the average number of items per order in the last 90 days?", "reason": "window-scoped; the basket-size rule averages units over all orders"}
 {"question": "Show the distribution of order values in 2023.", "reason": "year-scoped; the order-value bands count every order on record"}
 {"question": "How many orders contain products from more than one category in 2023?", "reason": "year-scoped; the multi-category rule and the order-count rule it would fall through to both have no date filter"}
+{"question": "Which customer placed the most orders in each region?", "reason": "a per-region ranking; the most-frequent-customers rule ranks the whole customer base and must decline rather than answer with one global leaderboard"}
