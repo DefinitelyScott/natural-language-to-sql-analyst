@@ -4119,3 +4119,57 @@ def test_end_to_end_most_frequent_customers_keeps_ties_at_the_cutoff():
         assert orders == per_customer[customer_id]
         assert rank == 1 + sum(1 for n in per_customer.values() if n > orders)
     assert [row[5] for row in rows] == sorted(row[5] for row in rows)
+
+
+# --- Inverted word order for the median and basket-size rules --------------
+#
+# Both phrasings below were documented `known_gap`s in evals/paraphrases.jsonl:
+# the rules required the metric noun directly after the statistic ("median
+# order value", "items per order"). The tests pin the widened routing and,
+# just as importantly, the near-miss phrasings it must keep declining.
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What's the median value of an order?",
+        "What is the median total of each order?",
+        "What is the median amount of an order?",
+    ],
+)
+def test_median_rule_accepts_inverted_value_of_an_order(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert sql == OfflineBackend().to_sql("What is the median order value?", schema="")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "How many items are in an average order?",
+        "How many units are in a typical order?",
+        "How many items in the average order?",
+    ],
+)
+def test_basket_size_rule_accepts_items_in_an_average_order(question):
+    sql = OfflineBackend().to_sql(question, schema="")
+    assert sql == OfflineBackend().to_sql(
+        "What is the average number of items per order?", schema=""
+    )
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # One specific order, not a mean across orders.
+        "How many items are in order 42?",
+        # "size" is units, not money: must not reach the median-value rule.
+        "What is the median size of an order?",
+        # Both rules are all-time; a named period must still be declined by
+        # the _UNSCOPED_ONLY guard rather than answered with the wrong window.
+        "What's the median value of an order in 2023?",
+        "How many items are in an average order this year?",
+    ],
+)
+def test_inverted_phrasings_do_not_over_reach(question):
+    with pytest.raises(NoRuleMatchError):
+        OfflineBackend().to_sql(question, schema="")

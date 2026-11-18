@@ -1649,6 +1649,10 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # between the two is itself informative. The matcher requires the word
         # "median", which no other rule uses, so it neither shadows nor is
         # shadowed by the average-order-value rules.
+        # The third alternative accepts the inverted "median value of an order"
+        # word order. It still needs "median" and an explicit money noun
+        # (value/total/amount) before "of ... order", so "median size of an
+        # order" -- a units question -- is deliberately not captured.
         # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
         # period-scoped phrasing ("... in 2023", "... this quarter") would
         # otherwise be answered with the all-time figure. See
@@ -1657,7 +1661,8 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             re.compile(
                 _UNSCOPED_ONLY
                 + r".*(?:median\s+(order\s+(value|total)|basket)|"
-                r"order\s+(value|total).*median)",
+                r"order\s+(value|total).*median|"
+                r"median\s+(value|total|amount)\s+of\s+(an?|each|the)\s+orders?\b)",
                 re.I,
             ),
             """
@@ -1689,6 +1694,9 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
         # items/units-per-order or basket-size phrase, so it does not shadow
         # the "order value" rule (which owns the "order value" wording) or the
         # broad order/product count rules.
+        # "items in an average/typical order" is the same metric with the noun
+        # order inverted. The adjective is required: "How many items are in
+        # order 42?" names one order, not the mean across all of them.
         # Guarded by _UNSCOPED_ONLY: the SQL has no date filter, so a
         # period-scoped phrasing ("... in 2023", "... this quarter") would
         # otherwise be answered with the all-time figure. See
@@ -1699,6 +1707,7 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
                 + r".*(?:(average|avg|mean)\s+(number\s+of\s+)?(items?|units?)"
                 r"\s+per\s+order|"
                 r"(items?|units?)\s+per\s+order|"
+                r"(items?|units?)\s+(are\s+)?in\s+(an?|the)\s+(average|typical)\s+order\b|"
                 r"average\s+basket\s+size|basket\s+size)",
                 re.I,
             ),

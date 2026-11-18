@@ -975,12 +975,12 @@ Known gaps are recorded rather than left out. A set assembled only from
 phrasings that already work would measure nothing about the matcher's reach, and
 would quietly reward narrowing a rule. They are reported but do not fail the
 run, and they are excluded from the ratio's denominator, so documenting a gap
-can never improve the headline. The set currently holds **86 gating pairs and
-6 known gaps**:
+can never improve the headline. The set currently holds **90 gating pairs and
+4 known gaps**:
 
 ```
-Paraphrase robustness: 86/86 rephrasings route to the canonical rule
-  Known gaps (not gating): 6
+Paraphrase robustness: 90/90 rephrasings route to the canonical rule
+  Known gaps (not gating): 4
 ```
 
 Every rule the gold set reaches carries at least one rephrasing, and
