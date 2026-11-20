@@ -92,3 +92,5 @@
 {"canonical": "Which customers placed the most orders?", "paraphrase": "Who are our most frequent customers?"}
 {"canonical": "Which customers placed the most orders?", "paraphrase": "Show the top customers by number of orders."}
 {"canonical": "Which customers placed the most orders?", "paraphrase": "Which customers buy most often?"}
+{"canonical": "What was each category's best and worst month?", "paraphrase": "Which month was strongest for each category?"}
+{"canonical": "What was each category's best and worst month?", "paraphrase": "In which month did each category peak?"}

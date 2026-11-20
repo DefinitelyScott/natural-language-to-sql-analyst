@@ -18,7 +18,7 @@
 {"question": "Which products had at least $1,000 in sales?", "reason": "a threshold filter, not a ranking; 'at least' must not be read as 'least' and answered with the bottom five products"}
 {"question": "What are the bottom 5 products by units sold?", "reason": "the bottom-products rule ranks by revenue; a units ranking of the low end is not implemented and must not be answered in revenue"}
 {"question": "Which month in 2024 had the highest revenue?", "reason": "year-scoped; the best-and-worst-month rule covers every month on record and must decline rather than ignore the year"}
-{"question": "Which category had its best month?", "reason": "asks for a per-category answer; the best-and-worst-month rule ranks total revenue only"}
+{"question": "Which category had its best month?", "reason": "asks to pick one category; the company-wide best-month rule ranks total revenue only, and the per-category best-month rule returns every category rather than choosing one"}
 {"question": "Which day of the week has the most orders?", "reason": "a weekday question; the busiest-days rule ranks individual dates, and the day-of-week rule only reports revenue, so this must decline rather than return calendar dates"}
 {"question": "How many orders were placed each month in 2024?", "reason": "year-scoped; the orders-by-month rule covers every month on record and must decline rather than ignore the year"}
 {"question": "Which customers spent the most in 2023?", "reason": "year-scoped; the top-customers rule ranks all-time spend and must decline rather than drop the year"}
@@ -38,3 +38,5 @@
 {"question": "Show the distribution of order values in 2023.", "reason": "year-scoped; the order-value bands count every order on record"}
 {"question": "How many orders contain products from more than one category in 2023?", "reason": "year-scoped; the multi-category rule and the order-count rule it would fall through to both have no date filter"}
 {"question": "Which customer placed the most orders in each region?", "reason": "a per-region ranking; the most-frequent-customers rule ranks the whole customer base and must decline rather than answer with one global leaderboard"}
+{"question": "What was each category's best month in 2023?", "reason": "year-scoped; the per-category best-month rule ranks every month on record and must decline rather than ignore the year"}
+{"question": "What was each region's best month?", "reason": "a per-region ranking; the per-category best-month rule groups by category and the company-wide best-month rule declines a dimension word"}

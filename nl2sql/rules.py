@@ -446,6 +446,86 @@ def build_catalog() -> list[tuple[re.Pattern[str], str]]:
             FROM (SELECT * FROM monthly ORDER BY revenue ASC, month LIMIT 1)
             """,
         ),
+        # Best and worst month *within each category*. The per-category
+        # sibling of the best-and-worst-month rule above, which deliberately
+        # declines "which category had its best month?" because its SQL ranks
+        # one company-wide series. This rule fills that gap: one row per
+        # category carrying the month with its highest revenue and the month
+        # with its lowest. Categories can peak in different months, and that
+        # is invisible both in the company-wide best month and in the
+        # category-by-month table, which shows every month but ranks none.
+        #
+        # Both ends come back in one row for the same reason the company-wide
+        # rule returns both: the pattern accepts "best" and "worst" alike, and
+        # answering "worst month" with the best one is the backwards-answer
+        # failure _DESCENDING_ONLY exists to prevent. Two ROW_NUMBER windows
+        # over the same partition rank each category's months from both ends,
+        # and conditional aggregation folds rank 1 of each into one row.
+        # Ranking runs on unrounded revenue and ties break on the earlier
+        # month, so the result is deterministic; rounding happens only in the
+        # output columns.
+        #
+        # Guards, each declining a question this SQL cannot answer:
+        #   * _UNSCOPED_ONLY: the SQL covers every month on record, so "best
+        #     month in 2023" declines instead of ignoring the year.
+        #   * the dimension lookahead: regions, customers and products are a
+        #     different grouping; units, orders, growth and averages are a
+        #     different measure.
+        #   * a *per-category* phrase is required ("each category", "by
+        #     category", "category's", "categories"), so the plain best-month
+        #     question still reaches the company-wide rule above, and "which
+        #     category had its best month?" keeps declining: it asks to pick
+        #     one category, which a one-row-per-category table does not do.
+        # It sits ahead of the category-by-month rule below, whose pattern
+        # needs a "monthly"/"each month" style word and so does not compete
+        # for these phrasings; the order is a precaution, not load-bearing.
+        (
+            re.compile(
+                _UNSCOPED_ONLY
+                + r"\A(?!.*\b(?:regions?|customers?|products?|growth|average|avg"
+                r"|orders?|units?|sold|quantity)\b)"
+                r"(?=.*(?:\b(?:each|every|per|by)\s+categor(?:y|ies)\b"
+                r"|\bcategory's\b|\bcategories\b))"
+                r".*(?:\b(?:highest|best|peak|biggest|strongest|top|lowest"
+                r"|worst|weakest|slowest)\s+(?:revenue\s+|sales\s+)?months?\b"
+                r"|\bmonths?\b[^?]*\b(?:highest|lowest|best|worst|strongest|weakest"
+                r"|peak(?:ed)?)\b)",
+                re.I,
+            ),
+            """
+            WITH monthly AS (
+                SELECT p.category AS category,
+                       strftime('%Y-%m', o.order_date) AS month,
+                       SUM(oi.quantity * oi.unit_price) AS revenue
+                FROM orders o
+                JOIN order_items oi ON oi.order_id = o.id
+                JOIN products p ON p.id = oi.product_id
+                GROUP BY p.category, month
+            ),
+            ranked AS (
+                SELECT category,
+                       month,
+                       revenue,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY category ORDER BY revenue DESC, month
+                       ) AS high_rank,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY category ORDER BY revenue ASC, month
+                       ) AS low_rank
+                FROM monthly
+            )
+            SELECT category,
+                   MAX(CASE WHEN high_rank = 1 THEN month END) AS best_month,
+                   ROUND(MAX(CASE WHEN high_rank = 1 THEN revenue END), 2)
+                       AS best_revenue,
+                   MAX(CASE WHEN low_rank = 1 THEN month END) AS worst_month,
+                   ROUND(MAX(CASE WHEN low_rank = 1 THEN revenue END), 2)
+                       AS worst_revenue
+            FROM ranked
+            GROUP BY category
+            ORDER BY category
+            """,
+        ),
         # Monthly revenue per category -- a category time series, not the
         # single-number-per-category breakdown the plain "revenue by
         # category" rule returns. Analysts ask this to see *which* category
