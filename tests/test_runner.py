@@ -399,3 +399,29 @@ def test_a_denied_query_is_not_reported_as_a_timeout(monkeypatch):
     monkeypatch.setattr(runner, "validate", lambda sql: sql)
     with pytest.raises(UnsafeQueryError, match="engine-level authorizer"):
         runner.run(DB, "ATTACH ':memory:' AS other", timeout_ms=5_000)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "WITH t AS (SELECT 1) DELETE FROM customers",
+        "WITH t AS (SELECT 1) UPDATE products SET price = 0",
+        "WITH t AS (SELECT 1 AS x) INSERT INTO customers SELECT x, 'x', 'North', '2024' FROM t",
+        "(SELECT 1) UNION SELECT 1; DROP TABLE orders",
+    ],
+)
+def test_validate_rejects_a_write_behind_a_select_shaped_prefix(sql):
+    """A statement can *start* like a read and still be a write.
+
+    SQLite accepts a CTE in front of ``DELETE``, ``UPDATE`` and ``INSERT``, so
+    ``WITH t AS (...) DELETE FROM ...`` clears the "must begin with SELECT or
+    WITH" check by construction. The keyword denylist is the layer that has to
+    catch it, and the ``match`` pins that: if the denylist were removed, these
+    would fall through to the engine-level authorizer, which also refuses them,
+    and a test asserting only ``UnsafeQueryError`` would keep passing while the
+    first layer was gone. The last case is the multi-statement guard, which
+    runs before the denylist and must still win.
+    """
+    expected = "multiple statements" if ";" in sql else "forbidden keyword"
+    with pytest.raises(UnsafeQueryError, match=expected):
+        runner.validate(sql)

@@ -152,3 +152,20 @@ def test_explain_command_unrecognized_question_errors(
 def test_explain_command_missing_db(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["explain", "How many customers do we have?", "--db", "/nope.db"]) == 2
     assert "Database not found" in capsys.readouterr().err
+
+
+@needs_db
+def test_explain_command_reports_a_missing_api_key_as_an_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``explain --llm`` without a key is a usage error, not a traceback.
+
+    ``LLMBackend`` checks ``OPENAI_API_KEY`` before it imports ``openai``, so
+    this path is reachable with neither the key nor the package installed —
+    which is the state of a fresh clone. The ``RuntimeError`` it raises must be
+    caught by the CLI and printed as one line with exit code 1.
+    """
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    assert cli.main(["explain", "How many customers do we have?", "--db", DB, "--llm"]) == 1
+    err = capsys.readouterr().err
+    assert err.strip() == "Error: OPENAI_API_KEY is not set"

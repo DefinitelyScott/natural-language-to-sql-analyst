@@ -317,3 +317,52 @@ def test_no_route_declares_a_withheld_parameter(client):
         name for _, name in declared if name in {"db", "llm", "examples"}
     }
     assert not withheld, f"withheld parameters are now declared: {sorted(withheld)}"
+
+
+# --------------------------------------------------------------------------- #
+# Failure paths the happy-path tests above never reach
+# --------------------------------------------------------------------------- #
+
+
+@needs_db
+def test_ask_returns_500_when_the_generated_sql_is_rejected(client, monkeypatch):
+    """Unsafe generated SQL is the service's defect, so it is a 500, not a 4xx.
+
+    The offline catalog never emits a write, so the only way to reach this
+    branch is a backend that does. The stub cannot repair, so the generator
+    gives up on the first rejection and raises ``QueryFailedError``; the
+    assertion is that the endpoint maps that to 500 and says why, rather than
+    leaking a traceback or blaming the caller with a 422.
+    """
+
+    class WritingBackend:
+        def to_sql(self, question, schema):
+            return "DELETE FROM orders"
+
+    monkeypatch.setattr(api.llm, "get_backend", lambda use_llm, examples=(): WritingBackend())
+    response = client.get("/ask", params={"q": "How many customers do we have?"})
+    assert response.status_code == 500
+    assert "DELETE FROM orders" in response.json()["detail"]
+
+
+@needs_db
+@pytest.mark.parametrize("gold_contents", [None, "this is not json\n"])
+def test_ask_still_returns_422_when_the_gold_file_is_unusable(tmp_path, gold_contents):
+    """A missing or malformed gold file costs the suggestions, not the response.
+
+    ``None`` means the file does not exist (``OSError``); the second case is a
+    file that exists but cannot be parsed (``ValueError``). Either way the
+    caller asked an unanswerable question and must get the same 422 shape, with
+    an empty ``suggestions`` list rather than a 500 about a file they never
+    mentioned.
+    """
+    gold = tmp_path / "gold.jsonl"
+    if gold_contents is not None:
+        gold.write_text(gold_contents)
+    client = TestClient(api.create_app(db_path=DB, gold_path=str(gold)))
+
+    response = client.get("/ask", params={"q": "revenue by store"})
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["error"] == "no offline rule matches this question"
+    assert detail["suggestions"] == []

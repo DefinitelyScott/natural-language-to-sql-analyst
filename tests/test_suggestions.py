@@ -139,3 +139,29 @@ def test_suggestions_go_to_stderr_only(capsys):
     cli.main(["ask", "revenue by store", "--db", DB, "--format", "csv"])
     captured = capsys.readouterr()
     assert "Did you mean:" not in captured.out
+
+
+@needs_db
+@pytest.mark.parametrize("gold_contents", [None, "this is not json\n"])
+def test_unusable_gold_file_drops_suggestions_but_keeps_the_pointer(
+    tmp_path, monkeypatch, capsys, gold_contents
+):
+    """The degradation ``_print_no_rule_help`` documents, checked end to end.
+
+    "revenue by store" overlaps several catalog questions, so with a working
+    gold file it gets "Did you mean" lines (see the test above). With the file
+    missing (``OSError``) or unparseable (``ValueError``) those must disappear
+    silently: same exit code, no traceback, no second warning, and the pointer
+    to ``nl2sql rules`` still printed.
+    """
+    gold = tmp_path / "gold.jsonl"
+    if gold_contents is not None:
+        gold.write_text(gold_contents)
+    monkeypatch.setattr(cli, "_DEFAULT_GOLD", str(gold))
+
+    assert cli.main(["ask", "revenue by store", "--db", DB]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error:")
+    assert "Did you mean:" not in err
+    assert "Warning" not in err
+    assert "nl2sql rules" in err
